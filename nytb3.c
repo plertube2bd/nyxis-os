@@ -19,17 +19,21 @@ typedef struct {
     UINT32      PixelsPerScanLine;
 } NTBLI;
 
-EFI_STATUS HandleError(EFI_STATUS Status, CHAR16* Message)
-{
+EFI_STATUS HandleError(
+    EFI_STATUS Status,
+    CHAR16* Message
+) {
     if (EFI_ERROR(Status)) {
-        Print(L"Error: %s (%r)\n", Message, Status);
+        Print(L"[ BOOTFAIL ] :: %s (%r)\n", Message, Status);
         gBS->Stall(3000000);
     }
-    return Status;
+    return EFI_SUCCESS;
 }
 
-EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
-{
+EFI_STATUS EFIAPI UefiMain(
+    EFI_HANDLE ImageHandle,
+    EFI_SYSTEM_TABLE *SystemTable
+) {
     EFI_STATUS Status;
 
     // 1. Graphics Output Protocol (GOP) 얻기
@@ -60,15 +64,31 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     UINTN MemMapSize = 0, MapKey, DescriptorSize;
     UINT32 DescriptorVersion;
 
-    gBS->GetMemoryMap(&MemMapSize, NULL, &MapKey, &DescriptorSize, &DescriptorVersion);
+    gBS->GetMemoryMap(
+        &MemMapSize,
+        NULL,
+        &MapKey,
+        &DescriptorSize,
+        &DescriptorVersion
+    );
     MemMapSize += (DescriptorSize * 2);
 
-    Status = gBS->AllocatePool(EfiLoaderData, MemMapSize, (void**)&MemMap);
+    Status = gBS->AllocatePool(
+        EfiLoaderData,
+        MemMapSize,
+        (void**)&MemMap
+    );
     if (EFI_ERROR(Status)) {
         return HandleError(Status, L"Memory Map Allocation Failed");
     }
 
-    Status = gBS->GetMemoryMap(&MemMapSize, MemMap, &MapKey, &DescriptorSize, &DescriptorVersion);
+    Status = gBS->GetMemoryMap(
+        &MemMapSize,
+        MemMap,
+        &MapKey,
+        &DescriptorSize,
+        &DescriptorVersion
+    );
     if (EFI_ERROR(Status)) {
         return HandleError(Status, L"GetMemoryMap Failed");
     }
@@ -82,7 +102,11 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
 
     // 5. 현재 부트로더의 Loaded Image Protocol 얻기
     EFI_LOADED_IMAGE_PROTOCOL *LoadedImage;
-    Status = gBS->HandleProtocol(ImageHandle, &gEfiLoadedImageProtocolGuid, (void**)&LoadedImage);
+    Status = gBS->HandleProtocol(
+        ImageHandle,
+        &gEfiLoadedImageProtocolGuid,
+        (void**)&LoadedImage
+    );
     if (EFI_ERROR(Status)) {
         return HandleError(Status, L"LIP Handle Failed");
     }
@@ -104,13 +128,19 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         0,                      // SourceSize
         &KernelImage            // ImageHandle
     );
+    if (Status == EFI_NOT_FOUND) {
+        return HandleError(Status, L"Kernel(//nyxskrnl.efi) is not found.");
     if (EFI_ERROR(Status)) {
-        return HandleError(Status, L"Kernel LoadImage Failed (nyxskrnl.efi not found?)");
+        return HandleError(Status, L"Kernel LoadImage Failed");
     }
 
     // 8. 커널에 NTBLI 정보 전달 (LoadOptions 사용)
     EFI_LOADED_IMAGE_PROTOCOL *KernelLoadedImage;
-    Status = gBS->HandleProtocol(KernelImage, &gEfiLoadedImageProtocolGuid, (void**)&KernelLoadedImage);
+    Status = gBS->HandleProtocol(
+        KernelImage,
+        &gEfiLoadedImageProtocolGuid,
+        (void**)&KernelLoadedImage
+    );
     if (EFI_ERROR(Status)) {
         return HandleError(Status, L"Kernel LIP Handle Failed");
     }
