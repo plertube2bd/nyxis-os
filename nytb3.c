@@ -130,7 +130,7 @@ EFI_STATUS EFIAPI UefiMain(
     );
     if (Status == EFI_NOT_FOUND) {
         return HandleError(Status, L"Kernel(//nyxskrnl.efi) is not found.");
-    if (EFI_ERROR(Status)) {
+    } else if (EFI_ERROR(Status)) {
         return HandleError(Status, L"Kernel LoadImage Failed");
     }
 
