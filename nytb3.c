@@ -5,7 +5,6 @@
 #include <Library/DevicePathLib.h>
 #include <Protocol/GraphicsOutput.h>
 #include <Protocol/LoadedImage.h>
-#include <Protocol/SimpleFileSystem.h>
 #include <Protocol/DevicePath.h>
 
 typedef struct {
@@ -26,6 +25,7 @@ EFI_STATUS HandleError(
     if (EFI_ERROR(Status)) {
         Print(L"[ BOOTFAIL ] :: %s (%r)\n", Message, Status);
         gBS->Stall(3000000);
+        return Status;
     }
     return EFI_SUCCESS;
 }
@@ -35,6 +35,7 @@ EFI_STATUS EFIAPI UefiMain(
     EFI_SYSTEM_TABLE *SystemTable
 ) {
     EFI_STATUS Status;
+    (void)SystemTable;
 
     // 1. Graphics Output Protocol (GOP) 얻기
     EFI_GRAPHICS_OUTPUT_PROTOCOL *Gop;
@@ -64,15 +65,18 @@ EFI_STATUS EFIAPI UefiMain(
     UINTN MemMapSize = 0, MapKey, DescriptorSize;
     UINT32 DescriptorVersion;
 
-    gBS->GetMemoryMap(
+    Status = gBS->GetMemoryMap(
         &MemMapSize,
         NULL,
         &MapKey,
         &DescriptorSize,
         &DescriptorVersion
     );
-    MemMapSize += (DescriptorSize * 2);
+    if (Status != EFI_BUFFER_TOO_SMALL) {
+        return HandleError(Status, L"GetMemoryMap Size Query Failed");
+    }
 
+    MemMapSize += DescriptorSize * 2;
     Status = gBS->AllocatePool(
         EfiLoaderData,
         MemMapSize,
@@ -90,6 +94,7 @@ EFI_STATUS EFIAPI UefiMain(
         &DescriptorVersion
     );
     if (EFI_ERROR(Status)) {
+        gBS->FreePool(MemMap);
         return HandleError(Status, L"GetMemoryMap Failed");
     }
 
@@ -99,6 +104,11 @@ EFI_STATUS EFIAPI UefiMain(
         TotalMem += Desc->NumberOfPages * EFI_PAGE_SIZE;
     }
     Info->Memory_Size = TotalMem;
+
+    Status = gBS->FreePool(MemMap);
+    if (EFI_ERROR(Status)) {
+        return HandleError(Status, L"Free Memory Map Failed");
+    }
 
     // 5. 현재 부트로더의 Loaded Image Protocol 얻기
     EFI_LOADED_IMAGE_PROTOCOL *LoadedImage;
@@ -129,9 +139,16 @@ EFI_STATUS EFIAPI UefiMain(
         &KernelImage            // ImageHandle
     );
     if (Status == EFI_NOT_FOUND) {
-        return HandleError(Status, L"Kernel(//nyxskrnl.efi) is not found.");
+        gBS->FreePool(KernelPath);
+        return HandleError(Status, L"Kernel(\\nyxskrnl.efi) is not found.");
     } else if (EFI_ERROR(Status)) {
+        gBS->FreePool(KernelPath);
         return HandleError(Status, L"Kernel LoadImage Failed");
+    }
+
+    Status = gBS->FreePool(KernelPath);
+    if (EFI_ERROR(Status)) {
+        return HandleError(Status, L"Free KernelPath Failed");
     }
 
     // 8. 커널에 NTBLI 정보 전달 (LoadOptions 사용)
