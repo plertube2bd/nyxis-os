@@ -26,6 +26,14 @@ typedef long long i64;
     typedef i32 isize;
 #endif
 
+// NULL
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 202311L
+        // C23
+    #define nNULL nullptr
+#else
+    #define nNULL ((void*)0)
+#endif
+
 // chars
 typedef u8  utf8;
 typedef u16 utf16;
