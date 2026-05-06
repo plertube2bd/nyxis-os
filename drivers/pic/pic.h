@@ -33,4 +33,6 @@ void pic_set_mask(u8 irq);
 // irq 언마스크
 void pic_clear_mask(u8 irq);
 
+static u16 __pic_get_reg(u8 ocw3);
+
 #endif
