@@ -17,6 +17,9 @@
 #define ICW1_ICW4   0x01
 #define ICW4_8086   0x01
 
+static u8 g_pic_offset1 = 0x20;
+static u8 g_pic_offset2 = 0x28;
+
 // ============================
 // IMPLEMENTATION
 // ============================
