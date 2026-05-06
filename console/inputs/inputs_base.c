@@ -52,7 +52,7 @@ u8 get_scancode() {
 
 utf8 translate(u8 sc) {
     if (sc >= 128) return 0;
-    i32 shift = shift_l || shift_r;
+    u8 shift = shift_l || shift_r;
     utf8 c = shift ? shifted[sc] : normal[sc];
 
     // Caps Lock 처리 (알파벳만)
