@@ -36,8 +36,11 @@ static utf8 shifted[128] = {
 
 u8 get_scancode() {
     while (1) {
-        if (inb(0x64) & 1)
+        cli();
+        if (inb(0x64) & 1) {
             return inb(0x60);
+            sti();
+        }
         sti();
         hlt();
     }
