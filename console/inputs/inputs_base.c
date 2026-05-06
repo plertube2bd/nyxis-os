@@ -1,6 +1,8 @@
 #include "nyxis.h"
 #include "lowlevel.h"
 
+#include "console/inputs_base.h"
+
 // ==========================
 // 키보드 상태
 // ==========================
@@ -36,7 +38,8 @@ u8 get_scancode() {
     while (1) {
         if (inb(0x64) & 1)
             return inb(0x60);
-        __asm__ volatile ("hlt");
+        sti();
+        hlt();
     }
 }
 
@@ -75,6 +78,7 @@ utf8 get_char() {
         if (sc & 0x80) {
             u8 key = sc & 0x7F;
             if (!extended) {
+                // TODO: extended 구현
                 if (key == 42) shift_l = 0;
                 if (key == 54) shift_r = 0;
             }
@@ -84,6 +88,7 @@ utf8 get_char() {
 
         // ===== 프레스 =====
         if (!extended) {
+            // TODO: extended 구현
             if (sc == 42) { shift_l = 1; continue; }
             if (sc == 54) { shift_r = 1; continue; }
             if (sc == 58) { // Caps Lock
