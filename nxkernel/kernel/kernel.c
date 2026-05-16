@@ -30,7 +30,7 @@ extern u32 next_pid;
 // Current process
 extern process_t* current_process;
 
-void zero_div(void) {
+interrupt void zero_div(void) {
 	__asm__ volatile ("push $0");
 	//hahaha
 	struct status current_stack_status = find_current_status();
