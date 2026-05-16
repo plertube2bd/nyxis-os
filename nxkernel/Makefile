@@ -23,7 +23,7 @@ OVMF_VARS = /usr/share/OVMF/OVMF_VARS_4M.fd
 CFLAGS = \
 -I$(EFIINC) \
 -I$(EFIARCH) \
--I$(ROOT)/include \
+	-I$(ROOT)/nxkernel \
 -fshort-wchar \
 -std=gnu11 \
 -ffreestanding \
@@ -54,7 +54,7 @@ CFLAGS = \
 KERNEL_CFLAGS = \
 	-nostdinc \
 	-I. \
-	-I$(ROOT)/include \
+	-I$(ROOT)/nxkernel \
 	-Ikernel \
 	-Iconsole/outputs \
 	-m64
@@ -124,7 +124,7 @@ $(BUILD)/paging/paging.o: kernel/paging/paging.c | $(BUILD)
 	mkdir -p $(dir $@)
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD)/memory.o: $(ROOT)/include/memory.c | $(BUILD)
+$(BUILD)/memory.o: $(ROOT)/nxkernel/include/memory.c | $(BUILD)
 	mkdir -p $(dir $@)
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
