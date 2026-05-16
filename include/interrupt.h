@@ -24,12 +24,12 @@ struct idt_entry{
 #define idt_entry_offset_high 6 /*16*/
 //64bit extand
 #define idt_entry_offset_mid 6 /*16*/
-#define idt_entry_offset_high 8 /*32*/
+#define idt_entry_offset_high_64 8 /*32*/
 #define idt_entry_zerof64 12 /*32*/
 /*addr = offset_low | (offset_high << 16);
 addr = offset_low | ((unsigned long)offset_mid << 16) | ((unsigned long)offset+high << 32);
-/*selector
-kernel code segment 0x08
+// selector
+// kernel code segment 0x08
 */
 /*type attr
 7 Present
@@ -43,40 +43,64 @@ kernel code segment 0x08
 */
 
 typedef struct interrupt_frame32 {
-	unsigned int eip;unsigned int cs;unsigned eflags;
-}interrupt_frame32_t;
+	u32 eip;
+	u32 cs;
+	u32 eflags;
+} interrupt_frame32_t;
 
 typedef struct interrupt_error_frame32 {
-	unsigned int error_code;unsigned int eip;unsigned int cs;unsigned eflags;
-}interrupt_error_frame32_t;
+	u32 error_code;
+	u32 eip;
+	u32 cs;
+	u32 eflags;
+} interrupt_error_frame32_t;
 
 typedef struct interrupt_frame32_ring {
-	unsigned int eip;unsigned int cs;unsigned eflags;
-	unsigned int esp;unsigned ss;
-}interrupt_frame32_ring_t;
+	u32 eip;
+	u32 cs;
+	u32 eflags;
+	u32 esp;
+	u32 ss;
+} interrupt_frame32_ring_t;
 
 typedef struct inturrupt_frame64 {
-	unsigned long rip;unsigned long cs;unsigned long rflags;;
-}interrupt_frame64_t;
+	u64 rip;
+	u64 cs;
+	u64 rflags;
+} interrupt_frame64_t;
 
 typedef struct inturrupt_frame64_ring {
-	unsigned long rip;unsigned long cs;unsigned long rflags;unsigned long rsp;unsigned long ss;
-}interrupt_frame64_ring_t;
+	u64 rip;
+	u64 cs;
+	u64 rflags;
+	u64 rsp;
+	u64 ss;
+} interrupt_frame64_ring_t;
 
 typedef struct inturrupt_error_frame64 {
-	unsigned long error_code;unsigned long rip;unsigned long cs;unsigned long rflags;unsigned long rsp;unsigned long ss;
-}interrupt_error_frame64_t;
+	u64 error_code;
+	u64 rip;
+	u64 cs;
+	u64 rflags;
+	u64 rsp;
+	u64 ss;
+} interrupt_error_frame64_t;
 
 typedef struct inturrupt_error_frame64_ring {
-	unsigned long error_code;unsigned long rip;unsigned long cs;unsigned long rflags;unsigned long rsp;unsigned long ss;
-}interrupt_error_frame64_ring_t;
+	u64 error_code;
+	u64 rip;
+	u64 cs;
+	u64 rflags;
+	u64 rsp;
+	u64 ss;
+} interrupt_error_frame64_ring_t;
 
 struct tss64 {
 	u32 res1;
 	u64 rsp0;
 	u64 rsp1;
 	u64 rsp2;
-	u64 res1;
+	u64 res2;
 	u64 ist1;
 	u64 ist2;
 	u64 ist3;
@@ -84,9 +108,9 @@ struct tss64 {
 	u64 ist5;
 	u64 ist6;
 	u64 ist7;
-	u64 res2;
-	u16 res3
-	u16 iomap_base
+	u64 res3;
+	u16 res4;
+	u16 iomap_base;
 }pack;
 
 struct regs64 {
@@ -96,8 +120,8 @@ struct regs64 {
 	u64 r12;
 	u64 r11;
 	u64 r10;
-	u64 r9{}
-	u64 r8{}
+	u64 r9;
+	u64 r8;
 	
 	u64 rbp;
 	u64 rdi;
@@ -111,10 +135,10 @@ struct status {u8 type; void* pointer;};
 
 void idt_set_gate(i32, void*, struct idt_entry*, u8, u8);
 void idt_init(u16, u64);
-void* idt_get_entry();
+void* idt_get_entry(void);
 
-interrupt void zero_div();
-static struct status find_current_status();
+void zero_div(void);
+struct status find_current_status(void);
 
 //must writing out a functions about the GDT!!!
 

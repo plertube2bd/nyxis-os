@@ -5,7 +5,7 @@
 #include "kernel/paging.h"
 
 __attribute__((noreturn))
-static inline void kernel_panic_simple(const char* Message, Nstatus error) {
+void kernel_panic_simple(const char* Message, Nstatus error) {
     disable_paging();
     printk("\n");
     printk("========================================\n");

@@ -79,7 +79,7 @@ static inline void outl(u16 port, u32 value) {
     __asm__ volatile ("outl %0, %1" : : "a"(value), "Nd"(port));
 }
 
-static inline void io_wait() {
+static inline void io_wait(void) {
     __asm__ volatile ("outb %%al, $0x80" : : "a"(0));
 }
 
@@ -88,15 +88,15 @@ static inline void io_wait() {
 // FLAGS / INTERRUPT
 // ============================
 
-static inline void cli() {
+static inline void cli(void) {
     __asm__ volatile ("cli");
 }
 
-static inline void sti() {
+static inline void sti(void) {
     __asm__ volatile ("sti");
 }
 
-static inline void hlt() {
+static inline void hlt(void) {
     __asm__ volatile ("hlt");
 }
 
@@ -105,7 +105,7 @@ static inline void hlt() {
 // RFLAGS
 // ============================
 
-static inline u64 read_rflags() {
+static inline u64 read_rflags(void) {
     u64 flags;
     __asm__ volatile (
         "pushfq\n\t"
@@ -130,7 +130,7 @@ static inline void write_rflags(u64 flags) {
 // CONTROL REGISTERS
 // ============================
 
-static inline u64 read_cr0() {
+static inline u64 read_cr0(void) {
     u64 val;
     __asm__ volatile ("mov %%cr0, %0" : "=r"(val));
     return val;
@@ -140,7 +140,7 @@ static inline void write_cr0(u64 val) {
     __asm__ volatile ("mov %0, %%cr0" : : "r"(val) : "memory");
 }
 
-static inline u64 read_cr3() {
+static inline u64 read_cr3(void) {
     u64 val;
     __asm__ volatile ("mov %%cr3, %0" : "=r"(val));
     return val;
@@ -150,7 +150,7 @@ static inline void write_cr3(u64 val) {
     __asm__ volatile ("mov %0, %%cr3" : : "r"(val) : "memory");
 }
 
-static inline u64 read_cr4() {
+static inline u64 read_cr4(void) {
     u64 val;
     __asm__ volatile ("mov %%cr4, %0" : "=r"(val));
     return val;
@@ -165,7 +165,7 @@ static inline void write_cr4(u64 val) {
 // TSC (Time Stamp Counter)
 // ============================
 
-static inline u64 rdtsc() {
+static inline u64 rdtsc(void) {
     u32 low, high;
     __asm__ volatile ("rdtsc" : "=a"(low), "=d"(high));
     return ((u64)high << 32) | low;
@@ -176,15 +176,15 @@ static inline u64 rdtsc() {
 // MEMORY BARRIER
 // ============================
 
-static inline void mfence() {
+static inline void mfence(void) {
     __asm__ volatile ("mfence" ::: "memory");
 }
 
-static inline void lfence() {
+static inline void lfence(void) {
     __asm__ volatile ("lfence" ::: "memory");
 }
 
-static inline void sfence() {
+static inline void sfence(void) {
     __asm__ volatile ("sfence" ::: "memory");
 }
 
@@ -193,7 +193,7 @@ static inline void sfence() {
 // PAUSE (spinlock 최적화)
 // ============================
 
-static inline void cpu_pause() {
+static inline void cpu_pause(void) {
     __asm__ volatile ("pause");
 }
 

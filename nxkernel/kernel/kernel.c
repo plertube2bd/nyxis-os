@@ -4,7 +4,8 @@
 #include "boot_info.h"
 #include "lowlevel.h"
 #include "console/outputs/printk.h"
-#include "include/inturrupt.h"
+#include "include/interrupt.h"
+#include "kernel/error_handling/panic.h"
 
 // Interrupt
 struct idt_entry idt;
@@ -19,6 +20,7 @@ NTBLI* get_kernel_info() {
     // In a full implementation, add privilege checks here
     // For now, return the kernel info
     return kernel_info;
+    // after multiprocessing, we can add process-specific info here as well
 }
 
 // Process list
@@ -28,20 +30,14 @@ extern u32 next_pid;
 // Current process
 extern process_t* current_process;
 
-interrupt void zero_div(){
+void zero_div(void) {
 	__asm__ volatile ("push $0");
 	//hahaha
-	struct status* current_stack_status;
-	current_stack_p = find_current_status();
-	if(current_stack_p->type){
+	struct status current_stack_status = find_current_status();
+	if (current_stack_status.type) {
 		process_terminate(current_process->pid);
 	}
-	else{
-		// KERNEL PANIC
-		for(;;){
-			__asm__ volatile ("hlt");
-		}
-	}
+	else { kernel_panic_simple("Zero division error", NdivideByZero); }
 }
 
 // Kernel main function - called from assembly entry point
@@ -66,7 +62,7 @@ void kernel_main(NTBLI* boot_info) {
         boot_info->height
     );
     if (NSTATUS_IS_ERR(status)) {
-        hlt();
+        kernel_panic_simple("Failed to initialize console output", status);
     }
 
     // Print boot message
@@ -74,7 +70,7 @@ void kernel_main(NTBLI* boot_info) {
     printk("Resolution: %ux%u\n", boot_info->width, boot_info->height);
     
     // Set up Interrupt Handers
-    idt_set_gate(0, zero_div, idt, 0x8E, 0x0);
+    idt_set_gate(0, zero_div, &idt, 0x8E, 0x0);
     
 
     // TODO: Create first user process

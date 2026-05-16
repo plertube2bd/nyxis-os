@@ -1,6 +1,8 @@
 #ifndef NYXIS_H
 #define NYXIS_H
 
+#include <stdint.h>
+
 #if UINTPTR_MAX == 0xFFFFFFFFFFFFFFFF
     #define NYXIS_64BITS
 #else
