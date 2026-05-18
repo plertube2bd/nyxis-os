@@ -1,0 +1,123 @@
+; =========================================================
+; Nyxis OS Syscall ABI v1
+; x86_64
+; =========================================================
+
+; rax = syscall number
+; rdi, rsi, rdx, r10, r8, r9 = args
+; return:
+;   rax >= 0  : success
+;   rax < 0   : -errno
+;
+; object handle type:
+;   u64 handle
+;
+; namespace style:
+;   Nx*
+
+; =========================================================
+; 0x0000 ~ 0x001F : Core
+; =========================================================
+
+0   | NxNull              ; nop
+1   | NxGetRoi            ; root object info / capability
+2   | NxGetVersion
+3   | NxGetTime
+4   | NxSleep
+5   | NxYield
+6   | NxRandom
+7   | NxSysInfo
+
+; =========================================================
+; 0x0020 ~ 0x003F : Object / Handle API
+; =========================================================
+
+32  | NxOpen
+33  | NxClose
+34  | NxRead
+35  | NxWrite
+36  | NxSeek
+37  | NxStat
+38  | NxIoctl
+39  | NxMap
+40  | NxUnmap
+41  | NxDuplicateHandle
+42  | NxPoll
+
+; =========================================================
+; 0x0040 ~ 0x005F : Process / Thread
+; =========================================================
+
+64  | NxProcessCreate
+65  | NxProcessExit
+66  | NxProcessKill
+67  | NxProcessWait
+68  | NxProcessInfo
+
+69  | NxThreadCreate
+70  | NxThreadExit
+71  | NxThreadJoin
+72  | NxThreadYield
+
+; =========================================================
+; 0x0060 ~ 0x007F : Memory
+; =========================================================
+
+96  | NxVirtualAlloc
+97  | NxVirtualFree
+98  | NxProtect
+99  | NxSharedMemoryCreate
+100 | NxSharedMemoryMap
+
+; =========================================================
+; 0x0080 ~ 0x009F : IPC
+; =========================================================
+
+128 | NxPipeCreate
+129 | NxChannelCreate
+130 | NxChannelSend
+131 | NxChannelReceive
+132 | NxSignal
+133 | NxEventCreate
+
+; =========================================================
+; 0x00A0 ~ 0x00BF : Filesystem
+; =========================================================
+
+160 | NxMount
+161 | NxUnmount
+162 | NxCreateNode
+163 | NxRemoveNode
+164 | NxRenameNode
+165 | NxReadDir
+
+; =========================================================
+; 0x00C0 ~ 0x00DF : Device / Driver
+; =========================================================
+
+192 | NxDeviceOpen
+193 | NxDeviceCommand
+194 | NxDeviceMapMMIO
+195 | NxInterruptWait
+
+; =========================================================
+; 0x00E0 ~ 0x00FF : Networking
+; =========================================================
+
+224 | NxSocket
+225 | NxBind
+226 | NxListen
+227 | NxAccept
+228 | NxConnect
+229 | NxSend
+230 | NxReceive
+
+; =========================================================
+; 0x0300 ~ Debug / Experimental
+; =========================================================
+
+768 | NxTrace
+769 | NxKernelLog
+770 | NxDebugBreak
+
+777 | NxDebugNop         ; compatibility debug syscall
