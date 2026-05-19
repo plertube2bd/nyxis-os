@@ -19,7 +19,7 @@
 ; 0x0000 ~ 0x001F : Core
 ; =========================================================
 
-0   | NxNull              ; nop
+0   | NxWhatCanIWriteHereHelpIamSad
 1   | NxGetRoi            ; root object info / capability
 2   | NxGetVersion
 3   | NxGetTime
@@ -119,5 +119,6 @@
 768 | NxTrace
 769 | NxKernelLog
 770 | NxDebugBreak
+771 | NxPrintHelloWorld
 
 777 | NxDebugNop         ; compatibility debug syscall

@@ -11,18 +11,61 @@ typedef enum {
     PROCESS_TERMINATED
 } process_state_t;
 
-// Process structure
 typedef struct process {
     u32 pid;
-    process_state_t state;
+
+    u32 state;
+
     void* stack;
     void* entry_point;
+
+    void* cr3;
+
+#ifdef NYXIS_64BITS
+
+    u64 rax;
+    u64 rbx;
+    u64 rcx;
+    u64 rdx;
+
+    u64 rsi;
+    u64 rdi;
+    u64 rbp;
+
+    u64 rsp;
+    u64 rip;
+
+    u64 rflags;
+
+    u64 r8;
+    u64 r9;
+    u64 r10;
+    u64 r11;
+    u64 r12;
+    u64 r13;
+    u64 r14;
+    u64 r15;
+
+#else
+
+    u32 eax;
+    u32 ebx;
+    u32 ecx;
+    u32 edx;
+
+    u32 esi;
+    u32 edi;
+    u32 ebp;
+
+    u32 esp;
+    u32 eip;
+
+    u32 eflags;
+
+#endif
+
     struct process* next;
-    // Registers for context switching
-    u32 eax, ebx, ecx, edx;
-    u32 esi, edi, ebp, esp;
-    u32 eip, eflags;
-    u32 cr3; // Page directory
+
 } process_t;
 
 // Functions

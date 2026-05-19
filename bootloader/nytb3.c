@@ -1,8 +1,7 @@
 #include <efi.h>
 #include <efilib.h>
 #include <efiprot.h>
-
-#include "boot_info.h"
+#include "../nxkernel/include/nyxis.h"
 
 /* =========================================================
  * ELF32 DEFINITIONS
@@ -12,10 +11,62 @@
 
 #define ET_EXEC 2
 #define EM_386  3
+#define EM_X86_64 62
 
 #define PT_LOAD 1
 
 #define PAGE_SIZE 4096
+
+#define ELFCLASS32 1
+#define ELFCLASS64 2
+
+typedef struct {
+    UINT32 e_magic;
+
+    UINT8  e_class;
+    UINT8  e_data;
+    UINT8  e_version;
+    UINT8  e_osabi;
+    UINT8  e_abiversion;
+    UINT8  pad[7];
+
+    UINT16 e_type;
+    UINT16 e_machine;
+
+    UINT32 e_version2;
+
+    UINT64 e_entry;
+
+    UINT64 e_phoff;
+    UINT64 e_shoff;
+
+    UINT32 e_flags;
+
+    UINT16 e_ehsize;
+    UINT16 e_phentsize;
+    UINT16 e_phnum;
+
+    UINT16 e_shentsize;
+    UINT16 e_shnum;
+    UINT16 e_shstrndx;
+
+} ELF64_HEADER;
+
+typedef struct {
+    UINT32 p_type;
+    UINT32 p_flags;
+
+    UINT64 p_offset;
+
+    UINT64 p_vaddr;
+    UINT64 p_paddr;
+
+    UINT64 p_filesz;
+    UINT64 p_memsz;
+
+    UINT64 p_align;
+
+} ELF64_PROGRAM_HEADER;
 
 typedef struct {
     UINT32 e_magic;
@@ -140,115 +191,139 @@ read_file(
 /* =========================================================
  * LOAD ELF
  * ========================================================= */
-
 EFI_STATUS
 load_elf_kernel(
     VOID* elf_buffer,
     UINTN elf_size,
     kernel_entry_t* entry_point
 ) {
-    ELF_HEADER* hdr;
-    ELF_PROGRAM_HEADER* phdr;
+    UINT8 elf_class = *((UINT8*)elf_buffer + 4);
 
     UINTN i;
 
-    hdr = (ELF_HEADER*)elf_buffer;
+    if (elf_class == ELFCLASS32) {
 
-    /* -----------------------------
-     * Validate ELF
-     * ----------------------------- */
+        ELF_HEADER* hdr = (ELF_HEADER*)elf_buffer;
 
-    if (elf_size < sizeof(ELF_HEADER)) {
-        return EFI_INVALID_PARAMETER;
-    }
+        if (hdr->e_magic != ELF_MAGIC)
+            return EFI_INVALID_PARAMETER;
 
-    if (hdr->e_magic != ELF_MAGIC) {
-        Print(L"Invalid ELF magic\n");
-        return EFI_INVALID_PARAMETER;
-    }
+        if (hdr->e_machine != EM_386)
+            return EFI_INVALID_PARAMETER;
 
-    if (hdr->e_machine != EM_386) {
-        Print(L"Invalid architecture\n");
-        return EFI_INVALID_PARAMETER;
-    }
+        for (i = 0; i < hdr->e_phnum; i++) {
 
-    if (hdr->e_type != ET_EXEC) {
-        Print(L"ELF is not executable\n");
-        return EFI_INVALID_PARAMETER;
-    }
+            ELF_PROGRAM_HEADER* phdr =
+                (ELF_PROGRAM_HEADER*)(
+                    (UINTN)elf_buffer +
+                    hdr->e_phoff +
+                    i * hdr->e_phentsize
+                );
 
-    /* -----------------------------
-     * Load Segments
-     * ----------------------------- */
+            if (phdr->p_type != PT_LOAD)
+                continue;
 
-    for (i = 0; i < hdr->e_phnum; i++) {
+            EFI_PHYSICAL_ADDRESS addr =
+                (EFI_PHYSICAL_ADDRESS)phdr->p_paddr;
 
-        phdr = (ELF_PROGRAM_HEADER*)(
-            (UINTN)elf_buffer +
-            hdr->e_phoff +
-            (i * hdr->e_phentsize)
-        );
+            UINTN pages =
+                (phdr->p_memsz + PAGE_SIZE - 1) / PAGE_SIZE;
 
-        if (phdr->p_type != PT_LOAD) {
-            continue;
+            EFI_STATUS Status =
+                uefi_call_wrapper(
+                    BS->AllocatePages,
+                    4,
+                    AllocateAddress,
+                    EfiLoaderData,
+                    pages,
+                    &addr
+                );
+
+            if (EFI_ERROR(Status))
+                return Status;
+
+            SetMem((VOID*)(UINTN)addr,
+                   phdr->p_memsz,
+                   0);
+
+            CopyMem(
+                (VOID*)(UINTN)addr,
+                (VOID*)((UINTN)elf_buffer + phdr->p_offset),
+                phdr->p_filesz
+            );
         }
 
-        EFI_PHYSICAL_ADDRESS SegmentAddr;
-        UINTN Pages;
+        *entry_point =
+            (kernel_entry_t)(UINTN)hdr->e_entry;
 
-        VOID* SegmentData;
+        Print(L"Loaded ELF32 kernel\n");
 
-        EFI_STATUS Status;
-
-        SegmentAddr = phdr->p_paddr;
-
-        Pages = (phdr->p_memsz + PAGE_SIZE - 1) / PAGE_SIZE;
-
-        Print(
-            L"Loading segment %u -> 0x%x (%u bytes)\n",
-            i,
-            SegmentAddr,
-            phdr->p_memsz
-        );
-
-        /* Allocate pages at exact physical address */
-
-        Status = uefi_call_wrapper(
-            BS->AllocatePages,
-            4,
-            AllocateAddress,
-            EfiLoaderData,
-            Pages,
-            &SegmentAddr
-        );
-
-        if (EFI_ERROR(Status)) {
-            Print(L"AllocatePages failed: %r\n", Status);
-            return Status;
-        }
-
-        SegmentData = (VOID*)((UINTN)elf_buffer + phdr->p_offset);
-
-        /* Zero segment */
-
-        SetMem(
-            (VOID*)(UINTN)SegmentAddr,
-            phdr->p_memsz,
-            0
-        );
-
-        /* Copy ELF data */
-
-        CopyMem(
-            (VOID*)(UINTN)SegmentAddr,
-            SegmentData,
-            phdr->p_filesz
-        );
+        return EFI_SUCCESS;
     }
 
-    *entry_point = (kernel_entry_t)(UINTN)hdr->e_entry;
+    else if (elf_class == ELFCLASS64) {
 
-    return EFI_SUCCESS;
+        ELF64_HEADER* hdr = (ELF64_HEADER*)elf_buffer;
+
+        if (hdr->e_magic != ELF_MAGIC)
+            return EFI_INVALID_PARAMETER;
+
+        if (hdr->e_machine != EM_X86_64)
+            return EFI_INVALID_PARAMETER;
+
+        for (i = 0; i < hdr->e_phnum; i++) {
+
+            ELF64_PROGRAM_HEADER* phdr =
+                (ELF64_PROGRAM_HEADER*)(
+                    (UINTN)elf_buffer +
+                    hdr->e_phoff +
+                    i * hdr->e_phentsize
+                );
+
+            if (phdr->p_type != PT_LOAD)
+                continue;
+
+            EFI_PHYSICAL_ADDRESS addr =
+                (EFI_PHYSICAL_ADDRESS)phdr->p_paddr;
+
+            UINTN pages =
+                (phdr->p_memsz + PAGE_SIZE - 1) / PAGE_SIZE;
+
+            EFI_STATUS Status =
+                uefi_call_wrapper(
+                    BS->AllocatePages,
+                    4,
+                    AllocateAddress,
+                    EfiLoaderData,
+                    pages,
+                    &addr
+                );
+
+            if (EFI_ERROR(Status))
+                return Status;
+
+            SetMem(
+                (VOID*)(UINTN)addr,
+                (UINTN)phdr->p_memsz,
+                0
+            );
+
+            CopyMem(
+                (VOID*)(UINTN)addr,
+                (VOID*)((UINTN)elf_buffer + phdr->p_offset),
+                (UINTN)phdr->p_filesz
+            );
+        }
+
+        *entry_point =
+            (kernel_entry_t)(UINTN)hdr->e_entry;
+
+        Print(L"Loaded ELF64 kernel\n");
+
+        return EFI_SUCCESS;
+    }
+
+    return EFI_UNSUPPORTED;
 }
 
 /* =========================================================
