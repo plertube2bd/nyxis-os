@@ -4,6 +4,7 @@
 #include "boot_info.h"
 #include "lowlevel.h"
 #include "console/outputs/printk.h"
+#include "../drivers/unfinished/ahci.h"
 #include "include/interrupt.h"
 #include "kernel/error_handling/panic.h"
 
@@ -68,6 +69,11 @@ void kernel_main(NTBLI* boot_info) {
     // Print boot message
     printk("Nyxis OS Kernel Started\n");
     printk("Resolution: %ux%u\n", boot_info->width, boot_info->height);
+
+    status = ahci_init();
+    if (NSTATUS_IS_ERR(status)) {
+        printk("AHCI init failed: %x\n", status);
+    }
     
     // Set up Interrupt Handers
     idt_set_gate(0, zero_div, &idt, 0x8E, 0x0);

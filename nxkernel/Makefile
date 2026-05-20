@@ -95,7 +95,8 @@ KERNEL_OBJS = \
 	$(BUILD)/kernel.o \
 	$(BUILD)/memory.o \
 	$(BUILD)/console/outputs/printk.o \
-	$(BUILD)/console/outputs/outputs_base.o
+	$(BUILD)/console/outputs/outputs_base.o \
+	$(BUILD)/ahci.o
 
 # =========================
 # Targets
@@ -133,6 +134,10 @@ $(BUILD)/console/outputs/printk.o: console/outputs/printk.c | $(BUILD)
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD)/console/outputs/outputs_base.o: console/outputs/outputs_base.c | $(BUILD)
+	mkdir -p $(dir $@)
+	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD)/ahci.o: $(ROOT)/drivers/unfinished/ahci.c | $(BUILD)
 	mkdir -p $(dir $@)
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 

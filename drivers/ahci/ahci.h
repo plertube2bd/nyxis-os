@@ -1,15 +1,7 @@
-// do not use in real os. it's unfinished.
-
 #ifndef AHCI_H
 #define AHCI_H
 
 #include "include/nyxis.h"
-
-// ======================================================
-// AHCI DEFINES
-// ======================================================
-
-#define AHCI_BASE 0x400000
 
 #define HBA_PORT_DET_PRESENT 3
 #define HBA_PORT_IPM_ACTIVE  1
@@ -23,11 +15,14 @@
 #define HBA_PX_CMD_FR   (1 << 14)
 #define HBA_PX_CMD_CR   (1 << 15)
 
+#define HBA_GHC_AE      (1 << 0)
+#define HBA_GHC_IE      (1 << 1)
+#define HBA_GHC_HR      (1 << 2)
+
 #define FIS_TYPE_REG_H2D 0x27
 
-// ======================================================
-// AHCI STRUCTURES
-// ======================================================
+#define AHCI_MAX_PORTS 32
+#define AHCI_MAX_CMD_SLOTS 32
 
 typedef volatile struct {
     u32 clb;
@@ -71,9 +66,9 @@ typedef volatile struct {
 } HBA_MEM;
 
 typedef struct {
-    u8  cfis[64];
-    u8  acmd[16];
-    u8  rsv[48];
+    u8 cfis[64];
+    u8 acmd[16];
+    u8 rsv[48];
 } HBA_CMD_TBL;
 
 typedef struct {
@@ -84,6 +79,13 @@ typedef struct {
     u32 ctbau;
     u32 rsv1[4];
 } HBA_CMD_HEADER;
+
+typedef struct {
+    u32 dba;
+    u32 dbau;
+    u32 rsv0;
+    u32 dbc;
+} HBA_PRDT_ENTRY;
 
 typedef struct {
     u8 fis_type;
@@ -112,48 +114,13 @@ typedef struct {
     u8 rsv1[4];
 } FIS_REG_H2D;
 
-// ======================================================
-// GLOBAL
-// ======================================================
-
-static volatile HBA_MEM* ahci_base = (HBA_MEM*)AHCI_BASE;
-
-// ======================================================
-// PORT HELPERS
-// ======================================================
-
-static void ahci_stop_cmd(HBA_PORT* Port);
-
-static void ahci_start_cmd(HBA_PORT* Port);
-
-static i32 ahci_check_type(HBA_PORT* Port);
-
-// ======================================================
-// FIND SATA PORT
-// ======================================================
-
-static HBA_PORT* ahci_find_port(void);
-
-// ======================================================
-// PORT INIT
-// ======================================================
-
-static void ahci_port_rebase(HBA_PORT* Port, i32 PortNo);
-
-// ======================================================
-// READ SECTOR
-// ======================================================
-
-i32 ahci_read(
+Nstatus ahci_init(void);
+HBA_PORT* ahci_find_port(void);
+Nstatus ahci_read(
     HBA_PORT* Port,
     u64 StartLba,
     u32 SectorCount,
     void* Buffer
 );
-
-// ======================================================
-// INIT
-// ======================================================
-void ahci_init(void);
 
 #endif // AHCI_H
