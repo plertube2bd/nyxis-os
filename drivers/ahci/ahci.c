@@ -285,5 +285,5 @@ Nstatus ahci_init(void) {
     }
     printk("\n");
 
-    return NSTATUS_OK;
+    return Nok;
 }
