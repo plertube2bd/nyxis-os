@@ -1,5 +1,8 @@
 #pragma once
 
+#ifndef FILESYSTEMCORE_H
+#define FILESYSTEMCORE_H
+
 #include "include/nyxis.h"
 
 #define FILESYSTEM_MAX       32
@@ -45,3 +48,5 @@ Nstatus filesystem_format(
     const char* fsname,
     u32 diskno
 );
+
+#endif // FILESYSTEMCORE_H
