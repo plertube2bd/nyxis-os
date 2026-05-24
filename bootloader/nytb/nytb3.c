@@ -5,7 +5,7 @@
  * It is also not intended to be a general-purpose bootloader, but rather a simple loader for the Nyxis OS kernel
  * Directiry structure:
  * - EFI/BOOT/
- *   - nytbx64.efi (this file)
+ *   - nytbARCH.efi (this file) (ARCH = x64 or ia32)
  *   - kernel.elf (the kernel to load)
  * must kernel be in the same directory as the bootloader, and must be named "kernel.elf"
  * kernel can't be PE/COFF or anything, it must be static ELF file, and must be compiled for the correct architecture:
