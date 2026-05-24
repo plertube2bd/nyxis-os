@@ -1,6 +1,6 @@
 #include "ata.h"
-#include "include/lowlevel.h"
-#include "include/nyxis.h"
+#include "lowlevel.h"
+#include "nyxis.h"
 
 // Wait for BSY to clear and RDY to set
 static void ata_wait_ready() {

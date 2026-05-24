@@ -1,6 +1,8 @@
 #ifndef NYXIS_TYPES_H
 #define NYXIS_TYPES_H
 
+#include <stdint.h>
+
 #define pack __attribute__((packed));
 #define interrupt __attribute__((interrupt))
 
@@ -81,6 +83,127 @@ typedef struct {
 
 } NTBLI;
 
+extern bool multicore_enabled;
+
+// low-level operations from lowlevel.h
+static inline void cli(void);
+static inline void sti(void);
+
+// atomic type
+typedef struct {
+    volatile i32 value;
+} atomic_t;
+
+static inline void atomic_inc(atomic_t* v) {
+
+    if (!multicore_enabled) {
+        v->value++;
+        return;
+    }
+
+    __asm__ volatile(
+        "lock incl %0"
+        : "+m"(v->value)
+        :
+        : "memory"
+    );
+}
+
+static inline int atomic_cmpxchg(
+    atomic_t* v,
+    int old,
+    int new
+) {
+
+    if (!multicore_enabled) {
+
+        int prev = v->value;
+
+        if (prev == old)
+            v->value = new;
+
+        return prev;
+    }
+
+    int prev;
+
+    __asm__ volatile(
+        "lock cmpxchgl %2, %1"
+        : "=a"(prev), "+m"(v->value)
+        : "r"(new), "0"(old)
+        : "memory"
+    );
+
+    return prev;
+}
+
+static inline void atomic_set(atomic_t* v, int new)
+{
+    if (!multicore_enabled) {
+        v->value = new;
+        return;
+    }
+
+    __asm__ volatile(
+        "lock xchgl %0, %1"
+        : "+r"(new), "+m"(v->value)
+        :
+        : "memory"
+    );
+}
+
+// spinlock type
+typedef struct {
+    atomic_t locked;
+} spinlock_t;
+
+static inline void spin_lock(spinlock_t* lock) {
+
+    if (!multicore_enabled) {
+        cli();
+        return;
+    }
+
+    while (1) {
+
+        if (atomic_cmpxchg(
+                &lock->locked,
+                0,
+                1
+            ) == 0)
+        {
+            break;
+        }
+
+        while (lock->locked.value) {
+            __asm__ volatile("pause");
+        }
+    }
+
+    cli();
+}
+
+static inline void spin_unlock(spinlock_t* lock) {
+
+    if (!multicore_enabled) {
+        sti();
+        return;
+    }
+
+    atomic_set(&lock->locked, 0);
+
+    sti();
+}
+
+typedef uint64_t hkey_t;
+
+typedef struct hashmap_node {
+    hkey_t key;
+
+    void* value;
+
+    struct hashmap_node* next;
+} hashmap_node_t;
 
 // 64 error codes should be more than enough for now, and we can always expand to 128 or 256 if needed
 typedef enum {

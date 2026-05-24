@@ -3,7 +3,7 @@
 // x86 bare-metal OS
 // ============================
 
-#include "include/nyxis.h"
+#include "nyxis.h"
 #include "pit_base.h"
 
 // ============================

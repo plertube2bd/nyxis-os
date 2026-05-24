@@ -1,5 +1,5 @@
-#include "include/nyxis.h"
-#include "include/lowlevel.h"
+#include "nyxis.h"
+#include "lowlevel.h"
 
 #include "console/inputs/inputs_base.h"
 

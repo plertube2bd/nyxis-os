@@ -1,7 +1,7 @@
 #ifndef INPUTS_BASE_H
 #define INPUTS_BASE_H
 
-#include "include/nyxis.h"
+#include "nyxis.h"
 
 // ==========================
 // 포트 I/O

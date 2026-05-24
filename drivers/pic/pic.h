@@ -1,7 +1,7 @@
 #ifndef PIC_H
 #define PIC_H
 
-#include "include/nyxis.h"
+#include "nyxis.h"
 
 static u8 g_pic_offset1;
 static u8 g_pic_offset2;

@@ -4,8 +4,8 @@
 #include "boot_info.h"
 #include "lowlevel.h"
 #include "console/outputs/printk.h"
-#include "../drivers/unfinished/ahci.h"
-#include "include/interrupt.h"
+#include "../../drivers/ahci/ahci.h"
+#include "interrupt.h"
 #include "kernel/error_handling/panic.h"
 
 // Interrupt

@@ -1,8 +1,8 @@
 #include "drivers/filesystem/core.h"
 
-#include "include/nyxis.h"
-#include "include/memory.h"
-#include "include/string.h"
+#include "nyxis.h"
+#include "memory.h"
+#include "string.h"
 
 static filesystem_t g_filesystems[FILESYSTEM_MAX];
 

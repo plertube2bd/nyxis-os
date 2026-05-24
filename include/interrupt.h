@@ -1,7 +1,7 @@
 //this is for 32bit
 #ifndef INTURRUPT_H
 #define INTURRUPT_H
-#include "include/types.h"
+#include "types.h"
 struct idtr{
 	u16 limit;
 	u64 base ;

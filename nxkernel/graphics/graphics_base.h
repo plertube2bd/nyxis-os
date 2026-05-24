@@ -1,8 +1,8 @@
 #ifndef GRAPHICS_BASE_H
 #define GRAPHICS_BASE_H
 
-#include "include/nyxis.h"
-#include "include/memory.h"
+#include "nyxis.h"
+#include "memory.h"
 
 static inline void draw_pixel(NTBLI* info, i32 x, i32 y, u32 color) {
     u32* fb = (u32*)info->framebuffer_base;

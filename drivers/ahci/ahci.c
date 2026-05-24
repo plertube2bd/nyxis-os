@@ -1,9 +1,7 @@
-// do not use in real os. it's unfinished.
-
 #include "ahci.h"
-#include "include/lowlevel.h"
-#include "include/nyxis.h"
-#include "include/memory.h"
+#include "lowlevel.h"
+#include "nyxis.h"
+#include "memory.h"
 #include "console/outputs/printk.h"
 
 static volatile HBA_MEM* ahci_base = nNULL;
@@ -14,10 +12,10 @@ static u8 ahci_cmd_tables[AHCI_MAX_PORTS][AHCI_MAX_CMD_SLOTS][256] __attribute__
 
 static u32 pci_read_config(u8 bus, u8 device, u8 function, u8 offset) {
     u32 address = (1u << 31) |
-                    ((u32)bus << 16) |
-                    ((u32)device << 11) |
-                    ((u32)function << 8) |
-                    (offset & 0xFC);
+        ((u32)bus << 16) |
+        ((u32)device << 11) |
+        ((u32)function << 8) |
+        (offset & 0xFC);
 
     outl(0xCF8, address);
     return inl(0xCFC);

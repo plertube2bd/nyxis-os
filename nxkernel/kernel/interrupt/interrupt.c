@@ -1,4 +1,4 @@
-#include "include/interrupt.h"
+#include "interrupt.h"
 
 static interrupt_error_frame64_t* current_stack;
 static interrupt_error_frame64_ring_t* current_stack_user;

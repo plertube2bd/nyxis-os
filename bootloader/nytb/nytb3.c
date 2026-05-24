@@ -1,7 +1,26 @@
+/* NYxis Tiny Bootloader : NYTB 3
+ * This is first bootloader stage, which is a UEFI application that loads the kernel from the EFI System Partition and jumps to it.
+ * It also sets up a simple boot information structure (NTBLI) that is passed to the kernel, which contains information about the framebuffer and memory size.
+ * This bootloader is designed to be simple and easy to understand, and is not optimized for size or performance.
+ * It is also not intended to be a general-purpose bootloader, but rather a simple loader for the Nyxis OS kernel
+ * Directiry structure:
+ * - EFI/BOOT/
+ *   - nytbx64.efi (this file)
+ *   - kernel.elf (the kernel to load)
+ * must kernel be in the same directory as the bootloader, and must be named "kernel.elf"
+ * kernel can't be PE/COFF or anything, it must be static ELF file, and must be compiled for the correct architecture:
+ * x86_64-elf-gcc for 64-bit
+ * i386-elf-gcc for 32-bit
+ * This bootloader does not support loading from other filesystems or from network, and does not support any advanced features like command line arguments or multiple kernel images.
+ * must kernel entry get a pointer to NTBLI structure, and must not expect any other arguments or environment variables.
+ * now code ;)
+*/
+
+
 #include <efi.h>
 #include <efilib.h>
 #include <efiprot.h>
-#include "../nxkernel/include/nyxis.h"
+#include <nyxis.h>
 
 /* =========================================================
  * ELF32 DEFINITIONS
@@ -117,6 +136,10 @@ typedef struct {
 
 typedef void (*kernel_entry_t)(NTBLI*);
 
+EFI_STATUS read_file(EFI_FILE_HANDLE file, VOID** buffer, UINTN* size);
+EFI_STATUS load_elf_kernel(VOID* elf_buffer, UINTN elf_size, kernel_entry_t* entry_point);
+EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable);
+
 /* =========================================================
  * READ FILE
  * ========================================================= */
@@ -197,6 +220,7 @@ load_elf_kernel(
     UINTN elf_size,
     kernel_entry_t* entry_point
 ) {
+    (void)elf_size;
     UINT8 elf_class = *((UINT8*)elf_buffer + 4);
 
     UINTN i;

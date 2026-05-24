@@ -1,7 +1,7 @@
 #ifndef KERNEL_PROCESS_H
 #define KERNEL_PROCESS_H
 
-#include "include/nyxis.h"
+#include "nyxis.h"
 
 // Process states
 typedef enum {

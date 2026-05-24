@@ -1,7 +1,7 @@
 #ifndef _STRING_H
 #define _STRING_H
 
-#include "include/types.h"
+#include "types.h"
 
 /* String length */
 usize strlen(const utf8* s);

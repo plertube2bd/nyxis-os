@@ -1,9 +1,9 @@
 #ifndef RAMDISK_H
 #define RAMDISK_H
 
-#include "include/types.h"
-#include "include/nyxis.h"
-#include "include/memory.h"
+#include "types.h"
+#include "nyxis.h"
+#include "memory.h"
 
 typedef struct {
     u32 diskno;

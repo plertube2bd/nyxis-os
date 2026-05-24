@@ -1,6 +1,6 @@
 #include "pic.h"
-#include "include/lowlevel.h"
-#include "include/nyxis.h"
+#include "lowlevel.h"
+#include "nyxis.h"
 
 // ============================
 // PIC DEFINES

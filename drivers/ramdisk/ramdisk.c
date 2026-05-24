@@ -1,8 +1,8 @@
 #include "drivers/ramdisk/ramdisk.h"
 
-#include "include/nyxis.h"
-#include "include/memory.h"
-#include "include/interrupt.h"
+#include "nyxis.h"
+#include "memory.h"
+#include "interrupt.h"
 
 static ramdisk_t g_ramdisks[RAMDISK_MAX];
 

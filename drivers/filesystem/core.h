@@ -3,7 +3,7 @@
 #ifndef FILESYSTEMCORE_H
 #define FILESYSTEMCORE_H
 
-#include "include/nyxis.h"
+#include "nyxis.h"
 
 #define FILESYSTEM_MAX       32
 #define FILESYSTEM_NAME_MAX  32

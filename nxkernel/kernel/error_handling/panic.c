@@ -1,7 +1,7 @@
 #pragma once
 
-#include "include/nyxis.h"
-#include "include/lowlevel.h"
+#include "nyxis.h"
+#include "lowlevel.h"
 #include "kernel/paging/paging.h"
 
 __attribute__((noreturn))

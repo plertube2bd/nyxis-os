@@ -12,9 +12,14 @@ int strlen(const char *s) {
     return len;
 }
 
-
+#ifdef _NYX64
 void puts(const char *s) {
-    syscall_wrapper(35, 1, s, strlen(s), NULL, NULL);
+    syscall_wrapper(35, 1, (unsigned long long)&s, strlen(s), 0, 0, 0);
 }
+#else
+void puts(const char *s) {
+    syscall_wrapper(35, 1, (unsigned int)&s, strlen(s), 0, 0, 0);
+}
+#endif
 
 #endif

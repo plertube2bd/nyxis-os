@@ -1,6 +1,6 @@
-#include "include/string.h"
-#include "include/memory.h"
-#include "include/nyxis.h"
+#include "string.h"
+#include "memory.h"
+#include "nyxis.h"
 
 /* strlen */
 usize strlen(const utf8* s) {

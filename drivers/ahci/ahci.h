@@ -1,7 +1,7 @@
 #ifndef AHCI_H
 #define AHCI_H
 
-#include "include/nyxis.h"
+#include "nyxis.h"
 
 #define HBA_PORT_DET_PRESENT 3
 #define HBA_PORT_IPM_ACTIVE  1

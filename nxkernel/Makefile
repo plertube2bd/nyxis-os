@@ -3,6 +3,7 @@ AS = as
 LD = ld
 
 ROOT = ..
+INCLUDE_DIR = $(ROOT)/include
 BUILD = $(ROOT)/out
 
 # =========================
@@ -23,7 +24,7 @@ OVMF_VARS = /usr/share/OVMF/OVMF_VARS_4M.fd
 CFLAGS = \
 -I$(EFIINC) \
 -I$(EFIARCH) \
-	-I$(ROOT)/nxkernel \
+	-I$(INCLUDE_DIR) \
 -fshort-wchar \
 -std=gnu11 \
 -ffreestanding \
@@ -46,15 +47,18 @@ CFLAGS = \
 -Wwrite-strings \
 -Wstrict-prototypes \
 -Wmissing-prototypes \
--Wformat=2
+-Wformat=2 \
+-Wno-error=strict-prototypes \
+-Wno-error=undef
 
 # =========================
 # Kernel (64-bit)
 # =========================
 KERNEL_CFLAGS = \
 	-nostdinc \
+	-std=gnu11 \
 	-I. \
-	-I$(ROOT)/nxkernel \
+	-I$(INCLUDE_DIR) \
 	-Ikernel \
 	-Iconsole/outputs \
 	-m64
@@ -94,6 +98,7 @@ KERNEL_OBJS = \
 	$(BUILD)/start.o \
 	$(BUILD)/kernel.o \
 	$(BUILD)/memory.o \
+	$(BUILD)/string.o \
 	$(BUILD)/console/outputs/printk.o \
 	$(BUILD)/console/outputs/outputs_base.o \
 	$(BUILD)/ahci.o
@@ -125,7 +130,11 @@ $(BUILD)/paging/paging.o: kernel/paging/paging.c | $(BUILD)
 	mkdir -p $(dir $@)
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD)/memory.o: $(ROOT)/nxkernel/include/memory.c | $(BUILD)
+$(BUILD)/memory.o: $(ROOT)/nxkernel/lib/memory.c | $(BUILD)
+	mkdir -p $(dir $@)
+	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD)/string.o: $(ROOT)/nxkernel/lib/string.c | $(BUILD)
 	mkdir -p $(dir $@)
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
