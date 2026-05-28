@@ -1,6 +1,8 @@
 #ifndef STDINT_H
 #define STDINT_H
 
+// just use types.h btw
+
 typedef signed char        int8_t;
 typedef unsigned char      uint8_t;
 typedef signed short       int16_t;
