@@ -1,7 +1,6 @@
 #include "kernel/kernel.h"
 #include "kernel/process/process.h"
 #include "types.h"
-#include "boot_info.h"
 #include "lowlevel.h"
 #include "console/outputs/printk.h"
 #include "../../drivers/ahci/ahci.h"
@@ -82,9 +81,17 @@ void kernel_main(NTBLI* boot_info) {
     // TODO: Create first user process
     // TODO: Set up interrupt handlers
     // TODO: Initialize other subsystems
-
+	// we should start initrd or initialramfs.
+	// but there isn't init user programs..
+	// we should code init program in project/userland/init/initrd/
+	// and initrd must be fat32(LFS) or readonly ext2
+	// i think this kernel.c make ramdisk before ExitBootservices after Nytb
+    // exec(init);
     // For now, just loop
+	i32 count = 0;
     while (1) {
+		printk("there isn't initrd. (%d)", count);
+		count++;
         hlt();
     }
 }
