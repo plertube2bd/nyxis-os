@@ -161,3 +161,21 @@ void *memmove(void *dst, const void *src, usize size)
 
     return dst;
 }
+
+/* =========================
+ * memcmp
+ * ========================= */
+i32 memcmp(const void *a, const void *b, usize size)
+{
+    const utf8 *s1 = (const utf8 *)a;
+    const utf8 *s2 = (const utf8 *)b;
+
+    while (size--) {
+        if (*s1 != *s2)
+            return (i32)*s1 - (i32)*s2;
+        s1++;
+        s2++;
+    }
+
+    return 0;
+}

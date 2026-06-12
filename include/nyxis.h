@@ -1,6 +1,10 @@
 #ifndef NYXIS_H
 #define NYXIS_H
 
+#ifdef __cplusplus
+#error "C++ is not supported. Please compile with a C compiler."
+#endif
+
 #include <stdint.h>
 
 #if UINTPTR_MAX == 0xFFFFFFFFFFFFFFFF

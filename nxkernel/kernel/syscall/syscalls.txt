@@ -119,6 +119,6 @@
 768 | NxTrace
 769 | NxKernelLog
 770 | NxDebugBreak
-771 | NxPrintHelloWorld
+771 | NxKernelPrint
 
 777 | NxDebugNop         ; compatibility debug syscall

@@ -1,4 +1,4 @@
-#include "drivers/ramdisk/ramdisk.h"
+#include "ramdisk.h"
 
 #include "nyxis.h"
 #include "memory.h"
@@ -122,7 +122,8 @@ Nstatus ramdisk_write(
     return Nok;
 }
 
-Nstatus ramdisk_format(u32 diskno) {
+Nstatus ramdisk_format(u32 diskno, NTBLI *info) {
+    (void)info;
     ramdisk_t* rd = ramdisk_find(diskno);
 
     if (!rd) {

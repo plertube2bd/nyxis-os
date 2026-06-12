@@ -8,7 +8,7 @@
 typedef struct vnode vnode_t;
 typedef struct dentry dentry_t;
 typedef struct superblock superblock_t;
-typedef struct filesystem filesystem_t;
+typedef struct vfs_filesystem vfs_filesystem_t;
 typedef struct handle handle_t;
 
 typedef struct vfs_ops {
@@ -19,7 +19,7 @@ typedef struct vfs_ops {
     Nstatus (*close)(handle_t* handle);
 } vfs_ops_t;
 
-struct filesystem {
+struct vfs_filesystem {
     const char* name;
     superblock_t* sb;
     vfs_ops_t* ops;
@@ -37,11 +37,24 @@ typedef struct handle {
 } handle_t;
 
 Nstatus vfs_init(void);
-Nstatus vfs_mount(const char* path, filesystem_t* fs);
+Nstatus vfs_mount(const char* path, vfs_filesystem_t* fs);
 Nstatus vfs_unmount(const char* path);
+Nstatus vfs_register_namespace(const char* namespace_name, const char* source_path);
 Nstatus vfs_open(const char* path, u32 flags, handle_t* out_handle);
 Nstatus vfs_read(handle_t* handle, void* buffer, usize size, usize* bytes_read);
 Nstatus vfs_write(handle_t* handle, const void* buffer, usize size, usize* bytes_written);
 Nstatus vfs_close(handle_t* handle);
+
+vnode_t* vfs_alloc_vnode(void);
+Nstatus vfs_init_vnode(
+    vnode_t* vnode,
+    u64 inode_id,
+    u32 type,
+    vfs_ops_t* ops,
+    superblock_t* sb,
+    void* fs_private
+);
+void vfs_free_vnode(vnode_t* vnode);
+void* vfs_get_vnode_private(vnode_t* vnode);
 
 #endif // VFS_H

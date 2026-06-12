@@ -1,7 +1,9 @@
 //this is for 32bit
 #ifndef INTURRUPT_H
 #define INTURRUPT_H
-#include "types.h"
+
+#include "nyxis.h"
+
 struct idtr{
 	u16 limit;
 	u64 base ;
@@ -137,7 +139,7 @@ void idt_set_gate(i32, void*, struct idt_entry*, u8, u8);
 void idt_init(u16, u64);
 void* idt_get_entry(void);
 
-interrupt void zero_div(void);
+void zero_div(void);
 struct status find_current_status(void);
 
 //must writing out a functions about the GDT!!!

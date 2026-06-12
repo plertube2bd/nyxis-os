@@ -350,6 +350,107 @@ load_elf_kernel(
     return EFI_UNSUPPORTED;
 }
 
+static UINT32 get_preferred_gop_mode(EFI_GRAPHICS_OUTPUT_PROTOCOL* Gop)
+{
+    if (!Gop)
+        return 0;
+
+    UINT32 selected = Gop->Mode->Mode;
+
+    for (UINT32 mode = 0; mode < Gop->Mode->MaxMode; mode++) {
+        EFI_GRAPHICS_OUTPUT_MODE_INFORMATION* Info;
+        UINTN InfoSize;
+        EFI_STATUS Status = uefi_call_wrapper(
+            Gop->QueryMode,
+            4,
+            Gop,
+            mode,
+            &InfoSize,
+            &Info
+        );
+
+        if (EFI_ERROR(Status))
+            continue;
+
+        Print(L"GOP mode %u: %ux%u stride=%u format=%u\n",
+            mode,
+            Info->HorizontalResolution,
+            Info->VerticalResolution,
+            Info->PixelsPerScanLine,
+            Info->PixelFormat
+        );
+
+        if (Info->HorizontalResolution == 1024 && Info->VerticalResolution == 768) {
+            selected = mode;
+            break;
+        }
+
+        if (Info->HorizontalResolution == 800 && Info->VerticalResolution == 600 && selected == Gop->Mode->Mode) {
+            selected = mode;
+        }
+    }
+
+    return selected;
+}
+
+#define NYTB_DEBUG
+#ifdef NYTB_DEBUG
+static void fill_framebuffer_test(
+    EFI_GRAPHICS_OUTPUT_PROTOCOL* Gop
+)
+{
+    if (!Gop || !Gop->Mode || !Gop->Mode->Info)
+        return;
+
+    EFI_GRAPHICS_OUTPUT_MODE_INFORMATION* Info = Gop->Mode->Info;
+    u32 width = Info->HorizontalResolution;
+    u32 height = Info->VerticalResolution;
+    u32 rows = (height < 64) ? height : 64;
+    u32 cols = (width < 256) ? width : 256;
+
+    if (Gop->Mode->FrameBufferBase && Info->PixelFormat != PixelBltOnly) {
+        u32* fb = (u32*)(UINTN)Gop->Mode->FrameBufferBase;
+        u32 pitch = Info->PixelsPerScanLine;
+
+        for (u32 y = 0; y < rows; y++) {
+            for (u32 x = 0; x < cols; x++) {
+                fb[y * pitch + x] = 0x00FF0000u | ((y << 8) ^ x);
+            }
+        }
+
+        Print(L"Framebuffer direct write used\n");
+        return;
+    }
+
+    EFI_STATUS Status;
+    EFI_GRAPHICS_OUTPUT_BLT_PIXEL Pixel;
+    Pixel.Blue = 0x00;
+    Pixel.Green = 0x00;
+    Pixel.Red = 0xFF;
+    Pixel.Reserved = 0x00;
+
+    Status = uefi_call_wrapper(
+        Gop->Blt,
+        10,
+        Gop,
+        &Pixel,
+        EfiBltVideoFill,
+        0,
+        0,
+        0,
+        0,
+        cols,
+        rows,
+        0
+    );
+
+    if (EFI_ERROR(Status)) {
+        Print(L"GOP Blt fill failed: %r\n", Status);
+    } else {
+        Print(L"GOP Blt fill used\n");
+    }
+}
+#endif
 /* =========================================================
  * EFI MAIN
  * ========================================================= */
@@ -368,10 +469,14 @@ efi_main(
 
     EFI_FILE_HANDLE RootDir;
     EFI_FILE_HANDLE KernelFile;
+    EFI_FILE_HANDLE InitrdFile;
 
     VOID* KernelBuffer = NULL;
+    VOID* InitrdBuffer = NULL;
 
     UINTN KernelSize = 0;
+    UINTN InitrdSize = 0;
+    EFI_PHYSICAL_ADDRESS InitrdAddr = 0;
 
     kernel_entry_t KernelEntry = NULL;
 
@@ -484,6 +589,60 @@ efi_main(
 
     uefi_call_wrapper(KernelFile->Close, 1, KernelFile);
 
+    Print(L"Opening initrd.img...\n");
+    Status = uefi_call_wrapper(
+        RootDir->Open,
+        5,
+        RootDir,
+        &InitrdFile,
+        L"initrd.img",
+        EFI_FILE_MODE_READ,
+        0
+    );
+
+    if (!EFI_ERROR(Status)) {
+        Status = read_file(
+            InitrdFile,
+            &InitrdBuffer,
+            &InitrdSize
+        );
+
+        if (EFI_ERROR(Status)) {
+            Print(L"Failed to read initrd.img: %r\n", Status);
+            FreePool(InitrdBuffer);
+            InitrdBuffer = NULL;
+            InitrdSize = 0;
+        } else {
+            EFI_PHYSICAL_ADDRESS InitrdAddr = 0;
+            UINTN InitrdPages = (InitrdSize + PAGE_SIZE - 1) / PAGE_SIZE;
+
+            Status = uefi_call_wrapper(
+                BS->AllocatePages,
+                4,
+                AllocateAnyPages,
+                EfiLoaderData,
+                InitrdPages,
+                &InitrdAddr
+            );
+
+            if (EFI_ERROR(Status)) {
+                Print(L"Initrd allocation failed: %r\n", Status);
+                FreePool(InitrdBuffer);
+                InitrdBuffer = NULL;
+                InitrdSize = 0;
+                InitrdAddr = 0;
+            } else {
+                CopyMem((VOID*)(UINTN)InitrdAddr, InitrdBuffer, InitrdSize);
+                InitrdBuffer = NULL;
+                Print(L"Loaded initrd.img, %u bytes at %p\n", InitrdSize, (VOID*)(UINTN)InitrdAddr);
+            }
+        }
+
+        uefi_call_wrapper(InitrdFile->Close, 1, InitrdFile);
+    } else {
+        Print(L"No initrd.img found, continuing without initrd\n");
+    }
+
     uefi_call_wrapper(RootDir->Close, 1, RootDir);
 
     Print(L"Kernel size: %u bytes\n", KernelSize);
@@ -524,6 +683,37 @@ efi_main(
         return Status;
     }
 
+    UINT32 preferred_mode = get_preferred_gop_mode(Gop);
+
+    if (preferred_mode != Gop->Mode->Mode) {
+        Status = uefi_call_wrapper(
+            Gop->SetMode,
+            2,
+            Gop,
+            preferred_mode
+        );
+
+        if (EFI_ERROR(Status)) {
+            Print(L"GOP SetMode failed: %r\n", Status);
+            FreePool(KernelBuffer);
+            return Status;
+        }
+    }
+
+    Print(L"Selected GOP mode: %u\n", Gop->Mode->Mode);
+    Print(L"Framebuffer base: %p size: %u\n",
+        (VOID*)(UINTN)Gop->Mode->FrameBufferBase,
+        Gop->Mode->FrameBufferSize
+    );
+    Print(L"Resolution: %ux%u stride: %u format: %u\n",
+        Gop->Mode->Info->HorizontalResolution,
+        Gop->Mode->Info->VerticalResolution,
+        Gop->Mode->Info->PixelsPerScanLine,
+        Gop->Mode->Info->PixelFormat
+    );
+
+    fill_framebuffer_test(Gop);
+
     /* =====================================================
      * Boot info
      * ===================================================== */
@@ -537,6 +727,10 @@ efi_main(
     }
 
     BootInfo->version = 1;
+    BootInfo->id = NULL;
+    BootInfo->memory_size = 0;
+    BootInfo->initrd_base = (VOID*)(UINTN)InitrdAddr;
+    BootInfo->initrd_size = InitrdSize;
 
     BootInfo->framebuffer_base =
         (VOID*)(UINTN)Gop->Mode->FrameBufferBase;
@@ -611,6 +805,24 @@ efi_main(
     if (EFI_ERROR(Status)) {
         Print(L"GetMemoryMap failed: %r\n", Status);
         return Status;
+    }
+
+    {
+        UINT64 max_address = 0;
+        UINTN descriptor_count = MemoryMapSize / DescriptorSize;
+
+        for (UINTN index = 0; index < descriptor_count; index++) {
+            EFI_MEMORY_DESCRIPTOR* descriptor =
+                (EFI_MEMORY_DESCRIPTOR*)((UINT8*)MemoryMap + index * DescriptorSize);
+
+            UINT64 end_address =
+                descriptor->PhysicalStart + descriptor->NumberOfPages * PAGE_SIZE;
+
+            if (end_address > max_address)
+                max_address = end_address;
+        }
+
+        BootInfo->memory_size = (usize)max_address;
     }
 
     /* =====================================================

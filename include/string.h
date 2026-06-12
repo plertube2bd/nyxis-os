@@ -12,6 +12,7 @@ i32 strncmp(const utf8* a, const utf8* b, usize n);
 
 /* String copy */
 utf8* strncpy(utf8* dest, const utf8* src, usize n);
+utf8* strcpy(utf8* dest, const utf8* src);
 
 /* String concatenation */
 utf8* strcat(utf8* dest, const utf8* src);

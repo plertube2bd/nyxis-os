@@ -49,6 +49,18 @@ utf8* strncpy(utf8* dest, const utf8* src, usize n) {
     return dest;
 }
 
+/* strcpy */
+utf8* strcpy(utf8* dest, const utf8* src) {
+    utf8* out = dest;
+
+    while (*src) {
+        *out++ = *src++;
+    }
+    *out = '\0';
+
+    return dest;
+}
+
 /* strcat */
 utf8* strcat(utf8* dest, const utf8* src) {
     utf8* ptr = dest + strlen(dest);
@@ -102,7 +114,7 @@ utf8* strrchr(const utf8* s, i32 c) {
     }
 
     if ((utf8)c == '\0')
-        return (utf8)s;
+        return (utf8*)s;
 
     return (utf8*)last;
 }
@@ -127,7 +139,7 @@ utf8* strstr(const utf8* haystack, const utf8* needle) {
 }
 
 /* strpbrk */
-char* strpbrk(const utf8* s, const utf8* accept) {
+utf8* strpbrk(const utf8* s, const utf8* accept) {
     while (*s) {
         const utf8* a = accept;
 

@@ -19,7 +19,7 @@ static inline __u64 syscall_wrapper(__u64 sysno, __u64 rdi, __u64 rsi, __u64 rdx
         "movq %5, %%r10\n\t"
         "movq %6, %%r8\n\t"
         "movq %7, %%r9\n\t"
-        "syscall\n\t"
+        "int $0x80\n\t"
         : "=a"(ret)
         : "r"(sysno), "r"(rdi), "r"(rsi), "r"(rdx), "r"(r10), "r"(r8), "r"(r9)
         : "rcx", "r11", "memory"

@@ -4,8 +4,10 @@
 #include "memory.h"
 #include "console/outputs/printk.h"
 
+// AHCI controller base address
 static volatile HBA_MEM* ahci_base = nNULL;
 
+// Command list, FIS, and command tables for each port
 static u8 ahci_command_list[AHCI_MAX_PORTS][1024] __attribute__((aligned(1024)));
 static u8 ahci_fis[AHCI_MAX_PORTS][256] __attribute__((aligned(256)));
 static u8 ahci_cmd_tables[AHCI_MAX_PORTS][AHCI_MAX_CMD_SLOTS][256] __attribute__((aligned(256)));

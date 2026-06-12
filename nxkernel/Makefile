@@ -1,6 +1,7 @@
-CC = x86_64-elf-gcc
+CC = gcc
 AS = as
 LD = ld
+OBJCOPY = objcopy
 
 ROOT = ..
 INCLUDE_DIR = $(ROOT)/include
@@ -13,7 +14,7 @@ EFIINC = /usr/include/efi
 EFIARCH = /usr/include/efi/x86_64
 
 EFILIB = /usr/lib
-CRT0 =
+CRT0 = /usr/lib/crt0-efi-x86_64.o
 
 OVMF = /usr/share/OVMF/OVMF_CODE_4M.fd
 OVMF_VARS = /usr/share/OVMF/OVMF_VARS_4M.fd
@@ -24,32 +25,16 @@ OVMF_VARS = /usr/share/OVMF/OVMF_VARS_4M.fd
 CFLAGS = \
 -I$(EFIINC) \
 -I$(EFIARCH) \
-	-I$(INCLUDE_DIR) \
--fshort-wchar \
+-I$(INCLUDE_DIR) \
 -std=gnu11 \
 -ffreestanding \
--nostdlib -nostartfiles -nodefaultlibs \
--fno-stack-protector \
--fPIC \
+-fshort-wchar \
+-fpic \
 -mno-red-zone \
+-fno-stack-protector \
 -fno-builtin \
 -fno-common \
--fno-omit-frame-pointer \
--fno-delete-null-pointer-checks \
--fno-strict-aliasing \
--mno-mmx -mno-sse -mno-sse2 \
--g \
--Wall -Wextra \
--Wshadow \
--Wundef \
--Werror \
--Wcast-align \
--Wwrite-strings \
--Wstrict-prototypes \
--Wmissing-prototypes \
--Wformat=2 \
--Wno-error=strict-prototypes \
--Wno-error=undef
+-Wall -Wextra
 
 # =========================
 # Kernel (64-bit)
@@ -57,6 +42,8 @@ CFLAGS = \
 KERNEL_CFLAGS = \
 	-nostdinc \
 	-std=gnu11 \
+	-fno-builtin \
+	-fno-stack-protector \
 	-I. \
 	-I$(INCLUDE_DIR) \
 	-Ikernel \
@@ -89,8 +76,9 @@ KERNEL_LDFLAGS = \
 # =========================
 # Sources
 # =========================
-BOOTLOADER_SRC = $(ROOT)/bootloader/nytb3.c
+BOOTLOADER_SRC = $(ROOT)/bootloader/nytb/nytb3.c
 BOOTLOADER_OBJ = $(BUILD)/nytb3.o
+BOOTLOADER_SO = $(BUILD)/BOOTX64.so
 BOOTLOADER = $(BUILD)/BOOTX64.EFI
 
 KERNEL = $(BUILD)/kernel.elf
@@ -98,10 +86,21 @@ KERNEL_OBJS = \
 	$(BUILD)/start.o \
 	$(BUILD)/kernel.o \
 	$(BUILD)/memory.o \
+	$(BUILD)/paging/paging.o \
 	$(BUILD)/string.o \
 	$(BUILD)/console/outputs/printk.o \
 	$(BUILD)/console/outputs/outputs_base.o \
-	$(BUILD)/ahci.o
+	$(BUILD)/ahci.o \
+	$(BUILD)/ramdisk.o \
+	$(BUILD)/filesystem/core.o \
+	$(BUILD)/filesystem/vfs.o \
+	$(BUILD)/filesystem/fat16/fat16.o \
+	$(BUILD)/error_handling/panic.o \
+	$(BUILD)/process/process.o \
+	$(BUILD)/process/schedule.o \
+	$(BUILD)/kernel/syscall/syscall.o \
+	$(BUILD)/helloworld.o \
+	$(BUILD)/interrupt/interrupt.o
 
 # =========================
 # Targets
@@ -118,19 +117,36 @@ $(BOOTLOADER_OBJ): $(BOOTLOADER_SRC) | $(BUILD)
 	mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(BOOTLOADER): $(BOOTLOADER_OBJ)
-	$(LD) $(EFI_LDFLAGS) $< -o $@
+$(BOOTLOADER_SO): $(BOOTLOADER_OBJ)
+	$(LD) \
+		$(CRT0) \
+		$(BOOTLOADER_OBJ) \
+		$(EFI_LDFLAGS) \
+		-o $@
+
+$(BOOTLOADER): $(BOOTLOADER_SO)
+	$(OBJCOPY) \
+		-j .text \
+		-j .sdata \
+		-j .data \
+		-j .dynamic \
+		-j .dynsym \
+		-j .rela \
+		-j .reloc \
+		--target=efi-app-x86_64 \
+		$< \
+		$@
 
 # Kernel
 $(BUILD)/kernel.o: kernel/kernel.c | $(BUILD)
 	mkdir -p $(dir $@)
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD)/paging/paging.o: kernel/paging/paging.c | $(BUILD)
+$(BUILD)/memory.o: $(ROOT)/nxkernel/lib/memory.c | $(BUILD)
 	mkdir -p $(dir $@)
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD)/memory.o: $(ROOT)/nxkernel/lib/memory.c | $(BUILD)
+$(BUILD)/paging/paging.o: kernel/paging/paging.c | $(BUILD)
 	mkdir -p $(dir $@)
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
@@ -146,7 +162,47 @@ $(BUILD)/console/outputs/outputs_base.o: console/outputs/outputs_base.c | $(BUIL
 	mkdir -p $(dir $@)
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD)/ahci.o: $(ROOT)/drivers/unfinished/ahci.c | $(BUILD)
+$(BUILD)/ahci.o: $(ROOT)/drivers/ahci/ahci.c | $(BUILD)
+	mkdir -p $(dir $@)
+	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD)/ramdisk.o: $(ROOT)/drivers/ramdisk/ramdisk.c | $(BUILD)
+	mkdir -p $(dir $@)
+	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD)/filesystem/core.o: $(ROOT)/drivers/filesystem/core.c | $(BUILD)
+	mkdir -p $(dir $@)
+	$(CC) $(KERNEL_CFLAGS) -I$(ROOT) -c $< -o $@
+
+$(BUILD)/filesystem/vfs.o: $(ROOT)/drivers/filesystem/vfs.c | $(BUILD)
+	mkdir -p $(dir $@)
+	$(CC) $(KERNEL_CFLAGS) -I$(ROOT) -c $< -o $@
+
+$(BUILD)/filesystem/fat16/fat16.o: $(ROOT)/drivers/filesystem/fat16/fat16.c | $(BUILD)
+	mkdir -p $(dir $@)
+	$(CC) $(KERNEL_CFLAGS) -I$(ROOT) -c $< -o $@
+
+$(BUILD)/error_handling/panic.o: kernel/error_handling/panic.c | $(BUILD)
+	mkdir -p $(dir $@)
+	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD)/process/process.o: kernel/process/process.c | $(BUILD)
+	mkdir -p $(dir $@)
+	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD)/process/schedule.o: kernel/process/schedule.c | $(BUILD)
+	mkdir -p $(dir $@)
+	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD)/kernel/syscall/syscall.o: kernel/syscall/syscall.c | $(BUILD)
+	mkdir -p $(dir $@)
+	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD)/helloworld.o: $(ROOT)/userland/helloworld/helloworld.c | $(BUILD)
+	mkdir -p $(dir $@)
+	$(CC) $(KERNEL_CFLAGS) -I$(ROOT)/userland/nlibc/library -c $< -o $@
+
+$(BUILD)/interrupt/interrupt.o: kernel/interrupt/interrupt.c | $(BUILD)
 	mkdir -p $(dir $@)
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
@@ -158,37 +214,55 @@ $(BUILD)/start.o: kernel/start.s | $(BUILD)
 $(KERNEL): $(KERNEL_OBJS)
 	$(LD) $(KERNEL_LDFLAGS) -o $@ $^
 
+INITRD_IMG = $(ROOT)/userland/initrd/initrd.img
+INITRD_RUN = $(ROOT)/userland/initrd/_ns_/app/hellowld.run
+OS_IMG = $(BUILD)/esp.img
+
+$(INITRD_IMG): $(INITRD_RUN)
+	rm -f $@
+	dd if=/dev/zero of=$@ bs=1M count=16
+	mkfs.vfat -F 16 -n INITRD $@
+	mmd -i $@ _ns_
+	mmd -i $@ _ns_/app
+	mcopy -i $@ $(INITRD_RUN) ::_ns_/app/hellowld.run
+
+os: $(BOOTLOADER) $(KERNEL) $(INITRD_IMG) $(OS_IMG)
+
+$(OS_IMG): $(BOOTLOADER) $(KERNEL) $(INITRD_IMG)
+	rm -f $@
+	dd if=/dev/zero of=$@ bs=1M count=64
+	mkfs.vfat $@
+
+	mmd -i $@ EFI
+	mmd -i $@ EFI/BOOT
+
+	mcopy -i $@ $(BOOTLOADER) ::EFI/BOOT/BOOTX64.EFI
+	mcopy -i $@ $(KERNEL) ::kernel.elf
+	mcopy -i $@ $(INITRD_IMG) ::initrd.img
+
 # =========================
 # Run (UEFI x86_64)
 # =========================
-run: $(BOOTLOADER) $(KERNEL)
-	dd if=/dev/zero of=esp.img bs=1M count=64
-	mkfs.vfat esp.img
-
-	mmd -i esp.img EFI
-	mmd -i esp.img EFI/BOOT
-
-	mcopy -i esp.img $(BOOTLOADER) ::EFI/BOOT/BOOTX64.EFI
-	mcopy -i esp.img $(KERNEL) ::kernel.elf
-
+run: os
 	mkdir -p $(BUILD)
 	cp $(OVMF) $(BUILD)/OVMF_CODE.fd
 	cp $(OVMF_VARS) $(BUILD)/OVMF_VARS.fd
 
-	qemu-system-x86_64 \
-		-drive if=pflash,format=raw,file=$(BUILD)/OVMF_CODE.fd \
-		-drive if=pflash,format=raw,file=$(BUILD)/OVMF_VARS.fd \
-		-device usb-ehci,id=usb \
-		-device usb-storage,drive=esp,bus=usb.0 \
-		-drive file=esp.img,format=raw,if=none,id=esp \
-		-nographic
+	env -i \
+		PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+		DISPLAY=$(DISPLAY) \
+		XDG_RUNTIME_DIR=$(XDG_RUNTIME_DIR) \
+		DBUS_SESSION_BUS_ADDRESS=$(DBUS_SESSION_BUS_ADDRESS) \
+		qemu-system-x86_64 \
+			-drive if=pflash,format=raw,file=$(BUILD)/OVMF_CODE.fd \
+			-drive if=pflash,format=raw,file=$(BUILD)/OVMF_VARS.fd \
+			-device usb-ehci,id=usb \
+			-device usb-storage,drive=esp,bus=usb.0 \
+			-drive file=$(OS_IMG),format=raw,if=none,id=esp \
+			-device virtio-gpu-pci \
+			-display gtk
 
 clean:
-	rm -f $(KERNEL_OBJ)
-	rm -f $(BOOTLOADER_OBJ)
-	rm -f $(BOOTLOADER)
-	rm -f $(KERNEL)
-	rm -f esp.img
 	rm -rf $(BUILD)
 
-.PHONY: all run clean
+.PHONY: all os run clean

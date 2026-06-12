@@ -32,11 +32,11 @@ static inline void paging_flush_tlb(void* addr) {
 
 static inline void paging_reload_cr3() {
     __asm__ volatile(
-        "mov %%cr3, %%eax\n"
-        "mov %%eax, %%cr3\n"
+        "mov %%cr3, %%rax\n"
+        "mov %%rax, %%cr3\n"
         :
         :
-        : "eax", "memory"
+        : "rax", "memory"
     );
 }
 
@@ -198,12 +198,12 @@ void paging_enable() {
     );
 
     __asm__ volatile(
-        "mov %%cr0, %%eax\n"
-        "or $0x80000000, %%eax\n"
-        "mov %%eax, %%cr0\n"
+        "mov %%cr0, %%rax\n"
+        "orq $-2147483648, %%rax\n"
+        "mov %%rax, %%cr0\n"
         :
         :
-        : "eax", "memory"
+        : "rax", "memory"
     );
 
     paging_reload_cr3();
@@ -216,11 +216,11 @@ void paging_enable() {
 void paging_disable() {
 
     __asm__ volatile(
-        "mov %%cr0, %%eax\n"
-        "and $0x7FFFFFFF, %%eax\n"
-        "mov %%eax, %%cr0\n"
+        "mov %%cr0, %%rax\n"
+        "andq $0x7FFFFFFF, %%rax\n"
+        "mov %%rax, %%cr0\n"
         :
         :
-        : "eax", "memory"
+        : "rax", "memory"
     );
 }

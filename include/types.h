@@ -71,6 +71,10 @@ typedef struct {
     // Memory
     usize       memory_size;
 
+    // Initrd
+    void*       initrd_base;
+    usize       initrd_size;
+
     // Framebuffer
     void*       framebuffer_base;
     usize       framebuffer_size;

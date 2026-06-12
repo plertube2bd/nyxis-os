@@ -68,6 +68,10 @@ typedef struct process {
 
 } process_t;
 
+// Global process state
+extern process_t* process_list;
+extern process_t* current_process;
+
 // Functions
 Nstatus process_init(void*);
 Nstatus process_create(void* entry_point, void* stack);
