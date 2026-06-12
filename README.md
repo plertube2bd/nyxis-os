@@ -53,6 +53,39 @@ Nyxis OS is currently under active development.
 
 **May 09, 2026** — ATA IDE I/O driver implementation completed.
 
+# 🇷🇸 Versiya v Medzsuslovjansky
+
+## Nyxis O/S
+
+Nyxis O/S sut Obsluga Sistema bytja jarabotana s krêpky fokus na koristnika izkuszenje a interfejs doslêdnost.
+
+Od izkoristybajuczi sentralizovanu APIu(aplikaciju programinu interfejsu) a ujedinjeny dizajn pravilo, jegocêlet dostavjati gladky a prêdvidimy koristnika izkuszenje po vsem sistemu.
+
+Dost nezs nadavajuczi prioritet stvarnogo sumêstimost, Nyxis O/S sut zaprojektovany dvigati do Modernoj Tehnologije a eksperimantalnoj sistemy Koncepcije. Ime sut zaroczety iz *Nyx*, Greczsky Boga Noczi, objedinjeny so Sufiksa *-is* davati "odtisk naklonnosti do nêczego."
+
+Nyxis O/S sut bytje zaprojektovany ako dopolnjenij-orientovanoj sistemy so skalabilitije a ekspansibilitije ako srdceviny zasady.
+
+## 🚀 Naczinati
+```bash
+$ git clone https://github.com/plertube2bd/nyxis-os.git
+$ cd nyxis
+$ echo ono sut ne ukonczeny obsluga sistema.
+```
+
+## ❓️ Zaczto my imejemo upotrêbiti jego?
+
+* legka a korinstnika orientovana obsluga sistema
+* drobny a szsety kod
+* vpolnê otvorjena nahodnost
+* krajna abstrakcija plast (namêrjajemy)
+* zaprojektovany dlja uczenije a razvitije
+
+Vlady a Kompanije, ne upotrêbi jeszcze jego.
+
+## czto izbudovanyv jutilitijy?
+
+## razvitije status
+
 # 🇰🇷 한국어 버전
 
 ## Nyxis OS
