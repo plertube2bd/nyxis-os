@@ -2,7 +2,6 @@
 #include "kernel/process/process.h"
 #include "kernel/paging/paging.h"
 #include "types.h"
-#include "boot_info.h"
 #include "lowlevel.h"
 #include "console/outputs/printk.h"
 #include "../../drivers/ahci/ahci.h"
@@ -267,9 +266,12 @@ void kernel_main(NTBLI* boot_info) {
 
     printk("Entering ring 3 userland\n");
 
-    enter_ring3(helloworld_main, &user_stack[sizeof(user_stack)]);
+    // TODO: Create first user process
+    // TODO: Set up interrupt handlers
+    // TODO: Initialize other subsystems
 
+    // For now, just loop
     while (1) {
-        cpu_pause();
+        hlt();
     }
 }
