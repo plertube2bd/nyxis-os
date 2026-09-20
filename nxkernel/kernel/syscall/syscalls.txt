@@ -7,7 +7,11 @@
 ; rdi, rsi, rdx, r10, r8, r9 = args
 ; return:
 ;   rax >= 0  : success
-;   rax < 0   : -errno
+;   rax < 0   : error (Nstatus, i.e. include/types.h Nerror, sign-extended to 64 bits;
+;               NOT a POSIX -errno value)
+;
+; implemented so far: 771 (NxKernelPrint), 777 (NxDebugNop). Everything else returns
+; NsyscallFailed. User pointers are validated (must be user-accessible mappings).
 ;
 ; object handle type:
 ;   u64 handle

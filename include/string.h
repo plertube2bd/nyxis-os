@@ -1,34 +1,44 @@
+/*
+ * string.h - 문자열 함수
+ *
+ * [수정 이력 요약]
+ *  - 인자/반환 타입을 utf8(unsigned char) 에서 표준 C 와 같은 char 로 변경.
+ *    호출하는 쪽은 거의 모두 char* 이므로, utf8* 이면 -Wpointer-sign 경고가
+ *    나거나 형변환이 필요했다. (바이트 단위 비교는 구현에서 unsigned char 로 수행)
+ *  - strnlen 추가: 신뢰할 수 없는 버퍼에서 문자열 길이를 안전하게 잴 때 사용.
+ */
 #ifndef _STRING_H
 #define _STRING_H
 
 #include "types.h"
 
 /* String length */
-usize strlen(const utf8* s);
+usize strlen(const char *s);
+usize strnlen(const char *s, usize maxlen);
 
 /* String compare */
-i32 strcmp(const utf8* a, const utf8* b);
-i32 strncmp(const utf8* a, const utf8* b, usize n);
+i32 strcmp(const char *a, const char *b);
+i32 strncmp(const char *a, const char *b, usize n);
 
-/* String copy */
-utf8* strncpy(utf8* dest, const utf8* src, usize n);
-utf8* strcpy(utf8* dest, const utf8* src);
+/* String copy (strncpy 는 표준과 같이 n 바이트를 0 으로 채운다) */
+char *strncpy(char *dest, const char *src, usize n);
+char *strcpy(char *dest, const char *src);
 
 /* String concatenation */
-utf8* strcat(utf8* dest, const utf8* src);
-utf8* strncat(utf8* dest, const utf8* src, usize n);
+char *strcat(char *dest, const char *src);
+char *strncat(char *dest, const char *src, usize n);
 
 /* Character search */
-utf8* strchr(const utf8* s, i32 c);
-utf8* strrchr(const utf8* s, i32 c);
+char *strchr(const char *s, i32 c);
+char *strrchr(const char *s, i32 c);
 
 /* Substring search */
-utf8* strstr(const utf8* haystack, const utf8* needle);
+char *strstr(const char *haystack, const char *needle);
 
 /* Character set search */
-utf8* strpbrk(const utf8* s, const utf8* accept);
+char *strpbrk(const char *s, const char *accept);
 
-/* Tokenizer */
-utf8* strtok(utf8* str, const utf8* delim);
+/* Tokenizer (비재진입: 전역 상태 사용) */
+char *strtok(char *str, const char *delim);
 
-#endif
+#endif /* _STRING_H */

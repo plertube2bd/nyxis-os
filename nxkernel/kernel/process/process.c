@@ -1,38 +1,62 @@
+/*
+ * process.c - 프로세스/커널 스레드 테이블과 컨텍스트 전환 (설계는 process.h 참고)
+ */
+
 #include "kernel/process/process.h"
 #include "kernel/paging/paging.h"
+#include "kernel/error_handling/panic.h"
+#include "interrupt.h"
+#include "memory.h"
 
-// Process list
-process_t* process_list = 0;
-u32 next_pid = 1;
+/* Process list */
+process_t *process_list = nNULL;
 
-// Current process
-process_t* current_process = 0;
+/* Current process */
+process_t *current_process = nNULL;
 
-// Initialize process system
-Nstatus process_init(void* plus) {
-    // Create idle process
-    process_t* idle = (process_t*)plus; // Example allocation
+static process_t g_procs[PROCESS_MAX];
+static u8 g_kstacks[PROCESS_MAX][PROCESS_KSTACK_SIZE] __attribute__((aligned(16)));
+static u32 g_next_pid = 1;
+
+/* 종료된 프로세스의 슬롯을 회수한다 (현재 실행 중인 것은 제외) */
+static void process_reap(void)
+{
+    process_t *p = process_list;
+    process_t *prev = nNULL;
+
+    while (p) {
+        process_t *next = p->next;
+
+        if (p->state == PROCESS_TERMINATED && p != current_process && p->pid != 0) {
+            if (prev)
+                prev->next = next;
+            else
+                process_list = next;
+
+            memset(p, 0, sizeof(*p));      /* in_use = false */
+        } else {
+            prev = p;
+        }
+
+        p = next;
+    }
+}
+
+Nstatus process_init(void)
+{
+    process_t *idle = &g_procs[0];
+
+    if (process_list)
+        return NalreadyInitialized;
+
+    memset(g_procs, 0, sizeof(g_procs));
+
+    /* 부트 스레드 = idle 프로세스. 스택은 start.s 의 부트 스택을 계속 사용한다. */
     idle->pid = 0;
     idle->state = PROCESS_RUNNING;
-    idle->stack = (void*)0x300000;
-    idle->entry_point = 0;
-    idle->next = 0;
-
-#ifdef NYXIS_64BITS
-    idle->rsp = (u64)idle->stack;
-    idle->rip = 0;
-    idle->rflags = 0x202;
-    idle->rax = idle->rbx = idle->rcx = idle->rdx = 0;
-    idle->rsi = idle->rdi = idle->rbp = 0;
-    idle->r8 = idle->r9 = idle->r10 = idle->r11 = 0;
-    idle->r12 = idle->r13 = idle->r14 = idle->r15 = 0;
-#else
-    idle->esp = (u32)idle->stack;
-    idle->eip = 0;
-    idle->eflags = 0x202;
-    idle->eax = idle->ebx = idle->ecx = idle->edx = 0;
-    idle->esi = idle->edi = idle->ebp = 0;
-#endif
+    idle->in_use = true;
+    idle->kernel_stack = nNULL;
+    idle->next = nNULL;
 
     process_list = idle;
     current_process = idle;
@@ -40,158 +64,154 @@ Nstatus process_init(void* plus) {
     return NSTATUS_OK;
 }
 
-// Create a new process
-Nstatus process_create(void* entry_point, void* stack) {
-    process_t* proc = (process_t*)((u8*)process_list + sizeof(process_t) * next_pid);
-    proc->pid = next_pid++;
+Nstatus process_create(process_entry_t entry_point, void *stack)
+{
+    u32 i;
+    u32 slot = PROCESS_MAX;
+    process_t *proc;
+    process_t *tail;
+    u64 *sp;
+    u64 top;
+    u64 flags;
+
+    if (!entry_point)
+        return NinvalidArg;
+    if (!process_list)
+        return NnotInitialized;
+
+    flags = irq_save();
+
+    process_reap();
+
+    for (i = 1; i < PROCESS_MAX; i++) {
+        if (!g_procs[i].in_use) {
+            slot = i;
+            break;
+        }
+    }
+
+    if (slot == PROCESS_MAX) {
+        irq_restore(flags);
+        return NprocessFailed;
+    }
+
+    proc = &g_procs[slot];
+    memset(proc, 0, sizeof(*proc));
+    memset(g_kstacks[slot], 0, PROCESS_KSTACK_SIZE);
+
+    proc->pid = g_next_pid++;
     proc->state = PROCESS_READY;
     proc->stack = stack;
     proc->entry_point = entry_point;
-    proc->next = process_list;
-    process_list = proc;
+    proc->cr3 = nNULL;
+    proc->kernel_stack = g_kstacks[slot];
+    proc->in_use = true;
 
-#ifdef NYXIS_64BITS
-    proc->rsp = (u64)stack;
-    proc->rip = (u64)entry_point;
-    proc->rflags = 0x202; // IF flag set
-    proc->rax = proc->rbx = proc->rcx = proc->rdx = 0;
-    proc->rsi = proc->rdi = proc->rbp = 0;
-    proc->r8 = proc->r9 = proc->r10 = proc->r11 = 0;
-    proc->r12 = proc->r13 = proc->r14 = proc->r15 = 0;
-#else
-    proc->esp = (u32)stack;
-    proc->eip = (u32)entry_point;
-    proc->eflags = 0x202; // IF flag set
-    proc->eax = proc->ebx = proc->ecx = proc->edx = 0;
-    proc->esi = proc->edi = proc->ebp = 0;
-#endif
+    /*
+     * 초기 커널 스택 구성 (switch.s 주석 참고). top 은 16바이트 정렬.
+     *   top-8  : 반환 주소 = process_entry_trampoline
+     *   top-16 : rbp, top-24 : rbx, top-32 : r12(진입 함수), top-40 : r13(인자),
+     *   top-48 : r14, top-56 : r15   <- 저장된 rsp
+     */
+    top = (u64)(usize)g_kstacks[slot] + PROCESS_KSTACK_SIZE;
+    sp = (u64 *)(usize)top;
+    *--sp = (u64)(usize)process_entry_trampoline;  /* 반환 주소 */
+    *--sp = 0;                                     /* rbp */
+    *--sp = 0;                                     /* rbx */
+    *--sp = (u64)(usize)entry_point;               /* r12 */
+    *--sp = (u64)(usize)stack;                     /* r13 */
+    *--sp = 0;                                     /* r14 */
+    *--sp = 0;                                     /* r15 */
+    proc->kernel_rsp = (u64)(usize)sp;
 
+    /* 리스트 끝에 추가 */
+    tail = process_list;
+    while (tail->next)
+        tail = tail->next;
+    tail->next = proc;
+
+    irq_restore(flags);
     return NSTATUS_OK;
 }
 
-// Switch to a process
-Nstatus process_switch(process_t* proc) {
-    if (!proc || proc->state != PROCESS_READY) {
-        return NSTATUS_ERR_FLAG | 1; // Error
-    }
+Nstatus process_switch(process_t *proc)
+{
+    process_t *old;
+    u64 flags;
 
-    if (current_process && current_process->state == PROCESS_RUNNING) {
-        current_process->state = PROCESS_READY;
-    }
+    if (!proc || !proc->in_use || proc->state != PROCESS_READY)
+        return NinvalidArg;
 
-    // Save current context
-    if (current_process) {
-#ifdef NYXIS_64BITS
-        u64 saved_rax, saved_rbx, saved_rcx, saved_rdx;
-        u64 saved_rsi, saved_rdi, saved_rbp, saved_rsp;
-        u64 saved_r8, saved_r9, saved_r10, saved_r11;
-        u64 saved_r12, saved_r13, saved_r14, saved_r15;
-        u64 saved_flags;
+    if (proc == current_process)
+        return NSTATUS_OK;
 
-        __asm__ volatile("movq %%rax, %0" : "=r"(saved_rax) :: "memory");
-        __asm__ volatile("movq %%rbx, %0" : "=r"(saved_rbx) :: "memory");
-        __asm__ volatile("movq %%rcx, %0" : "=r"(saved_rcx) :: "memory");
-        __asm__ volatile("movq %%rdx, %0" : "=r"(saved_rdx) :: "memory");
-        __asm__ volatile("movq %%rsi, %0" : "=r"(saved_rsi) :: "memory");
-        __asm__ volatile("movq %%rdi, %0" : "=r"(saved_rdi) :: "memory");
-        __asm__ volatile("movq %%rbp, %0" : "=r"(saved_rbp) :: "memory");
-        __asm__ volatile("movq %%rsp, %0" : "=r"(saved_rsp) :: "memory");
-        __asm__ volatile("movq %%r8, %0"  : "=r"(saved_r8)  :: "memory");
-        __asm__ volatile("movq %%r9, %0"  : "=r"(saved_r9)  :: "memory");
-        __asm__ volatile("movq %%r10, %0" : "=r"(saved_r10) :: "memory");
-        __asm__ volatile("movq %%r11, %0" : "=r"(saved_r11) :: "memory");
-        __asm__ volatile("movq %%r12, %0" : "=r"(saved_r12) :: "memory");
-        __asm__ volatile("movq %%r13, %0" : "=r"(saved_r13) :: "memory");
-        __asm__ volatile("movq %%r14, %0" : "=r"(saved_r14) :: "memory");
-        __asm__ volatile("movq %%r15, %0" : "=r"(saved_r15) :: "memory");
-        __asm__ volatile("pushfq\n popq %0" : "=r"(saved_flags) :: "memory");
+    flags = irq_save();
 
-        current_process->rax = saved_rax;
-        current_process->rbx = saved_rbx;
-        current_process->rcx = saved_rcx;
-        current_process->rdx = saved_rdx;
-        current_process->rsi = saved_rsi;
-        current_process->rdi = saved_rdi;
-        current_process->rbp = saved_rbp;
-        current_process->rsp = saved_rsp;
-        current_process->r8  = saved_r8;
-        current_process->r9  = saved_r9;
-        current_process->r10 = saved_r10;
-        current_process->r11 = saved_r11;
-        current_process->r12 = saved_r12;
-        current_process->r13 = saved_r13;
-        current_process->r14 = saved_r14;
-        current_process->r15 = saved_r15;
-        current_process->rflags = saved_flags;
-#else
-        u32 saved_flags;
-        __asm__ volatile("mov %%eax, %0"    : "=r"(current_process->eax) :: "memory");
-        __asm__ volatile("mov %%ebx, %0"    : "=r"(current_process->ebx) :: "memory");
-        __asm__ volatile("mov %%ecx, %0"    : "=r"(current_process->ecx) :: "memory");
-        __asm__ volatile("mov %%edx, %0"    : "=r"(current_process->edx) :: "memory");
-        __asm__ volatile("mov %%esi, %0"    : "=r"(current_process->esi) :: "memory");
-        __asm__ volatile("mov %%edi, %0"    : "=r"(current_process->edi) :: "memory");
-        __asm__ volatile("mov %%ebp, %0"    : "=r"(current_process->ebp) :: "memory");
-        __asm__ volatile("mov %%esp, %0"    : "=r"(current_process->esp) :: "memory");
-        __asm__ volatile("pushfl\n popl %0" : "=r"(saved_flags) :: "memory");
-        current_process->eflags = saved_flags;
-#endif
-    }
+    old = current_process;
+    if (old && old->state == PROCESS_RUNNING)
+        old->state = PROCESS_READY;
 
-    // Switch page directory
-    if (proc->cr3) {
-        __asm__ volatile("mov %0, %%cr3" : : "r"(proc->cr3));
-    }
+    /* 주소 공간 전환 (프로세스가 자기 CR3 를 가진 경우만) */
+    if (proc->cr3)
+        write_cr3((u64)(usize)proc->cr3);
 
-    // Load new context
+    /* 이 프로세스에서 ring3 -> ring0 진입 시 사용할 커널 스택 */
+    if (proc->kernel_stack)
+        gdt_set_kernel_stack((u64)(usize)proc->kernel_stack + PROCESS_KSTACK_SIZE);
+
     current_process = proc;
     proc->state = PROCESS_RUNNING;
 
-#ifdef NYXIS_64BITS
-    __asm__ volatile("movq %0, %%rax" :: "m"(proc->rax) : "memory");
-    __asm__ volatile("movq %0, %%rbx" :: "m"(proc->rbx) : "memory");
-    __asm__ volatile("movq %0, %%rcx" :: "m"(proc->rcx) : "memory");
-    __asm__ volatile("movq %0, %%rdx" :: "m"(proc->rdx) : "memory");
-    __asm__ volatile("movq %0, %%rsi" :: "m"(proc->rsi) : "memory");
-    __asm__ volatile("movq %0, %%rdi" :: "m"(proc->rdi) : "memory");
-    __asm__ volatile("movq %0, %%rbp" :: "m"(proc->rbp) : "memory");
-    __asm__ volatile("movq %0, %%rsp" :: "m"(proc->rsp) : "memory");
-    __asm__ volatile("movq %0, %%r8"  :: "m"(proc->r8)  : "memory");
-    __asm__ volatile("movq %0, %%r9"  :: "m"(proc->r9)  : "memory");
-    __asm__ volatile("movq %0, %%r10" :: "m"(proc->r10) : "memory");
-    __asm__ volatile("movq %0, %%r11" :: "m"(proc->r11) : "memory");
-    __asm__ volatile("movq %0, %%r12" :: "m"(proc->r12) : "memory");
-    __asm__ volatile("movq %0, %%r13" :: "m"(proc->r13) : "memory");
-    __asm__ volatile("movq %0, %%r14" :: "m"(proc->r14) : "memory");
-    __asm__ volatile("movq %0, %%r15" :: "m"(proc->r15) : "memory");
-    __asm__ volatile("pushq %0\n popfq" :: "r"(proc->rflags) : "memory");
-    __asm__ volatile("jmp *%0" :: "m"(proc->rip) : "memory");
-#else
-    __asm__ volatile("mov %0, %%eax" :: "m"(proc->eax) : "memory");
-    __asm__ volatile("mov %0, %%ebx" :: "m"(proc->ebx) : "memory");
-    __asm__ volatile("mov %0, %%ecx" :: "m"(proc->ecx) : "memory");
-    __asm__ volatile("mov %0, %%edx" :: "m"(proc->edx) : "memory");
-    __asm__ volatile("mov %0, %%esi" :: "m"(proc->esi) : "memory");
-    __asm__ volatile("mov %0, %%edi" :: "m"(proc->edi) : "memory");
-    __asm__ volatile("mov %0, %%ebp" :: "m"(proc->ebp) : "memory");
-    __asm__ volatile("mov %0, %%esp" :: "m"(proc->esp) : "memory");
-    __asm__ volatile("pushl %0\n popfl" :: "r"(proc->eflags) : "memory");
-    __asm__ volatile("jmp *%0" :: "m"(proc->eip) : "memory");
-#endif
+    cpu_switch_context(&old->kernel_rsp, proc->kernel_rsp);
 
+    /* 이 컨텍스트가 다시 선택되면 여기서 이어서 실행된다 */
+    irq_restore(flags);
     return NSTATUS_OK;
 }
 
-// Terminate a process
-Nstatus process_terminate(u32 pid) {
-    process_t* proc = process_list;
-    while (proc) {
-        if (proc->pid == pid) {
-            proc->state = PROCESS_TERMINATED;
-            // Remove from list, free memory, etc.
-            return NSTATUS_OK;
-        }
-        proc = proc->next;
+Nstatus process_terminate(u32 pid)
+{
+    process_t *proc;
+    u64 flags;
+
+    if (pid == 0)
+        return Npermission;        /* idle(부트) 스레드는 종료 불가 */
+
+    flags = irq_save();
+
+    for (proc = process_list; proc; proc = proc->next) {
+        if (proc->in_use && proc->pid == pid)
+            break;
     }
-    return NSTATUS_ERR_FLAG | 2; // Not found
+
+    if (!proc || proc->state == PROCESS_TERMINATED) {
+        irq_restore(flags);
+        return NnotFound;
+    }
+
+    proc->state = PROCESS_TERMINATED;
+
+    if (proc == current_process) {
+        /* 자기 자신을 종료: 다른 프로세스로 전환하며 이 함수는 반환하지 않는다 */
+        schedule();
+        kernel_panic_simple("process_terminate: no runnable process", NprocessFailed);
+    }
+
+    process_reap();
+    irq_restore(flags);
+    return NSTATUS_OK;
+}
+
+void process_exit(void)
+{
+    if (!current_process || current_process->pid == 0)
+        kernel_panic_simple("process_exit called on idle/boot thread", NinvalidState);
+
+    (void)process_terminate(current_process->pid);
+    kernel_panic_simple("process_exit: unreachable", NkernelFault);
+}
+
+void process_thread_exit(void)
+{
+    process_exit();
 }
