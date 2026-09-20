@@ -56,3 +56,9 @@ dkms.conf
 
 out/
 out-*/
+
+# 빌드/실행 산출물 (예전에는 git 에 추적되고 있었음)
+nxkernel/esp.img
+nxkernel/esp_test.img
+nxkernel/serial.log
+userland/initrd/initrd.img

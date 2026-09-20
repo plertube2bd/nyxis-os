@@ -5,7 +5,7 @@
 #   make os         부팅 가능한 ESP 디스크 이미지    (out/esp.img)
 #   make run        QEMU(OVMF, q35+AHCI) 로 실행     (GTK 창 + 시리얼 stdio)
 #   make run-nographic  화면 없이 시리얼만으로 실행
-#   make run-usb    예전 방식(usb-storage + virtio-gpu) 으로 실행
+#   make run-usb    usb-storage 부팅 디스크 + std VGA 로 실행 (예전 virtio-gpu 는 BltOnly GOP 라 프레임버퍼가 없어 제거)
 #   make check      C89 엄격 컴파일(-O0/-O2) 검사
 #   make test-host  FAT16/VFS/램디스크 호스트 테스트 (회귀 + ASan/UBSan 변이 퍼징)
 #   make clean
@@ -315,7 +315,7 @@ run-usb: prepare-run
 			-device usb-ehci,id=usb \
 			-device usb-storage,drive=esp,bus=usb.0 \
 			-drive file=$(OS_IMG),format=raw,if=none,id=esp \
-			-device virtio-gpu-pci \
+			-vga std \
 			-serial stdio \
 			-display gtk
 

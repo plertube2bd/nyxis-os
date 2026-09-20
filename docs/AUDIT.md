@@ -137,16 +137,36 @@
 - `userland/initrd/initrd.c` 는 컴파일 불가능한 자리 표시자(`bimbimbambam;`)라 손대지 않았다. `nxkernel/kernel/linker32.lds`, 빈 `코드분석.rtf` 도 그대로 둠.
 - `esp.img`, `esp_test.img`(각 64MiB), `initrd.img`(16MiB), `serial.log` 가 git 에 추적되고 있다.
 
-## 5. 결정이 필요한 질문
+## 5. 결정 사항 (질문에 대한 답변 반영)
 
-1. **기본 QEMU 구성**: 원래 `make run` 은 usb-storage + virtio-gpu 였다. OVMF 의 virtio-gpu GOP 는 BltOnly(직접 프레임버퍼 없음)라 프레임버퍼 콘솔이 동작할 수 없다.
-   "그래픽카드 없음 & 프레임버퍼" 는 (a) UEFI GOP 선형 프레임버퍼(std VGA 등)를 쓰겠다는 뜻인지, (b) 그래픽 장치가 전혀 없어도 되어야 한다는 뜻인지 알려 달라.
-   지금은 (a)+(b) 모두 동작(프레임버퍼가 없으면 시리얼만 사용)하고 `make run` 은 q35+AHCI+std VGA+시리얼로 바꿨다. `make run-usb` 가 예전 구성이다.
-2. **시스템 콜 ABI**: `int 0x80` 만 유지할지, `syscall/sysret` 도 지원할지. 반환은 문서의 "-errno" 대신 `Nstatus` 부호 확장으로 구현했다 — 맞는지.
-3. **유저 공간 설계**: higher-half 커널로 갈지(권장), 현재의 낮은 주소 항등 매핑을 유지할지.
-4. **삭제해도 되는지**: Multiboot2 지원, ELF32/ia32 로더, `linker32.lds`. (전부 64비트 UEFI 전용이라는 요구와 충돌해서 Multiboot2/ELF32 는 이미 제거함)
-5. **git 추적 바이너리** 4개를 `git rm --cached` + `.gitignore` 로 정리해도 되는지 (히스토리에서 제거할지는 별도 결정).
-6. **`userland/initrd/initrd.c`** 의 의도(첫 유저 프로세스?)와 `helloworld` 를 커널 이미지에 링크해 두는 임시 구조를 언제까지 유지할지.
-7. **스케줄러 정책**: 타이머 선점을 도입할지, SMAP/스택 카나리를 켤지.
-8. **Rust**: 커널의 어느 부분부터 Rust 로 작성할 계획인지 (현재 코드는 전부 C).
-9. **라이선스**: 저장소는 GPL-3.0 이고 이번 변경은 외부 코드를 가져오지 않았다(모두 새로 작성). 향후 Linux/BSD 코드를 가져올 때 어떤 라이선스 조합을 허용할지.
+| 항목 | 결정 | 상태 |
+|---|---|---|
+| 기본 QEMU 구성 | virtio-gpu(BltOnly) 대신 **std VGA(Bochs VBE) 선형 프레임버퍼** 사용. 그래픽 장치가 없어도 시리얼로 동작 | 완료 (`make run`, `make run-usb` 모두 std VGA. usb-storage 부팅으로 프레임버퍼 1024x768 확인) |
+| UEFI 비종속 | 커널은 UEFI 가 아니라 NTBLI 만 본다. 다른 부트 방식은 "부트 정보 -> NTBLI" 어댑터를 추가하는 방식으로 지원 | 설계만 (아래 6절) |
+| 시스템 콜 | `int 0x80` + `syscall/sysret` 둘 다 지원, 반환은 Nstatus 부호 확장 유지 | **미구현** (`int 0x80` 만 동작) |
+| 유저 공간 | higher-half 커널 | **미구현** |
+| Multiboot2 / ELF32 / `linker32.lds` | 삭제하지 않는다. (`linker32.lds` 는 원래부터 그대로 있음) 이전에 제가 제거한 Multiboot2 헤더와 ELF32 경로는 "동작하지 않는 상태" 였으므로 되살리지 않고, 제대로 동작하도록 다시 구현한다 | **미구현** (아래 질문 필요) |
+| git 추적 바이너리 | 추적 해제 + `.gitignore` | 완료 (`esp.img`, `esp_test.img`, `serial.log`, `initrd.img`. 히스토리는 그대로) |
+| `helloworld` 링크 / `initrd.c` | 가능한 빨리 제거 예정. 그때까지 유지 | 유지 |
+| 스케줄러 | 외부 진입점은 `schedule()` 하나, 정책은 인라인 헤더(`sched_rr.h`) | 완료 |
+| Rust | 소유권/메모리 이동을 확신할 수 없는 부분에만 사용. 기존 C 는 질문 없이 바꾸지 않는다 | 해당 없음 |
+| 라이선스 | 제가 정함: `docs/LICENSING.md` (Linux GPL-2.0-only 코드는 복사 금지, BSD/MIT/Apache/GPL-3 호환 코드만) | 완료 |
+
+## 6. 아직 하지 않은 일과 이유
+
+아래 세 가지는 서로 얽혀 있어서 한 번에 설계해야 한다. 절반만 하면 부팅이 깨질 위험이 커서 이번에는 시작하지 않았다.
+
+1. **higher-half 커널**: 링크 주소를 `0xFFFFFFFF80100000`(적재 주소 1MiB)으로 옮기고, 낮은 주소의 초기 진입 코드가 임시 페이지 테이블을 만든 뒤 높은 주소로 점프해야 한다.
+   물리 주소를 다루는 모든 곳(AHCI DMA, initrd, 프레임버퍼, 페이지 테이블, 부트 정보)에 `phys_to_virt/virt_to_phys` 변환이 필요하다.
+2. **Multiboot2(GRUB) 부팅**: 32비트 보호 모드로 진입하므로 롱 모드 전환 스텁 + Multiboot2 정보를 NTBLI 로 바꾸는 어댑터(메모리 맵, 프레임버퍼 태그, 모듈=initrd, RSDP)가 필요하다. 위 1번의 초기 진입 코드와 같은 파일에서 만든다.
+3. **`syscall/sysret`**: EFER.SCE/STAR/LSTAR/SFMASK, `swapgs` 기반 진입 스텁, sysret 전 RIP 정규성 검사, GDT 를 SYSRET 규칙에 맞게 재배치(유저 데이터 -> 유저 코드64 순서). ring 3 에서 두 경로를 모두 실행해 보는 자체 점검도 함께 만든다.
+
+### 결정이 필요한 질문 (1개)
+
+**"32비트, 64비트 둘 다 동작"** 을 어떻게 구현할지에 따라 위 설계가 달라진다. 세 가지 방안이 있고 저는 **A 를 추천**한다.
+
+- **A. 커널은 64비트 하나 + 32비트는 "부트/유저" 지원 (추천)**: GRUB(BIOS/32비트 진입)와 32비트 유저 프로그램(호환 모드)을 지원한다. 커널 코드는 하나라 안정성/보안 검증 비용이 가장 낮다. 32비트 CPU 에서 직접 실행하는 것은 불가능.
+- **B. 32비트 커널과 64비트 커널을 따로 빌드**: `arch/x86`, `arch/x86_64` 로 분리해 공용 코드를 공유한다. 32비트 전용 CPU(i686)에서도 실행 가능하지만 페이징/IDT/컨텍스트 전환/시스템 콜을 두 벌 만들고 두 벌 모두 검증해야 한다. `linker32.lds` 와 ELF32 로더는 이 방안에서 의미가 생긴다.
+- **C. A 로 먼저 만들고 B 는 나중에**: 지금 구조(NTBLI 어댑터)는 B 로도 확장 가능하다.
+
+어느 쪽으로 할지 알려주면, 그에 맞춰 위 1~3번을 한 번에 구현하고 GRUB(BIOS/UEFI)과 UEFI 직접 부팅을 모두 QEMU 에서 검증하겠다.

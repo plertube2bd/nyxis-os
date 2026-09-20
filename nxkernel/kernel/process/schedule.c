@@ -1,20 +1,18 @@
 /*
- * schedule.c - 협력형 라운드 로빈 스케줄러
+ * schedule.c - 스케줄러 (정책은 sched_rr.h 를 인라인으로 사용)
  *
- * [수정 이력 요약]
- *  - 후보 탐색을 "한 바퀴" 로 정확히 제한. (기존: 리스트가 원형이 아니면 무한 루프 가능)
- *  - 현재 프로세스가 TERMINATED 이면 READY 로 되돌리지 않는다.
- *  - 문맥 전환 도중 인터럽트로 상태가 바뀌지 않도록 인터럽트를 끈 채 선택한다.
+ * 문맥 전환 도중 인터럽트로 상태가 바뀌지 않도록 인터럽트를 끈 채 선택한다.
+ * 현재 프로세스가 TERMINATED 인 경우 READY 로 되돌리지 않는다. (process_switch 참고)
  */
 
 #include "kernel/process/schedule.h"
 #include "kernel/process/process.h"
+#include "kernel/process/sched_rr.h"
 #include "nyxis.h"
 
-void round_robin_schedule(void)
+void schedule(void)
 {
-    process_t *start;
-    process_t *proc;
+    process_t *next;
     u64 flags;
 
     if (!current_process || !process_list)
@@ -22,25 +20,9 @@ void round_robin_schedule(void)
 
     flags = irq_save();
 
-    start = current_process;
-    proc = start->next ? start->next : process_list;
+    next = sched_pick_next(current_process, process_list);
+    if (next)
+        (void)process_switch(next);   /* 다시 이 스레드가 선택되면 여기로 복귀 */
 
-    /* 리스트를 정확히 한 바퀴만 돈다 */
-    while (proc != start) {
-        if (proc->in_use && proc->state == PROCESS_READY) {
-            (void)process_switch(proc);   /* 다시 이 스레드가 선택되면 여기로 복귀 */
-            irq_restore(flags);
-            return;
-        }
-        proc = proc->next ? proc->next : process_list;
-    }
-
-    /* 현재 프로세스가 종료 상태인데 갈 곳이 없다면 호출자가 처리한다 */
     irq_restore(flags);
-}
-
-/* Simple round-robin scheduler */
-void schedule(void)
-{
-    round_robin_schedule();
 }
