@@ -1,27 +1,28 @@
-#include "schedule.h"
+/*
+ * schedule.c - 스케줄러 (정책은 sched_rr.h 를 인라인으로 사용)
+ *
+ * 문맥 전환 도중 인터럽트로 상태가 바뀌지 않도록 인터럽트를 끈 채 선택한다.
+ * 현재 프로세스가 TERMINATED 인 경우 READY 로 되돌리지 않는다. (process_switch 참고)
+ */
 
+#include "kernel/process/schedule.h"
 #include "kernel/process/process.h"
-#include "kernel/paging/paging.h"
+#include "kernel/process/sched_rr.h"
 #include "nyxis.h"
 
-void round_robin_schedule(void) {
-    if (!current_process)
+void schedule(void)
+{
+    process_t *next;
+    u64 flags;
+
+    if (!current_process || !process_list)
         return;
 
-    process_t* proc = current_process->next ? current_process->next : process_list;
-    while (proc && proc != current_process) {
-        if (proc->state == PROCESS_READY) {
-            if (current_process->state == PROCESS_RUNNING) {
-                current_process->state = PROCESS_READY;
-            }
-            process_switch(proc);
-            return;
-        }
-        proc = proc->next ? proc->next : process_list;
-    }
-}
+    flags = irq_save();
 
-// Simple round-robin scheduler
-void schedule(void) {
-    round_robin_schedule();
+    next = sched_pick_next(current_process, process_list);
+    if (next)
+        (void)process_switch(next);   /* 다시 이 스레드가 선택되면 여기로 복귀 */
+
+    irq_restore(flags);
 }

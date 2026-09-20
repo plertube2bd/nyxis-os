@@ -6,12 +6,14 @@
 
 static filesystem_t g_filesystems[FILESYSTEM_MAX];
 
-static filesystem_t* fs_find(const char* name) {
+static filesystem_t *fs_find(const char *name) {
+    u32 i;
+
     if (!name) {
         return nNULL;
     }
 
-    for (u32 i = 0; i < FILESYSTEM_MAX; i++) {
+    for (i = 0; i < FILESYSTEM_MAX; i++) {
         if (!g_filesystems[i].is_used) {
             continue;
         }
@@ -25,9 +27,11 @@ static filesystem_t* fs_find(const char* name) {
 }
 
 Nstatus filesystem_register(
-    const char* name,
+    const char *name,
     filesystem_ops_t ops
 ) {
+    u32 i;
+
     if (!name) {
         return NinvalidArg;
     }
@@ -40,11 +44,12 @@ Nstatus filesystem_register(
         return NalreadyExists;
     }
 
-    for (u32 i = 0; i < FILESYSTEM_MAX; i++) {
+    for (i = 0; i < FILESYSTEM_MAX; i++) {
         if (!g_filesystems[i].is_used) {
 
             memset(&g_filesystems[i], 0, sizeof(filesystem_t));
 
+            /* 위에서 strlen(name) < FILESYSTEM_NAME_MAX 를 확인했으므로 안전 */
             strcpy(g_filesystems[i].name, name);
             g_filesystems[i].ops = ops;
             g_filesystems[i].is_used = true;
@@ -56,8 +61,8 @@ Nstatus filesystem_register(
     return NtooManyFileSystem;
 }
 
-Nstatus filesystem_unregister(const char* name) {
-    filesystem_t* fs = fs_find(name);
+Nstatus filesystem_unregister(const char *name) {
+    filesystem_t *fs = fs_find(name);
 
     if (!fs) {
         return NnotFound;
@@ -68,16 +73,16 @@ Nstatus filesystem_unregister(const char* name) {
     return Nok;
 }
 
-filesystem_t* filesystem_get(const char* name) {
+filesystem_t *filesystem_get(const char *name) {
     return fs_find(name);
 }
 
 Nstatus filesystem_mount(
-    const char* fsname,
+    const char *fsname,
     u32 diskno,
-    void* userdata
+    void *userdata
 ) {
-    filesystem_t* fs = fs_find(fsname);
+    filesystem_t *fs = fs_find(fsname);
 
     if (!fs) {
         return NnotFound;
@@ -91,10 +96,10 @@ Nstatus filesystem_mount(
 }
 
 Nstatus filesystem_unmount(
-    const char* fsname,
+    const char *fsname,
     u32 diskno
 ) {
-    filesystem_t* fs = fs_find(fsname);
+    filesystem_t *fs = fs_find(fsname);
 
     if (!fs) {
         return NnotFound;
@@ -108,10 +113,10 @@ Nstatus filesystem_unmount(
 }
 
 Nstatus filesystem_format(
-    const char* fsname,
+    const char *fsname,
     u32 diskno
 ) {
-    filesystem_t* fs = fs_find(fsname);
+    filesystem_t *fs = fs_find(fsname);
 
     if (!fs) {
         return NnotFound;

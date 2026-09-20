@@ -1,4 +1,22 @@
-//
+/*
+ * vfs.c - 가상 파일시스템
+ *
+ * 구조: 네임스페이스("app", "initrd", ...) -> dentry 트리 -> vnode -> 파일시스템 ops.
+ * 경로 형식: "namespace:/path/to/file"  (네임스페이스가 없으면 기본 네임스페이스)
+ *
+ * [수정 이력 요약]
+ *  - 경로 해석에서 "찾았는데도 NfileNotFound 를 반환" 하던 논리 오류 수정.
+ *    resolve_path_internal_ns 는 lookup 에 성공해도 create_missing 이 false 이면 실패로
+ *    처리했다. 그 결과 vfs_register_namespace("app", "initrd:/_ns_/app") 가 항상 실패해서
+ *    kernel 이 "initrd:/" 로 잘못된 대체 등록을 했고, app:/hellowld.run 을 열 수 없었다.
+ *    dentry 는 lookup 결과의 "캐시" 일 뿐이므로 항상 만든다 (불필요해진 인자 삭제).
+ *  - create_namespace 안의 의미 없는 spin_lock/unlock 쌍 삭제 (sync.h 수정 전에는 이 unlock 이
+ *    인터럽트를 켜서 IDT 가 준비되기 전에 인터럽트가 발생할 수 있었다).
+ *  - C89 호환 (for 루프 선언/혼합 선언/라인 주석 제거), 'private' -> 'priv'.
+ *  - 락: 이 VFS 는 현재 단일 코어 + 인터럽트 비사용 경로에서만 쓰인다.
+ *    mount/unmount 는 g_vfs_lock 으로 보호하지만 resolve/open 경로는 락이 없다.
+ *    멀티코어/선점 도입 전에 반드시 보완해야 한다.
+ */
 
 #include "vfs.h"
 #include "memory.h"
@@ -10,30 +28,30 @@
 #define VFS_MAX_NAMESPACES  16
 #define VFS_NAME_MAX        255
 
-typedef struct vnode {
+struct vnode {
     u64 inode_id;
     u32 type;
 
-    vfs_ops_t* ops;
-    superblock_t* sb;
+    vfs_ops_t *ops;
+    superblock_t *sb;
 
     atomic_t refcnt;
-    void* fs_private;
-} vnode_t;
+    void *fs_private;
+};
 
 struct dentry {
     char name[VFS_NAME_MAX + 1];
-    vnode_t* node;
-    dentry_t* parent;
-    dentry_t* first_child;
-    dentry_t* next_sibling;
+    vnode_t *node;
+    dentry_t *parent;
+    dentry_t *first_child;
+    dentry_t *next_sibling;
     atomic_t refcnt;
 };
 
 typedef struct vfs_namespace {
     char name[VFS_NAME_MAX + 1];
-    dentry_t* root;
-    dentry_t* cwd;
+    dentry_t *root;
+    dentry_t *cwd;
     spinlock_t lock;
     bool in_use;
 } vfs_namespace_t;
@@ -41,11 +59,15 @@ typedef struct vfs_namespace {
 static dentry_t g_dentries[VFS_MAX_DENTRIES];
 static handle_t g_handles[VFS_MAX_HANDLES];
 static vfs_namespace_t g_namespaces[VFS_MAX_NAMESPACES];
-static vfs_namespace_t* g_default_namespace = nNULL;
+static vfs_namespace_t *g_default_namespace = nNULL;
 static spinlock_t g_vfs_lock;
+static vnode_t g_vnodes[VFS_MAX_VNODES];
 
-static dentry_t* alloc_dentry(const char* name, vnode_t* node, dentry_t* parent) {
-    for (u32 i = 0; i < VFS_MAX_DENTRIES; i++) {
+static dentry_t *alloc_dentry(const char *name, vnode_t *node, dentry_t *parent)
+{
+    u32 i;
+
+    for (i = 0; i < VFS_MAX_DENTRIES; i++) {
         if (g_dentries[i].refcnt.value != 0) {
             continue;
         }
@@ -62,7 +84,8 @@ static dentry_t* alloc_dentry(const char* name, vnode_t* node, dentry_t* parent)
     return nNULL;
 }
 
-static void free_dentry(dentry_t* dentry) {
+static void free_dentry(dentry_t *dentry)
+{
     if (!dentry) {
         return;
     }
@@ -74,7 +97,8 @@ static void free_dentry(dentry_t* dentry) {
     dentry->next_sibling = nNULL;
 }
 
-static void attach_child(dentry_t* parent, dentry_t* child) {
+static void attach_child(dentry_t *parent, dentry_t *child)
+{
     if (!parent || !child) {
         return;
     }
@@ -83,13 +107,17 @@ static void attach_child(dentry_t* parent, dentry_t* child) {
     parent->first_child = child;
 }
 
-static void detach_child(dentry_t* parent, dentry_t* child) {
+static void detach_child(dentry_t *parent, dentry_t *child)
+{
+    dentry_t *current;
+    dentry_t *previous;
+
     if (!parent || !child) {
         return;
     }
 
-    dentry_t* current = parent->first_child;
-    dentry_t* previous = nNULL;
+    current = parent->first_child;
+    previous = nNULL;
 
     while (current) {
         if (current == child) {
@@ -107,12 +135,15 @@ static void detach_child(dentry_t* parent, dentry_t* child) {
     }
 }
 
-static dentry_t* find_child(dentry_t* parent, const char* name) {
+static dentry_t *find_child(dentry_t *parent, const char *name)
+{
+    dentry_t *child;
+
     if (!parent || !name) {
         return nNULL;
     }
 
-    dentry_t* child = parent->first_child;
+    child = parent->first_child;
     while (child) {
         if (strcmp(child->name, name) == 0) {
             return child;
@@ -123,10 +154,11 @@ static dentry_t* find_child(dentry_t* parent, const char* name) {
     return nNULL;
 }
 
-static vnode_t g_vnodes[VFS_MAX_VNODES];
+static vnode_t *alloc_vnode(void)
+{
+    u32 i;
 
-static vnode_t* alloc_vnode(void) {
-    for (u32 i = 0; i < VFS_MAX_VNODES; i++) {
+    for (i = 0; i < VFS_MAX_VNODES; i++) {
         if (g_vnodes[i].refcnt.value != 0) {
             continue;
         }
@@ -139,7 +171,8 @@ static vnode_t* alloc_vnode(void) {
     return nNULL;
 }
 
-static void free_vnode(vnode_t* vnode) {
+static void free_vnode(vnode_t *vnode)
+{
     if (!vnode) {
         return;
     }
@@ -150,17 +183,18 @@ static void free_vnode(vnode_t* vnode) {
     vnode->fs_private = nNULL;
 }
 
-vnode_t* vfs_alloc_vnode(void) {
+vnode_t *vfs_alloc_vnode(void)
+{
     return alloc_vnode();
 }
 
 Nstatus vfs_init_vnode(
-    vnode_t* vnode,
+    vnode_t *vnode,
     u64 inode_id,
     u32 type,
-    vfs_ops_t* ops,
-    superblock_t* sb,
-    void* fs_private
+    vfs_ops_t *ops,
+    superblock_t *sb,
+    void *fs_private
 ) {
     if (!vnode || !ops) {
         return NinvalidArg;
@@ -174,19 +208,24 @@ Nstatus vfs_init_vnode(
     return Nok;
 }
 
-void vfs_free_vnode(vnode_t* vnode) {
+void vfs_free_vnode(vnode_t *vnode)
+{
     free_vnode(vnode);
 }
 
-void* vfs_get_vnode_private(vnode_t* vnode) {
+void *vfs_get_vnode_private(vnode_t *vnode)
+{
     if (!vnode) {
         return nNULL;
     }
     return vnode->fs_private;
 }
 
-static handle_t* alloc_handle(void) {
-    for (u32 i = 0; i < VFS_MAX_HANDLES; i++) {
+static handle_t *alloc_handle(void)
+{
+    u32 i;
+
+    for (i = 0; i < VFS_MAX_HANDLES; i++) {
         if (g_handles[i].refcnt.value != 0) {
             continue;
         }
@@ -199,7 +238,8 @@ static handle_t* alloc_handle(void) {
     return nNULL;
 }
 
-static void free_handle(handle_t* handle) {
+static void free_handle(handle_t *handle)
+{
     if (!handle) {
         return;
     }
@@ -211,11 +251,20 @@ static void free_handle(handle_t* handle) {
     handle->flags = 0;
 }
 
-static bool is_empty_string(const char* string) {
-    return !string || string[0] == '\0';
+static bool is_empty_string(const char *string)
+{
+    return (!string || string[0] == '\0') ? true : false;
 }
 
-static Nstatus parse_namespace_path(const char* path, char* out_ns, usize max_ns, const char** out_local_path) {
+/*
+ * "ns:/path" 를 네임스페이스 이름과 로컬 경로로 분리한다.
+ * 네임스페이스 이름은 max_ns(NUL 포함) 안에 들어가야 한다.
+ */
+static Nstatus parse_namespace_path(const char *path, char *out_ns, usize max_ns, const char **out_local_path)
+{
+    const char *cursor;
+    usize ns_len = 0;
+
     if (!path || !out_ns || max_ns == 0 || !out_local_path) {
         return NinvalidArg;
     }
@@ -227,26 +276,32 @@ static Nstatus parse_namespace_path(const char* path, char* out_ns, usize max_ns
         return Nok;
     }
 
-    const char* cursor = path;
-    usize ns_len = 0;
+    cursor = path;
 
     while (*cursor) {
-        const char* colon = strchr(cursor, ':');
+        const char *colon = strchr(cursor, ':');
+        usize segment_len;
+
         if (!colon) {
             break;
         }
 
-        if (colon[1] == '/') {
-            usize segment_len = (usize)(colon - cursor);
-            if (ns_len + segment_len >= max_ns) {
-                return NpathTooLong;
-            }
+        segment_len = (usize)(colon - cursor);
 
+        /* 이름 + (구분자 ':') + 종료 NUL 이 버퍼 안에 들어가는지 검사 */
+        if (ns_len + segment_len >= max_ns) {
+            return NpathTooLong;
+        }
+
+        if (colon[1] == '/') {
             if (ns_len > 0) {
                 if (ns_len + 1 >= max_ns) {
                     return NpathTooLong;
                 }
                 out_ns[ns_len++] = ':';
+                if (ns_len + segment_len >= max_ns) {
+                    return NpathTooLong;
+                }
             }
             memcpy(out_ns + ns_len, cursor, segment_len);
             ns_len += segment_len;
@@ -259,16 +314,14 @@ static Nstatus parse_namespace_path(const char* path, char* out_ns, usize max_ns
             return Nok;
         }
 
-        usize segment_len = (usize)(colon - cursor);
-        if (ns_len + segment_len >= max_ns) {
-            return NpathTooLong;
-        }
-
         if (ns_len > 0) {
             if (ns_len + 1 >= max_ns) {
                 return NpathTooLong;
             }
             out_ns[ns_len++] = ':';
+            if (ns_len + segment_len >= max_ns) {
+                return NpathTooLong;
+            }
         }
 
         memcpy(out_ns + ns_len, cursor, segment_len);
@@ -279,12 +332,16 @@ static Nstatus parse_namespace_path(const char* path, char* out_ns, usize max_ns
     return Nok;
 }
 
-static Nstatus parse_segment(const char** cursor, char* out_name, usize max_len) {
+static Nstatus parse_segment(const char **cursor, char *out_name, usize max_len)
+{
+    const char *source;
+    usize len = 0;
+
     if (!cursor || !*cursor || !out_name || max_len == 0) {
         return NinvalidArg;
     }
 
-    const char* source = *cursor;
+    source = *cursor;
 
     while (*source == '/') {
         source++;
@@ -296,7 +353,6 @@ static Nstatus parse_segment(const char** cursor, char* out_name, usize max_len)
         return Nok;
     }
 
-    usize len = 0;
     while (*source != '\0' && *source != '/') {
         if (len + 1 >= max_len) {
             return NpathTooLong;
@@ -314,8 +370,11 @@ static Nstatus parse_segment(const char** cursor, char* out_name, usize max_len)
     return Nok;
 }
 
-static vfs_namespace_t* find_namespace(const char* name) {
-    for (u32 i = 0; i < VFS_MAX_NAMESPACES; i++) {
+static vfs_namespace_t *find_namespace(const char *name)
+{
+    u32 i;
+
+    for (i = 0; i < VFS_MAX_NAMESPACES; i++) {
         if (!g_namespaces[i].in_use) {
             continue;
         }
@@ -328,8 +387,11 @@ static vfs_namespace_t* find_namespace(const char* name) {
     return nNULL;
 }
 
-static vfs_namespace_t* create_namespace(const char* name, dentry_t* root) {
-    for (u32 i = 0; i < VFS_MAX_NAMESPACES; i++) {
+static vfs_namespace_t *create_namespace(const char *name, dentry_t *root)
+{
+    u32 i;
+
+    for (i = 0; i < VFS_MAX_NAMESPACES; i++) {
         if (!g_namespaces[i].in_use) {
             memset(&g_namespaces[i], 0, sizeof(vfs_namespace_t));
             g_namespaces[i].in_use = true;
@@ -339,8 +401,6 @@ static vfs_namespace_t* create_namespace(const char* name, dentry_t* root) {
             }
             g_namespaces[i].root = root;
             g_namespaces[i].cwd = root;
-            spin_lock(&g_namespaces[i].lock);
-            spin_unlock(&g_namespaces[i].lock);
             return &g_namespaces[i];
         }
     }
@@ -348,17 +408,21 @@ static vfs_namespace_t* create_namespace(const char* name, dentry_t* root) {
     return nNULL;
 }
 
-static vfs_namespace_t* get_namespace(const char* name, bool create) {
+static vfs_namespace_t *get_namespace(const char *name, bool create)
+{
+    vfs_namespace_t *ns;
+    dentry_t *root;
+
     if (is_empty_string(name)) {
         return g_default_namespace;
     }
 
-    vfs_namespace_t* ns = find_namespace(name);
+    ns = find_namespace(name);
     if (ns || !create) {
         return ns;
     }
 
-    dentry_t* root = alloc_dentry("", nNULL, nNULL);
+    root = alloc_dentry("", nNULL, nNULL);
     if (!root) {
         return nNULL;
     }
@@ -372,13 +436,16 @@ static vfs_namespace_t* get_namespace(const char* name, bool create) {
     return ns;
 }
 
-static Nstatus resolve_namespace_path(const char* path, vfs_namespace_t** out_ns, const char** out_local_path, bool create_ns) {
+static Nstatus resolve_namespace_path(const char *path, vfs_namespace_t **out_ns, const char **out_local_path, bool create_ns)
+{
+    char namespace_name[VFS_NAME_MAX + 1];
+    Nstatus status;
+
     if (!path || !out_ns || !out_local_path) {
         return NinvalidArg;
     }
 
-    char namespace_name[VFS_NAME_MAX + 1];
-    Nstatus status = parse_namespace_path(path, namespace_name, sizeof(namespace_name), out_local_path);
+    status = parse_namespace_path(path, namespace_name, sizeof(namespace_name), out_local_path);
     if (NSTATUS_IS_ERR(status)) {
         return status;
     }
@@ -391,18 +458,24 @@ static Nstatus resolve_namespace_path(const char* path, vfs_namespace_t** out_ns
     return Nok;
 }
 
+/*
+ * 네임스페이스 안에서 path 를 따라 dentry 를 찾는다.
+ * dentry 캐시에 없으면 파일시스템의 lookup 을 호출하고 결과를 캐시에 추가한다.
+ */
 static Nstatus resolve_path_internal_ns(
-    vfs_namespace_t* ns,
-    const char* path,
-    dentry_t** out_dentry,
-    bool create_missing
+    vfs_namespace_t *ns,
+    const char *path,
+    dentry_t **out_dentry
 ) {
+    dentry_t *current;
+    const char *cursor;
+
     if (!ns || !path || !out_dentry) {
         return NinvalidArg;
     }
 
-    dentry_t* current = (path[0] == '/') ? ns->root : ns->cwd;
-    const char* cursor = path;
+    current = (path[0] == '/') ? ns->root : ns->cwd;
+    cursor = path;
 
     if (*cursor == '/') {
         cursor++;
@@ -410,7 +483,9 @@ static Nstatus resolve_path_internal_ns(
 
     while (*cursor != '\0') {
         char name[VFS_NAME_MAX + 1];
+        dentry_t *child;
         Nstatus status = parse_segment(&cursor, name, sizeof(name));
+
         if (NSTATUS_IS_ERR(status)) {
             return status;
         }
@@ -419,13 +494,14 @@ static Nstatus resolve_path_internal_ns(
             break;
         }
 
-        dentry_t* child = find_child(current, name);
+        child = find_child(current, name);
         if (!child) {
+            vnode_t *vnode = nNULL;
+
             if (!current->node || !current->node->ops || !current->node->ops->lookup) {
                 return NfileNotFound;
             }
 
-            vnode_t* vnode = nNULL;
             status = current->node->ops->lookup(current->node, name, &vnode);
             if (NSTATUS_IS_ERR(status)) {
                 return status;
@@ -435,12 +511,9 @@ static Nstatus resolve_path_internal_ns(
                 return NfileNotFound;
             }
 
-            if (!create_missing) {
-                return NfileNotFound;
-            }
-
             child = alloc_dentry(name, vnode, current);
             if (!child) {
+                vfs_free_vnode(vnode);
                 return NoutOfMemory;
             }
             attach_child(current, child);
@@ -454,18 +527,21 @@ static Nstatus resolve_path_internal_ns(
 }
 
 static Nstatus resolve_parent_ns(
-    vfs_namespace_t* ns,
-    const char* path,
-    dentry_t** out_parent,
-    char* out_name,
+    vfs_namespace_t *ns,
+    const char *path,
+    dentry_t **out_parent,
+    char *out_name,
     usize max_len
 ) {
+    dentry_t *current;
+    const char *cursor;
+
     if (!ns || !path || !out_parent || !out_name || max_len == 0) {
         return NinvalidArg;
     }
 
-    dentry_t* current = (path[0] == '/') ? ns->root : ns->cwd;
-    const char* cursor = path;
+    current = (path[0] == '/') ? ns->root : ns->cwd;
+    cursor = path;
 
     if (*cursor == '/') {
         cursor++;
@@ -473,7 +549,10 @@ static Nstatus resolve_parent_ns(
 
     while (*cursor != '\0') {
         char name[VFS_NAME_MAX + 1];
+        const char *next_cursor;
+        dentry_t *child;
         Nstatus status = parse_segment(&cursor, name, sizeof(name));
+
         if (NSTATUS_IS_ERR(status)) {
             return status;
         }
@@ -482,7 +561,7 @@ static Nstatus resolve_parent_ns(
             break;
         }
 
-        const char* next_cursor = cursor;
+        next_cursor = cursor;
         while (*next_cursor == '/') {
             next_cursor++;
         }
@@ -494,13 +573,14 @@ static Nstatus resolve_parent_ns(
             return Nok;
         }
 
-        dentry_t* child = find_child(current, name);
+        child = find_child(current, name);
         if (!child) {
+            vnode_t *vnode = nNULL;
+
             if (!current->node || !current->node->ops || !current->node->ops->lookup) {
                 return NnotFound;
             }
 
-            vnode_t* vnode = nNULL;
             status = current->node->ops->lookup(current->node, name, &vnode);
             if (NSTATUS_IS_ERR(status)) {
                 return status;
@@ -512,6 +592,7 @@ static Nstatus resolve_parent_ns(
 
             child = alloc_dentry(name, vnode, current);
             if (!child) {
+                vfs_free_vnode(vnode);
                 return NoutOfMemory;
             }
             attach_child(current, child);
@@ -530,11 +611,14 @@ static Nstatus resolve_parent_ns(
     return NnotFound;
 }
 
-Nstatus vfs_init(void) {
+Nstatus vfs_init(void)
+{
+    dentry_t *root;
+
     memset(g_namespaces, 0, sizeof(g_namespaces));
     memset(&g_vfs_lock, 0, sizeof(spinlock_t));
 
-    dentry_t* root = alloc_dentry("", nNULL, nNULL);
+    root = alloc_dentry("", nNULL, nNULL);
     if (!root) {
         return NoutOfMemory;
     }
@@ -548,20 +632,24 @@ Nstatus vfs_init(void) {
     return Nok;
 }
 
-Nstatus vfs_register_namespace(const char* namespace_name, const char* source_path) {
+Nstatus vfs_register_namespace(const char *namespace_name, const char *source_path)
+{
+    vfs_namespace_t *source_ns = nNULL;
+    vfs_namespace_t *target_ns;
+    const char *local_path = nNULL;
+    dentry_t *root = nNULL;
+    Nstatus status;
+
     if (!namespace_name || !source_path) {
         return NinvalidArg;
     }
 
-    vfs_namespace_t* source_ns = nNULL;
-    const char* local_path = nNULL;
-    Nstatus status = resolve_namespace_path(source_path, &source_ns, &local_path, false);
+    status = resolve_namespace_path(source_path, &source_ns, &local_path, false);
     if (NSTATUS_IS_ERR(status)) {
         return status;
     }
 
-    dentry_t* root = nNULL;
-    status = resolve_path_internal_ns(source_ns, local_path, &root, false);
+    status = resolve_path_internal_ns(source_ns, local_path, &root);
     if (NSTATUS_IS_ERR(status)) {
         return status;
     }
@@ -570,7 +658,7 @@ Nstatus vfs_register_namespace(const char* namespace_name, const char* source_pa
         return NnotFound;
     }
 
-    vfs_namespace_t* target_ns = get_namespace(namespace_name, true);
+    target_ns = get_namespace(namespace_name, true);
     if (!target_ns) {
         return NtooManyFileSystem;
     }
@@ -580,7 +668,15 @@ Nstatus vfs_register_namespace(const char* namespace_name, const char* source_pa
     return Nok;
 }
 
-Nstatus vfs_mount(const char* path, vfs_filesystem_t* fs) {
+Nstatus vfs_mount(const char *path, vfs_filesystem_t *fs)
+{
+    vfs_namespace_t *ns = nNULL;
+    const char *local_path = nNULL;
+    dentry_t *parent = nNULL;
+    dentry_t *existing;
+    char mount_name[VFS_NAME_MAX + 1];
+    Nstatus status;
+
     if (!path || !fs || !fs->root || !fs->ops) {
         return NinvalidArg;
     }
@@ -590,9 +686,7 @@ Nstatus vfs_mount(const char* path, vfs_filesystem_t* fs) {
     }
 
     spin_lock(&g_vfs_lock);
-    vfs_namespace_t* ns = nNULL;
-    const char* local_path = nNULL;
-    Nstatus status = resolve_namespace_path(path, &ns, &local_path, true);
+    status = resolve_namespace_path(path, &ns, &local_path, true);
     if (NSTATUS_IS_ERR(status)) {
         spin_unlock(&g_vfs_lock);
         return status;
@@ -609,8 +703,6 @@ Nstatus vfs_mount(const char* path, vfs_filesystem_t* fs) {
         return Nok;
     }
 
-    dentry_t* parent = nNULL;
-    char mount_name[VFS_NAME_MAX + 1];
     status = resolve_parent_ns(ns, local_path, &parent, mount_name, sizeof(mount_name));
     if (NSTATUS_IS_ERR(status)) {
         spin_unlock(&g_vfs_lock);
@@ -622,7 +714,7 @@ Nstatus vfs_mount(const char* path, vfs_filesystem_t* fs) {
         return NinvalidArg;
     }
 
-    dentry_t* existing = find_child(parent, mount_name);
+    existing = find_child(parent, mount_name);
     if (existing && existing->node) {
         spin_unlock(&g_vfs_lock);
         return NalreadyExists;
@@ -643,15 +735,20 @@ Nstatus vfs_mount(const char* path, vfs_filesystem_t* fs) {
     return Nok;
 }
 
-Nstatus vfs_unmount(const char* path) {
+Nstatus vfs_unmount(const char *path)
+{
+    vfs_namespace_t *ns = nNULL;
+    const char *local_path = nNULL;
+    dentry_t *mount_point = nNULL;
+    dentry_t *parent;
+    Nstatus status;
+
     if (!path || strlen(path) == 0) {
         return NinvalidArg;
     }
 
     spin_lock(&g_vfs_lock);
-    vfs_namespace_t* ns = nNULL;
-    const char* local_path = nNULL;
-    Nstatus status = resolve_namespace_path(path, &ns, &local_path, false);
+    status = resolve_namespace_path(path, &ns, &local_path, false);
     if (NSTATUS_IS_ERR(status)) {
         spin_unlock(&g_vfs_lock);
         return status;
@@ -668,8 +765,7 @@ Nstatus vfs_unmount(const char* path) {
         return Nok;
     }
 
-    dentry_t* mount_point = nNULL;
-    status = resolve_path_internal_ns(ns, local_path, &mount_point, false);
+    status = resolve_path_internal_ns(ns, local_path, &mount_point);
     if (NSTATUS_IS_ERR(status)) {
         spin_unlock(&g_vfs_lock);
         return status;
@@ -680,7 +776,7 @@ Nstatus vfs_unmount(const char* path) {
         return NnotFound;
     }
 
-    dentry_t* parent = mount_point->parent;
+    parent = mount_point->parent;
     if (parent) {
         detach_child(parent, mount_point);
         free_dentry(mount_point);
@@ -692,43 +788,35 @@ Nstatus vfs_unmount(const char* path) {
     return Nok;
 }
 
-static Nstatus resolve_path_internal(const char* path, dentry_t** out_dentry, bool create_missing) {
+static Nstatus resolve_path_internal(const char *path, dentry_t **out_dentry)
+{
+    vfs_namespace_t *ns = nNULL;
+    const char *local_path = nNULL;
+    Nstatus status;
+
     if (!path || !out_dentry) {
         return NinvalidArg;
     }
 
-    vfs_namespace_t* ns = nNULL;
-    const char* local_path = nNULL;
-    Nstatus status = resolve_namespace_path(path, &ns, &local_path, false);
+    status = resolve_namespace_path(path, &ns, &local_path, false);
     if (NSTATUS_IS_ERR(status)) {
         return status;
     }
 
-    return resolve_path_internal_ns(ns, local_path, out_dentry, create_missing);
+    return resolve_path_internal_ns(ns, local_path, out_dentry);
 }
 
-static Nstatus resolve_parent(const char* path, dentry_t** out_parent, char* out_name, usize max_len) {
-    if (!path || !out_parent || !out_name || max_len == 0) {
-        return NinvalidArg;
-    }
+Nstatus vfs_open(const char *path, u32 flags, handle_t *out_handle)
+{
+    dentry_t *target = nNULL;
+    handle_t *handle;
+    Nstatus status;
 
-    vfs_namespace_t* ns = nNULL;
-    const char* local_path = nNULL;
-    Nstatus status = resolve_namespace_path(path, &ns, &local_path, false);
-    if (NSTATUS_IS_ERR(status)) {
-        return status;
-    }
-
-    return resolve_parent_ns(ns, local_path, out_parent, out_name, max_len);
-}
-
-Nstatus vfs_open(const char* path, u32 flags, handle_t* out_handle) {
     if (!path || !out_handle) {
         return NinvalidArg;
     }
 
-    dentry_t* target = nNULL;
-    Nstatus status = resolve_path_internal(path, &target, true);
+    status = resolve_path_internal(path, &target);
     if (NSTATUS_IS_ERR(status)) {
         return status;
     }
@@ -737,7 +825,7 @@ Nstatus vfs_open(const char* path, u32 flags, handle_t* out_handle) {
         return Nunsupported;
     }
 
-    handle_t* handle = alloc_handle();
+    handle = alloc_handle();
     if (!handle) {
         return NoutOfMemory;
     }
@@ -753,12 +841,16 @@ Nstatus vfs_open(const char* path, u32 flags, handle_t* out_handle) {
         return status;
     }
 
+    /* 호출자가 가진 handle_t 로 사본을 넘기고, 전역 슬롯은 즉시 반환한다 */
     *out_handle = *handle;
     free_handle(handle);
     return Nok;
 }
 
-Nstatus vfs_read(handle_t* handle, void* buffer, usize size, usize* bytes_read) {
+Nstatus vfs_read(handle_t *handle, void *buffer, usize size, usize *bytes_read)
+{
+    Nstatus status;
+
     if (!handle || !buffer || !bytes_read) {
         return NinvalidArg;
     }
@@ -767,16 +859,22 @@ Nstatus vfs_read(handle_t* handle, void* buffer, usize size, usize* bytes_read) 
         return Nunsupported;
     }
 
-    Nstatus status = handle->vnode->ops->read(handle, buffer, size, bytes_read);
+    *bytes_read = 0;
+
+    status = handle->vnode->ops->read(handle, buffer, size, bytes_read);
     if (NSTATUS_IS_ERR(status)) {
         return status;
     }
 
+    /* 파일 오프셋은 VFS 계층에서만 갱신한다 (파일시스템 드라이버가 갱신하면 이중 증가) */
     handle->offset += *bytes_read;
     return Nok;
 }
 
-Nstatus vfs_write(handle_t* handle, const void* buffer, usize size, usize* bytes_written) {
+Nstatus vfs_write(handle_t *handle, const void *buffer, usize size, usize *bytes_written)
+{
+    Nstatus status;
+
     if (!handle || !buffer || !bytes_written) {
         return NinvalidArg;
     }
@@ -785,7 +883,9 @@ Nstatus vfs_write(handle_t* handle, const void* buffer, usize size, usize* bytes
         return Nunsupported;
     }
 
-    Nstatus status = handle->vnode->ops->write(handle, buffer, size, bytes_written);
+    *bytes_written = 0;
+
+    status = handle->vnode->ops->write(handle, buffer, size, bytes_written);
     if (NSTATUS_IS_ERR(status)) {
         return status;
     }
@@ -794,7 +894,10 @@ Nstatus vfs_write(handle_t* handle, const void* buffer, usize size, usize* bytes
     return Nok;
 }
 
-Nstatus vfs_close(handle_t* handle) {
+Nstatus vfs_close(handle_t *handle)
+{
+    Nstatus status;
+
     if (!handle) {
         return NinvalidArg;
     }
@@ -803,7 +906,7 @@ Nstatus vfs_close(handle_t* handle) {
         return Nunsupported;
     }
 
-    Nstatus status = handle->vnode->ops->close(handle);
+    status = handle->vnode->ops->close(handle);
     if (NSTATUS_IS_ERR(status)) {
         return status;
     }
@@ -811,5 +914,3 @@ Nstatus vfs_close(handle_t* handle) {
     free_handle(handle);
     return Nok;
 }
-
-
