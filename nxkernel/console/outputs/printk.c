@@ -325,6 +325,23 @@ static Nstatus printk_vformat(const char *format, va_list args)
     return NSTATUS_OK;
 }
 
+void printk_write(const char *buf, usize len)
+{
+    usize i;
+
+    if (!buf)
+        return;
+
+    for (i = 0; i < len; i++) {
+        u8 c = (u8)buf[i];
+
+        if (c == '\n' || c == '\r' || c == '\t' || (c >= 0x20 && c <= 0x7E))
+            printk_putc((char)c);
+        else
+            printk_putc('?');
+    }
+}
+
 Nstatus printk(const char *format, ...)
 {
     va_list args;

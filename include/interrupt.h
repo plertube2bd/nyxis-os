@@ -21,9 +21,20 @@
 /* ------------------------------------------------------------------ */
 #define SEL_KERNEL_CODE  0x08U   /* ring0 64비트 코드 */
 #define SEL_KERNEL_DATA  0x10U   /* ring0 데이터 */
-#define SEL_USER_CODE    0x1BU   /* ring3 64비트 코드 (RPL=3 포함) */
+#define SEL_USER_CODE32  0x1BU   /* ring3 32비트 코드 (호환 모드용, RPL=3 포함) */
 #define SEL_USER_DATA    0x23U   /* ring3 데이터      (RPL=3 포함) */
-#define SEL_TSS          0x28U   /* TSS (16바이트 디스크립터) */
+#define SEL_USER_CODE    0x2BU   /* ring3 64비트 코드 (RPL=3 포함) */
+#define SEL_TSS          0x30U   /* TSS (16바이트 디스크립터) */
+
+/*
+ * SYSCALL/SYSRET 규칙에 맞춘 배치:
+ *   STAR[47:32] = 0x08 -> SYSCALL: CS = 0x08,      SS = 0x10
+ *   STAR[63:48] = 0x18 -> SYSRET64: SS = 0x18+8|3 = 0x23 (유저 데이터), CS = 0x18+16|3 = 0x2B (유저 코드64)
+ *                         SYSRET32: CS = 0x18|3   = 0x1B (유저 코드32)
+ * 그래서 GDT 는 "유저 코드32 -> 유저 데이터 -> 유저 코드64" 순서여야 한다.
+ */
+#define STAR_KERNEL_BASE 0x08U
+#define STAR_USER_BASE   0x18U
 
 /* ------------------------------------------------------------------ */
 /* 벡터 번호                                                           */

@@ -141,32 +141,100 @@
 
 | 항목 | 결정 | 상태 |
 |---|---|---|
-| 기본 QEMU 구성 | virtio-gpu(BltOnly) 대신 **std VGA(Bochs VBE) 선형 프레임버퍼** 사용. 그래픽 장치가 없어도 시리얼로 동작 | 완료 (`make run`, `make run-usb` 모두 std VGA. usb-storage 부팅으로 프레임버퍼 1024x768 확인) |
-| UEFI 비종속 | 커널은 UEFI 가 아니라 NTBLI 만 본다. 다른 부트 방식은 "부트 정보 -> NTBLI" 어댑터를 추가하는 방식으로 지원 | 설계만 (아래 6절) |
-| 시스템 콜 | `int 0x80` + `syscall/sysret` 둘 다 지원, 반환은 Nstatus 부호 확장 유지 | **미구현** (`int 0x80` 만 동작) |
-| 유저 공간 | higher-half 커널 | **미구현** |
-| Multiboot2 / ELF32 / `linker32.lds` | 삭제하지 않는다. (`linker32.lds` 는 원래부터 그대로 있음) 이전에 제가 제거한 Multiboot2 헤더와 ELF32 경로는 "동작하지 않는 상태" 였으므로 되살리지 않고, 제대로 동작하도록 다시 구현한다 | **미구현** (아래 질문 필요) |
-| git 추적 바이너리 | 추적 해제 + `.gitignore` | 완료 (`esp.img`, `esp_test.img`, `serial.log`, `initrd.img`. 히스토리는 그대로) |
+| 기본 QEMU 구성 | virtio-gpu(BltOnly) 대신 **std VGA(Bochs VBE) 선형 프레임버퍼**. 그래픽 장치가 없어도 시리얼로 동작 | 완료 (`make run`, `make run-usb`) |
+| UEFI 비종속 | 커널은 부트 방식이 아니라 NTBLI 만 본다. 부트 방식마다 "정보 -> NTBLI" 어댑터만 추가 | 완료 (UEFI 직접 + GRUB Multiboot2 BIOS/UEFI) |
+| 32/64비트 | **방안 C 선택**: 64비트 커널 하나 + 32비트는 부트(GRUB 32비트 진입)와 32비트 호환 모드 유저(GDT 에 32비트 유저 코드 세그먼트 준비) 지원을 먼저 만들고, 32비트 전용 커널(B)은 나중에 | A 부분 완료 / B 는 이후 |
+| 시스템 콜 | `int 0x80` + `syscall/sysret` 둘 다, 반환은 Nstatus 부호 확장 | 완료 (ring 3 에서 두 경로 모두 실행 검증) |
+| 유저 공간 | higher-half 커널 (HHDM + 커널 이미지 상위 매핑, 하위 절반은 사용자 공간) | 완료 |
+| Multiboot2 / ELF32 / `linker32.lds` | 삭제하지 않는다. Multiboot2 는 제대로 동작하도록 다시 구현. ELF32 로더/`linker32.lds` 는 방안 B(32비트 커널)에서 의미가 생기므로 그때 구현 (이전 ELF32 경로는 롱 모드에서 32비트 커널로 점프하는 동작 불가 코드였음) | Multiboot2 완료 / ELF32 는 B 와 함께 |
+| git 추적 바이너리 | 추적 해제 + `.gitignore` | 완료 |
 | `helloworld` 링크 / `initrd.c` | 가능한 빨리 제거 예정. 그때까지 유지 | 유지 |
 | 스케줄러 | 외부 진입점은 `schedule()` 하나, 정책은 인라인 헤더(`sched_rr.h`) | 완료 |
 | Rust | 소유권/메모리 이동을 확신할 수 없는 부분에만 사용. 기존 C 는 질문 없이 바꾸지 않는다 | 해당 없음 |
-| 라이선스 | 제가 정함: `docs/LICENSING.md` (Linux GPL-2.0-only 코드는 복사 금지, BSD/MIT/Apache/GPL-3 호환 코드만) | 완료 |
+| 라이선스 | `docs/LICENSING.md` | 완료 |
 
-## 6. 아직 하지 않은 일과 이유
+## 6. higher-half / Multiboot2 / syscall 구현 내용 (2차 작업)
 
-아래 세 가지는 서로 얽혀 있어서 한 번에 설계해야 한다. 절반만 하면 부팅이 깨질 위험이 커서 이번에는 시작하지 않았다.
+- **메모리 레이아웃** (`include/phys.h`, `linker64.lds`): 커널은 물리 1MiB 에 적재되고 가상 `0xFFFFFFFF80000000 + 물리` 에 링크된다(`-mcmodel=kernel`).
+  낮은 주소의 `.boot` 섹션에 초기 진입 코드와 임시 페이지 테이블이 있다. 물리 주소를 다루는 곳(AHCI DMA, ABAR, 페이지 테이블, initrd, 프레임버퍼)은
+  `virt_to_phys/phys_to_virt` 로 물리/가상 주소를 구분한다. DMA 는 커널 이미지/HHDM 의 (물리적으로 연속인) 버퍼만 허용한다.
+- **페이징**: PML4[256] = HHDM(2MiB, NX), PML4[511] = 커널 이미지(4KiB, W^X, 스택 가드 페이지 없음). 커널 이미지의 HHDM 별칭은 읽기 전용(W^X 우회 방지).
+  하위 절반은 사용자 공간이며 `paging_map_page` 로 매핑한다. 부팅 후 낮은 주소 항등 매핑은 없다 (NULL 역참조는 자동으로 #PF).
+- **부트** (`kernel/boot/boot.s`): UEFI 용 64비트 `_start`, GRUB 용 32비트 `_start_mb`(Multiboot2 entry address 태그). 둘 다 부트 정보와 메모리 맵을
+  커널 안의 버퍼로 복사(UEFI 페이지 테이블을 버리기 전)한 뒤 임시 테이블로 higher-half 에 진입한다. 64비트 CPU 가 아니면 VGA 텍스트로 오류를 표시하고 정지.
+  `multiboot2.c` 는 태그(메모리 맵, 프레임버퍼, 모듈=initrd, ACPI RSDP)를 검증하며 NTBLI 로 변환한다.
+- **syscall/sysret** (`syscall_entry.s`, `syscall.c`): EFER.SCE/STAR/LSTAR/SFMASK, `swapgs` + 커널 스택 전환(`g_cpu_local`), `int 0x80` 과 같은 `syscall_handle` 로 처리.
+  sysret 전 복귀 RIP 이 사용자 영역인지 검사(비정규 RIP sysret 취약점 방지). GDT 를 SYSRET 규칙(유저 코드32 -> 유저 데이터 -> 유저 코드64)으로 재배치.
+  시스템 콜 `NxYield(5)`, `NxProcessExit(65)` 추가.
+- **테스트**: ring 3 프로그램이 `syscall` 과 `int 0x80` 으로 시스템 콜을 호출하고(성공/NULL/커널 주소 거부/yield/exit), 사용자 모드 #GP 는 해당 프로세스만 종료하고 커널은 계속 동작한다.
+  `tests/host/mb2_test.c`: Multiboot2 어댑터의 정상 입력 + 변이 퍼징 2만 회(ASan/UBSan).
 
-1. **higher-half 커널**: 링크 주소를 `0xFFFFFFFF80100000`(적재 주소 1MiB)으로 옮기고, 낮은 주소의 초기 진입 코드가 임시 페이지 테이블을 만든 뒤 높은 주소로 점프해야 한다.
-   물리 주소를 다루는 모든 곳(AHCI DMA, initrd, 프레임버퍼, 페이지 테이블, 부트 정보)에 `phys_to_virt/virt_to_phys` 변환이 필요하다.
-2. **Multiboot2(GRUB) 부팅**: 32비트 보호 모드로 진입하므로 롱 모드 전환 스텁 + Multiboot2 정보를 NTBLI 로 바꾸는 어댑터(메모리 맵, 프레임버퍼 태그, 모듈=initrd, RSDP)가 필요하다. 위 1번의 초기 진입 코드와 같은 파일에서 만든다.
-3. **`syscall/sysret`**: EFER.SCE/STAR/LSTAR/SFMASK, `swapgs` 기반 진입 스텁, sysret 전 RIP 정규성 검사, GDT 를 SYSRET 규칙에 맞게 재배치(유저 데이터 -> 유저 코드64 순서). ring 3 에서 두 경로를 모두 실행해 보는 자체 점검도 함께 만든다.
+### 2차 작업 검증 결과
+- `make check` (`-O0`/`-O2`) 통과. `make test-host`: FAT16 회귀 12건 + 퍼징, Multiboot2 어댑터 테스트 통과.
+- 부팅 + `SELFTEST=1`(33개 항목, ring 3 포함) 통과: UEFI 직접(q35/AHCI, pc/IDE, VGA 없음, `-cpu max` + 3GB(4GB 초과 영역 포함), `-O0`/`-O2`),
+  **GRUB BIOS(SeaBIOS)**, **GRUB UEFI(OVMF)**. GRUB 경로의 프레임버퍼 콘솔(1024x768)도 화면으로 확인.
+- 예외/보호(`SELFTEST=2..7`): #DE, NULL 역참조, 스택 오버플로(#DF), `.text` 쓰기, 데이터 페이지 실행(NX), #UD 모두 higher-half 에서도 의도대로 검출.
 
-### 결정이 필요한 질문 (1개)
+### 검증하지 못한 것
+- 실제 하드웨어(모두 QEMU). AHCI COMRESET 지연, 실제 GRUB/UEFI 환경의 프레임버퍼 태그 다양성(현재 32bpp 직접 색상만 지원).
+- SMEP 위반 동작(QEMU `qemu64` 에는 SMEP 없음, `-cpu max` 에서 부팅만 확인). sysret 의 비정규 RIP 방어 경로(`syscall_bad_return`)는 실행해 보지 못했다.
+- 32비트 유저(호환 모드) 프로그램 실행, 멀티코어(AP 는 깨우지 않음), 4GB 초과 RAM 은 3GB 게스트까지.
 
-**"32비트, 64비트 둘 다 동작"** 을 어떻게 구현할지에 따라 위 설계가 달라진다. 세 가지 방안이 있고 저는 **A 를 추천**한다.
+## 7. 남은 문제 / 알려진 한계
 
-- **A. 커널은 64비트 하나 + 32비트는 "부트/유저" 지원 (추천)**: GRUB(BIOS/32비트 진입)와 32비트 유저 프로그램(호환 모드)을 지원한다. 커널 코드는 하나라 안정성/보안 검증 비용이 가장 낮다. 32비트 CPU 에서 직접 실행하는 것은 불가능.
-- **B. 32비트 커널과 64비트 커널을 따로 빌드**: `arch/x86`, `arch/x86_64` 로 분리해 공용 코드를 공유한다. 32비트 전용 CPU(i686)에서도 실행 가능하지만 페이징/IDT/컨텍스트 전환/시스템 콜을 두 벌 만들고 두 벌 모두 검증해야 한다. `linker32.lds` 와 ELF32 로더는 이 방안에서 의미가 생긴다.
-- **C. A 로 먼저 만들고 B 는 나중에**: 지금 구조(NTBLI 어댑터)는 B 로도 확장 가능하다.
+- VFS: mount/unmount 외의 경로에 락 없음, dentry/vnode 참조 카운트를 실제로 쓰지 않음 (멀티코어/선점 도입 전 필수).
+- 스케줄러는 협력형. 타이머 선점, 실제 유저 프로세스 로더(ELF), 프로세스별 주소 공간(CR3) 없음. syscall/int 0x80 처리 중에는 인터럽트가 꺼져 있다.
+- syscall 복귀 직전 사용자 스택 위에서 NMI 가 오면 스택 전환 문제가 생길 수 있다 (NMI 는 IST 를 쓰므로 스택은 안전하나 GS 상태 주의 필요).
+- 스택 카나리, KASLR, SMAP 미사용. 프레임버퍼는 WB 매핑(MTRR 에 의존; PAT 로 WC 지정하면 스크롤이 빨라짐).
+- Multiboot2 프레임버퍼 태그가 없거나 지원하지 않는 형식이면 시리얼만 사용한다.
+- 방안 B(32비트 커널 별도 빌드)와 ELF32 로더/`linker32.lds` 는 아직 없다.
+- `userland/initrd/initrd.c` 는 컴파일 불가능한 자리 표시자, 빈 `코드분석.rtf` 는 그대로 둠.
 
-어느 쪽으로 할지 알려주면, 그에 맞춰 위 1~3번을 한 번에 구현하고 GRUB(BIOS/UEFI)과 UEFI 직접 부팅을 모두 QEMU 에서 검증하겠다.
+## 8. 시스템 콜 구현 (3차 작업)
+
+가장 먼저 필요한 것부터 만들었다: 시스템 콜이 사용자 입력을 다루는 코드이므로, "무엇을 만들지" 보다
+"안전하게 다루는 통로부터 만드는 것" 을 우선했다. 그 통로(uaccess, 핸들 테이블) 위에 핵심 호출들을 올렸다.
+
+- **공개 ABI 헤더** (`include/nyx_abi.h`): 시스템 콜 번호, 구조체(`nx_stat`/`nx_sysinfo`/`nx_procinfo`), 플래그, 제한값을
+  커널 내부 타입과 분리해서 정의한다. 유저랜드는 이 헤더 하나만 포함하면 된다. 구조체 크기는 `NX_STATIC_ASSERT` 로 고정한다.
+- **`uaccess.c`/`uaccess_asm.s`**: 사용자 포인터를 역참조하는 유일한 통로. `paging_is_user_range()` 로 먼저 검사하고,
+  실제 복사는 `#PF` 를 복구할 수 있는 어셈블리 루틴(`nx_uaccess_copy`) 하나로만 한다. 검사와 실제 접근 사이에 다른
+  실행 흐름이 매핑을 바꾸는 경쟁(TOCTOU)이 있어도, 그 순간의 `#PF` 는 커널을 패닉시키지 않고 시스템 콜 오류로 바뀐다.
+  `interrupt.c` 의 `#PF` 핸들러가 `uaccess_fixup()` 을 먼저 확인하고, 그 복사 명령에서 난 커널 모드 폴트가 아니면
+  (즉 진짜 커널 버그이면) 그대로 패닉한다.
+- **`handles.c`**: 프로세스별 capability 방식 핸들 테이블. 핸들 값 = `(세대 << 32) | 슬롯`. 각 핸들은 권한
+  (`NX_RIGHT_READ/WRITE/SEEK/STAT/DUP`)을 가지고, `NxDuplicateHandle` 은 `원본 권한 & 요청 마스크` 로만 계산되므로
+  ALL 을 요청해도 권한을 넓힐 수 없다. 닫힌 슬롯은 세대가 올라가서 오래된 핸들 값이 재사용을 가리키지 못한다.
+  프로세스가 종료되면 `process_terminate()` 가 남은 핸들을 전부 닫는다 (열린 파일이 새지 않는다).
+- **구현한 시스템 콜** (표 기반 디스패치, `syscall.c` 의 `g_syscalls`): `NxGetVersion`, `NxGetTime`, `NxSleep`, `NxYield`,
+  `NxSysInfo`, `NxOpen`/`NxClose`/`NxRead`/`NxWrite`/`NxSeek`/`NxStat`/`NxDuplicateHandle`, `NxProcessExit`, `NxProcessInfo`,
+  `NxKernelPrint`(이번에 유저 포인터 검증 경로로 다시 연결), `NxDebugNop`. 정확한 번호/시그니처는 `syscalls.txt` 참고.
+- **VFS/드라이버 보강**: `vfs_fstat()`(핸들 기준 stat, 경로 재해석이 없어 TOCTOU 없음), `vfs_reopen()`(핸들 복제 시
+  파일시스템 내부 상태를 공유하지 않도록 새로 연다), FAT16 에 `stat` 연산 추가.
+- **프로세스**: `wake_tick` 기반 `process_sleep_ticks()` (스케줄러가 시간이 되면 깨움), 종료 코드(`exit_code`), 핸들 테이블을
+  `process_t` 에 내장. 스케줄러 정책 함수(`sched_rr.h`)가 잠든 프로세스를 깨우는 조건도 함께 처리한다 (원칙: `schedule()`
+  하나만 외부에 공개, 정책은 인라인).
+- **printk_write()**: 사용자 프로그램의 콘솔 출력 전용 경로. 서식 문자열이 아니며, 출력 가능한 ASCII/`\n`/`\r`/`\t` 외의
+  바이트(특히 ESC 등 제어 문자)는 `?` 로 바꿔서 시리얼 터미널로의 이스케이프 시퀀스 주입을 막는다.
+- **자체 점검 확장** (`selftest_user.s`): ring 3 프로그램이 구현한 시스템 콜 전부를 `syscall` 명령과 `int 0x80` 양쪽으로
+  호출한다 — 파일 열기/읽기/탐색(seek)/상태(stat)/닫기, 핸들 복제와 권한-축소만 가능함(ALL 마스크로 복제해도 쓰기 권한이
+  생기지 않음을 확인), 이미 닫은 핸들 재사용 거부, stdout 쓰기와 그 복제본 쓰기, 프로세스 정보 조회, 버전/시간/수면/시스템 정보.
+  총 67개 점검(functional 33개 + ring3 34개)이 모두 통과한다.
+
+### 3차 작업 검증 결과
+- `make check` (`-O0`/`-O2`), `make test-host`(FAT16 + Multiboot2 어댑터) 통과.
+- `SELFTEST=1`: q35/AHCI, pc/IDE, VGA 없음, `-O0`, GRUB BIOS, GRUB UEFI 에서 부팅 + 67개 점검 전부 통과 (실패 0건).
+- `SELFTEST=2..7`(#DE/#PF/#DF/WP/NX/#UD)과 기본(SELFTEST 없는) 릴리스 빌드 부팅도 이번 변경 이후 다시 확인했다.
+
+### 검증하지 못한 것
+- 실제 하드웨어. 동시에 여러 프로세스가 같은 파일을 여는 경쟁(현재 VFS 락이 얕아서 이론상 취약, 7절 참고), `NX_MAX_HANDLES`(32개)
+  소진 시의 동작(코드는 `NoutOfMemory` 를 반환하도록 되어 있으나 점검에서 실제로 채워보지는 않았다).
+- 콘솔 입력(`NxRead(stdin, ...)`): 키보드 드라이버가 아직 인터럽트 기반이 아니라서 `NxRead` 가 콘솔 핸들에는 `Nunsupported` 를
+  반환한다. `sys_read()` 에 그 분기를 표시해 뒀다.
+
+### 다음에 만들 것 (원칙: 우선순위 높은 것부터)
+1. `NxProcessCreate`/`NxProcessWait` — 지금은 커널 스레드만 있고 실제 사용자 프로세스를 새로 만들 방법이 없다.
+2. ELF 유저 프로세스 로더 (7절의 "실제 유저 프로세스 로더 없음"과 연결). 이게 있어야 `helloworld` 를 커널에 링크해 두는
+   임시 구조를 없앨 수 있다.
+3. `NxVirtualAlloc`/`NxVirtualFree` — 지금 유저 프로세스는 커널이 미리 매핑해 준 고정 페이지만 쓸 수 있다.
+4. 콘솔 입력(키보드 인터럽트 + 대기 중인 프로세스를 깨우는 큐) — 이게 있어야 `NxRead(stdin, ...)` 이 실제로 동작한다.

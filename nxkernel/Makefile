@@ -5,6 +5,8 @@
 #   make os         부팅 가능한 ESP 디스크 이미지    (out/esp.img)
 #   make run        QEMU(OVMF, q35+AHCI) 로 실행     (GTK 창 + 시리얼 stdio)
 #   make run-nographic  화면 없이 시리얼만으로 실행
+#   make iso        GRUB(Multiboot2) 부팅 ISO (BIOS/UEFI 겸용)   (out/nyxis.iso)
+#   make run-grub-bios / run-grub-uefi   GRUB 으로 부팅
 #   make run-usb    usb-storage 부팅 디스크 + std VGA 로 실행 (예전 virtio-gpu 는 BltOnly GOP 라 프레임버퍼가 없어 제거)
 #   make check      C89 엄격 컴파일(-O0/-O2) 검사
 #   make test-host  FAT16/VFS/램디스크 호스트 테스트 (회귀 + ASan/UBSan 변이 퍼징)
@@ -19,7 +21,8 @@
 #      -mno-red-zone                                : 인터럽트가 스택 아래(레드존)를 덮어쓰는 것 방지 (필수)
 #      -mgeneral-regs-only                          : 커널에서 SSE/x87 레지스터 사용 금지
 #                                                     (인터럽트 핸들러가 XMM 을 저장하지 않으므로)
-#      -fno-pie -fno-pic -fcf-protection=none       : 고정 주소(1MiB)에 링크되는 정적 커널
+#      -fno-pie -fno-pic -fcf-protection=none       : 고정 주소에 링크되는 정적 커널
+#      -mcmodel=kernel                              : higher-half(0xFFFFFFFF80000000~) 링크 주소에 필요한 코드 모델
 #      -fno-tree-loop-distribute-patterns           : memset/memcpy 구현이 자기 자신을 호출하는 재귀 방지
 #      -fno-stack-protector -fno-builtin -nostdinc -ffreestanding
 #  - 사용하지 않던 kernel/timer, pic, ata, inputs, graphics 도 빌드에 포함 (컴파일 검증).
@@ -88,6 +91,7 @@ KERNEL_CFLAGS = \
 	-ffreestanding -nostdinc \
 	-fno-builtin -fno-stack-protector \
 	-fno-pie -fno-pic -fcf-protection=none \
+	-mcmodel=kernel \
 	-fno-asynchronous-unwind-tables \
 	-mno-red-zone -mgeneral-regs-only \
 	-fno-tree-loop-distribute-patterns \
@@ -121,6 +125,7 @@ KERNEL_LDFLAGS = \
 	-nostdlib \
 	-z max-page-size=0x1000 \
 	-z noexecstack \
+	--no-warn-rwx-segments \
 	-T kernel/linker64.lds
 
 # =========================
@@ -136,6 +141,7 @@ KERNEL = $(BUILD)/kernel.elf
 # C 소스 (nxkernel 기준 상대 경로)
 KERNEL_C_SRCS = \
 	kernel/kernel.c \
+	kernel/boot/multiboot2.c \
 	kernel/error_handling/panic.c \
 	kernel/interrupt/interrupt.c \
 	kernel/interrupt/gdt.c \
@@ -143,6 +149,8 @@ KERNEL_C_SRCS = \
 	kernel/process/process.c \
 	kernel/process/schedule.c \
 	kernel/syscall/syscall.c \
+	kernel/syscall/uaccess.c \
+	kernel/syscall/handles.c \
 	kernel/timer/pit/pit_base.c \
 	lib/memory.c \
 	lib/string.c \
@@ -165,9 +173,15 @@ endif
 
 # 어셈블리 소스
 KERNEL_S_SRCS = \
-	kernel/start.s \
+	kernel/boot/boot.s \
 	kernel/interrupt/isr_stubs.s \
-	kernel/process/switch.s
+	kernel/process/switch.s \
+	kernel/syscall/syscall_entry.s \
+	kernel/syscall/uaccess_asm.s
+
+ifneq ($(SELFTEST),)
+KERNEL_S_SRCS += kernel/selftest_user.s
+endif
 
 # 임시로 커널 이미지에 함께 링크되는 유저랜드 예제 (유저 프로그램 로더가 생기면 제거 예정)
 USER_HELLO_SRC = $(ROOT)/userland/helloworld/helloworld.c
@@ -320,6 +334,43 @@ run-usb: prepare-run
 			-display gtk
 
 # =========================
+# GRUB (Multiboot2) 부팅 이미지: BIOS/UEFI 겸용 ISO
+#   OS 는 UEFI 에 종속되지 않는다. GRUB 이 Multiboot2 로 커널을 적재하면 kernel/boot/boot.s 의
+#   32비트 진입점(_start_mb)에서 시작하고, 부트 정보는 multiboot2.c 가 NTBLI 로 변환한다.
+# =========================
+ISO_DIR = $(BUILD)/isodir
+ISO_IMG = $(BUILD)/nyxis.iso
+
+iso: $(ISO_IMG)
+
+$(ISO_IMG): $(KERNEL) $(INITRD_IMG)
+	rm -rf $(ISO_DIR)
+	mkdir -p $(ISO_DIR)/boot/grub
+	cp $(KERNEL) $(ISO_DIR)/boot/kernel.elf
+	cp $(INITRD_IMG) $(ISO_DIR)/boot/initrd.img
+	printf 'insmod all_video\nset timeout=0\nset default=0\nset gfxmode=1024x768x32\nset gfxpayload=keep\nmenuentry "Nyxis OS" {\n\tmultiboot2 /boot/kernel.elf\n\tmodule2 /boot/initrd.img initrd\n\tboot\n}\n' > $(ISO_DIR)/boot/grub/grub.cfg
+	grub-mkrescue -o $@ $(ISO_DIR) >/dev/null 2>&1
+
+# BIOS(SeaBIOS) + GRUB
+run-grub-bios: iso
+	env -i \
+		PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+		DISPLAY=$(DISPLAY) \
+		XDG_RUNTIME_DIR=$(XDG_RUNTIME_DIR) \
+		DBUS_SESSION_BUS_ADDRESS=$(DBUS_SESSION_BUS_ADDRESS) \
+		qemu-system-x86_64 -m 1024 -cdrom $(ISO_IMG) -vga std -serial stdio -display gtk
+
+# UEFI(OVMF) + GRUB
+run-grub-uefi: iso
+	cp $(OVMF_VARS) $(BUILD)/OVMF_VARS.fd
+	env -i \
+		PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+		DISPLAY=$(DISPLAY) \
+		XDG_RUNTIME_DIR=$(XDG_RUNTIME_DIR) \
+		DBUS_SESSION_BUS_ADDRESS=$(DBUS_SESSION_BUS_ADDRESS) \
+		qemu-system-x86_64 -machine q35 $(QEMU_COMMON) -cdrom $(ISO_IMG) -vga std -serial stdio -display gtk
+
+# =========================
 # Host test: 커널 파일시스템 코드를 리눅스에서 ASan/UBSan 으로 실행
 #   (NYX_HOST_TEST 는 cli/sti 같은 특권 명령을 no-op 으로 바꾸는 스위치. 커널 빌드에서는 쓰지 않는다)
 # =========================
@@ -342,8 +393,13 @@ test-host: $(INITRD_IMG)
 	done
 	$(CC) -std=gnu99 -Wall -Wextra -DNYX_HOST_TEST $(HOST_SAN) \
 		-idirafter $(INCLUDE_DIR) -I$(ROOT) -I. \
-		$(HOST_DIR)/fat16_test.c $(HOST_OUT)/*.o -o $(HOST_OUT)/fat16_test
+		$(HOST_DIR)/fat16_test.c $(HOST_OUT)/core.o $(HOST_OUT)/vfs.o $(HOST_OUT)/fat16.o $(HOST_OUT)/ramdisk.o -o $(HOST_OUT)/fat16_test
 	$(HOST_OUT)/fat16_test $(INITRD_IMG) $(ITER) $(SEED)
+	$(CC) -std=c89 -pedantic -Wall -Wextra -Werror -Wmissing-prototypes -Wshadow -Wdeclaration-after-statement -nostdinc \
+		-DNYX_HOST_TEST $(HOST_SAN) -I$(INCLUDE_DIR) -I$(ROOT) -I. -c kernel/boot/multiboot2.c -o $(HOST_OUT)/mb2_adapter.o
+	$(CC) -std=gnu99 -Wall -Wextra -DNYX_HOST_TEST $(HOST_SAN) -idirafter $(INCLUDE_DIR) -I$(ROOT) -I. \
+		$(HOST_DIR)/mb2_test.c $(HOST_OUT)/mb2_adapter.o -o $(HOST_OUT)/mb2_test
+	$(HOST_OUT)/mb2_test 20000
 
 # =========================
 # Check: C89 준수/경고 검사
@@ -359,4 +415,4 @@ check:
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all kernel os run run-nographic run-usb prepare-run check test-host clean
+.PHONY: all kernel os iso run run-nographic run-usb run-grub-bios run-grub-uefi prepare-run check test-host clean

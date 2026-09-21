@@ -6,8 +6,12 @@
 
 #include "types.h"
 
-/* 어셈블리 진입점(_start)에서 호출된다. 절대 반환하지 않는다. */
-void kernel_main(NTBLI *boot_info) __attribute__((noreturn));
+/*
+ * boot.s 가 higher-half 로 진입한 뒤 호출한다. 절대 반환하지 않는다.
+ *   boot_kind      : BOOT_KIND_UEFI / BOOT_KIND_MULTIBOOT2 (kernel/boot/multiboot2.h)
+ *   boot_info_phys : 부트 정보의 "물리 주소" (UEFI: 낮은 주소로 복사된 NTBLI, Multiboot2: MBI)
+ */
+void kernel_main(u32 boot_kind, u64 boot_info_phys) __attribute__((noreturn));
 
 /*
  * 커널이 소유한 부트 정보 사본을 반환한다. (부트로더 메모리의 원본이 아님)

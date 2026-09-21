@@ -18,6 +18,7 @@
 #include "kernel/error_handling/panic.h"
 #include "kernel/process/process.h"
 #include "kernel/syscall/syscall.h"
+#include "kernel/syscall/uaccess.h"
 #include "drivers/pic/pic.h"
 
 /* isr_stubs.s 가 제공하는 256개 스텁 주소 테이블 */
@@ -175,12 +176,16 @@ static void dump_frame(const struct trap_frame *f)
 /* 등록된 핸들러가 없는 예외의 기본 처리 */
 static void exception_default(struct trap_frame *f)
 {
+    /* 사용자 메모리 복사 중의 폴트는 시스템 콜이 오류로 처리하도록 복구한다 (커널 패닉 아님) */
+    if (f->vector == VEC_PAGE_FAULT && uaccess_fixup(f))
+        return;
+
     if ((f->cs & 3UL) == 3UL) {
         /* 유저 모드 프로세스의 오류: 커널은 살리고 해당 프로세스만 종료한다 */
         printk("\nUser-mode fault, terminating process:\n");
         dump_frame(f);
-        process_exit();
-        /* process_exit 는 반환하지 않는다 */
+        process_exit_with_code(-1);
+        /* 반환하지 않는다 */
     }
 
     printk("\n*** KERNEL EXCEPTION ***\n");

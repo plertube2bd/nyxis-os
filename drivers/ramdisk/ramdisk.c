@@ -48,14 +48,17 @@ Nstatus ramdisk_init(
 ) {
     u32 i;
 
-    if (!info)
-        return NinvalidArg;
+    /*
+     * ramdisk_start 는 "커널 가상 주소" 이다 (higher-half 커널). 물리 RAM 범위 검증은 부트 정보를 받는
+     * 쪽(kernel.c) 에서 물리 주소로 이미 끝냈으므로 여기서는 산술 오버플로만 막는다.
+     */
+    (void)info;
 
     if (ramdisk_size == 0 || ramdisk_start == 0)
         return NinvalidArg;
 
-    if (!range_within(ramdisk_start, ramdisk_size, info->memory_size))
-        return NoutOfMemory;
+    if (!range_within(ramdisk_start, ramdisk_size, 0xFFFFFFFFFFFFFFFFUL))
+        return NinvalidArg;
 
     if (ramdisk_find(diskno))
         return NalreadyExists;
@@ -86,13 +89,15 @@ Nstatus ramdisk_read(
     if (!rd)
         return NnotFound;
 
-    if (!buffer || size == 0 || !info)
+    (void)info;
+
+    if (!buffer || size == 0)
         return NinvalidArg;
 
     if (!range_within(offset, size, rd->size))
         return Noverflow;
 
-    if (!range_within((u64)(usize)buffer, size, info->memory_size))
+    if (!range_within((u64)(usize)buffer, size, 0xFFFFFFFFFFFFFFFFUL))
         return NinvalidPointer;
 
     memcpy(buffer, (void *)(usize)(rd->offset + offset), size);
@@ -112,13 +117,15 @@ Nstatus ramdisk_write(
     if (!rd)
         return NnotFound;
 
-    if (!buffer || size == 0 || !info)
+    (void)info;
+
+    if (!buffer || size == 0)
         return NinvalidArg;
 
     if (!range_within(offset, size, rd->size))
         return Noverflow;
 
-    if (!range_within((u64)(usize)buffer, size, info->memory_size))
+    if (!range_within((u64)(usize)buffer, size, 0xFFFFFFFFFFFFFFFFUL))
         return NinvalidPointer;
 
     memcpy((void *)(usize)(rd->offset + offset), buffer, size);

@@ -10,11 +10,34 @@
 ;   rax < 0   : error (Nstatus, i.e. include/types.h Nerror, sign-extended to 64 bits;
 ;               NOT a POSIX -errno value)
 ;
-; implemented so far: 771 (NxKernelPrint), 777 (NxDebugNop). Everything else returns
-; NsyscallFailed. User pointers are validated (must be user-accessible mappings).
+; implemented so far (include/nyx_abi.h 에 번호/구조체/상수가 정의되어 있다. include/nyx_abi.h 는
+; 커널과 유저랜드가 함께 포함하는 공개 ABI 헤더이며, 이 파일의 번호가 바뀌면 항상 함께 갱신한다):
+;
+;   2  NxGetVersion            7  NxSysInfo(struct nx_sysinfo *out)
+;   3  NxGetTime(clock_id)                clock_id: NX_CLOCK_MONOTONIC(0) 만 지원
+;   4  NxSleep(ms)                        ms <= NX_SLEEP_MAX_MS(1h)
+;   5  NxYield
+;
+;   32 NxOpen(const char *path, flags)    flags: NX_O_READ|NX_O_WRITE -> 핸들
+;   33 NxClose(handle)
+;   34 NxRead(handle, void *buf, len)     -> 읽은 바이트 수 (0 = EOF)
+;   35 NxWrite(handle, const void *buf, len) -> 쓴 바이트 수
+;   36 NxSeek(handle, offset, whence)     whence: NX_SEEK_SET/CUR/END -> 새 오프셋
+;   37 NxStat(handle, struct nx_stat *out)
+;   41 NxDuplicateHandle(handle, rights_mask) -> 새 핸들 (권한은 줄이기만 가능)
+;
+;   65 NxProcessExit(exit_code)           반환하지 않음
+;   68 NxProcessInfo(pid, struct nx_procinfo *out)  pid 는 지금은 NX_PID_SELF 만 허용
+;
+;   771 NxKernelPrint(const char *str)    디버그 로그. 서식 문자열 아님, 제어 문자는 '?' 로 치환
+;   777 NxDebugNop
+;
+; 그 외 번호는 NsyscallFailed. 사용자 포인터는 모두 검증된다 (uaccess.h: 페이지 테이블 USER/RW 비트 확인 +
+; 접근 도중 매핑이 바뀌는 경쟁에도 안전한 폴트 복구 복사). 핸들은 프로세스별 테이블에서 권한(NX_RIGHT_*)까지
+; 함께 검사한다(handles.h). 구현은 nxkernel/kernel/syscall/syscall.c 의 g_syscalls 표를 참고.
 ;
 ; object handle type:
-;   u64 handle
+;   u64 handle (상위 32비트 = 세대, 하위 32비트 = 슬롯. 닫힌 핸들 값의 재사용을 막는다)
 ;
 ; namespace style:
 ;   Nx*
@@ -25,27 +48,27 @@
 
 0   | NxWhatCanIWriteHereHelpIamSad
 1   | NxGetRoi            ; root object info / capability
-2   | NxGetVersion
-3   | NxGetTime
-4   | NxSleep
-5   | NxYield
+2   | NxGetVersion  ; [구현됨]
+3   | NxGetTime  ; [구현됨]
+4   | NxSleep  ; [구현됨]
+5   | NxYield  ; [구현됨]
 6   | NxRandom
-7   | NxSysInfo
+7   | NxSysInfo  ; [구현됨]
 
 ; =========================================================
 ; 0x0020 ~ 0x003F : Object / Handle API
 ; =========================================================
 
-32  | NxOpen
-33  | NxClose
-34  | NxRead
-35  | NxWrite
-36  | NxSeek
-37  | NxStat
+32  | NxOpen  ; [구현됨]
+33  | NxClose  ; [구현됨]
+34  | NxRead  ; [구현됨]
+35  | NxWrite  ; [구현됨]
+36  | NxSeek  ; [구현됨]
+37  | NxStat  ; [구현됨]
 38  | NxIoctl
 39  | NxMap
 40  | NxUnmap
-41  | NxDuplicateHandle
+41  | NxDuplicateHandle  ; [구현됨]
 42  | NxPoll
 
 ; =========================================================
@@ -53,10 +76,10 @@
 ; =========================================================
 
 64  | NxProcessCreate
-65  | NxProcessExit
+65  | NxProcessExit  ; [구현됨]
 66  | NxProcessKill
 67  | NxProcessWait
-68  | NxProcessInfo
+68  | NxProcessInfo  ; [구현됨]
 
 69  | NxThreadCreate
 70  | NxThreadExit
@@ -123,6 +146,6 @@
 768 | NxTrace
 769 | NxKernelLog
 770 | NxDebugBreak
-771 | NxKernelPrint
+771 | NxKernelPrint  ; [구현됨]
 
-777 | NxDebugNop         ; compatibility debug syscall
+777 | NxDebugNop         ; compatibility debug syscall  [구현됨]

@@ -1,26 +1,21 @@
 /*
- * paging.h - x86_64 4단계 페이징 (PML4 -> PDPT -> PD -> PT)
+ * paging.h - x86_64 4단계 페이징 (PML4 -> PDPT -> PD -> PT), higher-half 커널 레이아웃
  *
  * [기존 코드의 문제 (전면 재작성 이유)]
- *  - 32비트 2단계 페이징(page directory + page table, 엔트리 20비트 frame)을 64비트
- *    long mode 커널에서 사용하고 있었다. 롱 모드 CR3 는 반드시 PML4 를 가리켜야 한다.
- *  - 포인터를 (u32) 로 잘라서 사용 -> 4GB 이상 주소에서 잘못된 주소 사용.
- *  - 페이지 테이블용 메모리를 고정 주소 0x200000 부터 "그냥 증가" 시키며 할당했다.
- *    커널 이미지(0x100000~)가 1MB 를 넘으면 커널 자신의 .bss 를 덮어쓰게 된다.
+ *  - 32비트 2단계 페이징(page directory + page table)을 64비트 long mode 커널에서 사용했다.
+ *    롱 모드 CR3 는 반드시 PML4 를 가리켜야 한다. 포인터를 (u32) 로 잘랐고, 페이지 테이블 메모리를
+ *    고정 주소 0x200000 부터 "그냥 증가" 시키며 할당해 커널 .bss 를 덮을 수 있었다.
  *  - paging_disable(): 롱 모드에서는 CR0.PG 를 끌 수 없다 (#GP). 삭제.
- *  - 접근 권한(NX/WP/유저 비트)에 대한 보안 정책이 전혀 없었다.
  *
- * [현재 설계]
- *  - 물리 메모리를 "항등 매핑(identity map)" 한다. (0 ~ max(4GiB, RAM 끝), 2MiB 페이지)
- *    x86_64 는 커널이 낮은 주소(1MiB)에 링크되어 있으므로 이 방식이 가장 단순하다.
- *  - 커널 이미지가 있는 2MiB 영역과 최하위 2MiB 는 4KiB 페이지로 쪼개서 W^X 를 적용한다:
- *      .text  = 읽기+실행(쓰기 불가), .rodata = 읽기 전용(NX), .data/.bss = 읽기/쓰기(NX)
- *    0 번 페이지(NULL 역참조 방지)와 부트 스택 가드 페이지는 매핑하지 않는다.
- *  - 페이지 테이블 메모리는 커널 .bss 안의 정적 풀에서 할당한다.
+ * [현재 설계] (phys.h 의 가상 주소 레이아웃 참고)
+ *  - PML4[0..255]   : 사용자 공간. 부팅 직후에는 비어 있다. (프로세스별 CR3 는 추후)
+ *  - PML4[256]      : HHDM. 물리 메모리 [0, max(4GiB, RAM 끝)) 를 2MiB 페이지로 직접 매핑 (RW, NX).
+ *                     커널 이미지가 놓인 물리 범위는 HHDM 에서 읽기 전용으로 낮춘다.
+ *                     (HHDM 별칭으로 커널 코드를 쓰는 W^X 우회 방지)
+ *  - PML4[511]      : 커널 이미지 (VMA 0xFFFFFFFF80000000 ~). 4KiB 페이지, 섹션별 W^X:
+ *                     .text = R-X, .rodata = R--(NX), .data/.bss = RW-(NX). 부트 스택 가드 페이지는 매핑하지 않는다.
+ *  - 페이지 테이블 메모리는 커널 .bss 의 정적 풀에서 할당한다.
  *  - EFER.NXE, CR0.WP, (지원 시) CR4.SMEP 를 켠다.
- *
- * 한계: 사용자 공간이 아직 없다. 항등 매핑은 PML4[0] 전체를 차지하므로, 유저 프로세스를
- *       도입할 때는 상위 절반(higher-half) 커널 또는 프로세스별 CR3 설계가 필요하다.
  */
 #ifndef KERNEL_PAGING_H
 #define KERNEL_PAGING_H
@@ -49,13 +44,14 @@
  * 페이지 테이블을 구성한다. (CR3 는 아직 바꾸지 않는다)
  * info 의 메모리 맵/프레임버퍼 범위를 참고하여 매핑 범위를 결정한다.
  */
-Nstatus paging_init(const NTBLI *info);
+Nstatus paging_init(const NTBLI *info);   /* info 의 주소 필드는 아직 "물리 주소" 여야 한다 */
 
 /* 구성한 페이지 테이블로 전환한다. (NXE/WP/SMEP 활성화 포함) paging_init 성공 후에만 호출. */
 void paging_enable(void);
 
 /*
- * 4KiB 페이지 하나를 매핑한다. phys/virt 는 4KiB 정렬이어야 한다.
+ * 4KiB 페이지 하나를 매핑한다. phys(물리 주소)/virt 는 4KiB 정렬이어야 한다.
+ * virt 는 사용자 공간(< USER_SPACE_END)이어야 한다.
  * 정책: 쓰기 가능(PAGE_RW)이면서 실행 가능(NX 없음)인 매핑은 거부한다 (W^X).
  * 이미 2MiB 항등 매핑이 있는 영역이나 이미 매핑된 페이지에는 NalreadyExists.
  */

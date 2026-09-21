@@ -914,3 +914,48 @@ Nstatus vfs_close(handle_t *handle)
     free_handle(handle);
     return Nok;
 }
+
+Nstatus vfs_fstat(handle_t *handle, vfs_stat_t *out)
+{
+    if (!handle || !out) {
+        return NinvalidArg;
+    }
+
+    if (!handle->vnode || !handle->vnode->ops || !handle->vnode->ops->stat) {
+        return Nunsupported;
+    }
+
+    memset(out, 0, sizeof(*out));
+    return handle->vnode->ops->stat(handle->vnode, out);
+}
+
+Nstatus vfs_reopen(const handle_t *src, handle_t *dst)
+{
+    handle_t *slot;
+    Nstatus status;
+
+    if (!src || !dst || !src->vnode || !src->vnode->ops || !src->vnode->ops->open) {
+        return NinvalidArg;
+    }
+
+    /* 전역 핸들 슬롯을 임시로 빌려서 open 을 수행한 뒤 사본을 넘긴다 (vfs_open 과 같은 방식) */
+    slot = alloc_handle();
+    if (!slot) {
+        return NoutOfMemory;
+    }
+
+    slot->vnode = src->vnode;
+    slot->flags = src->flags;
+    slot->offset = src->offset;
+    atomic_set(&slot->refcnt, 1);
+
+    status = slot->vnode->ops->open(slot->vnode, slot->flags, slot);
+    if (NSTATUS_IS_ERR(status)) {
+        free_handle(slot);
+        return status;
+    }
+
+    *dst = *slot;
+    free_handle(slot);
+    return Nok;
+}

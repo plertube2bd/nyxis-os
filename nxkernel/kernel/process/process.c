@@ -7,6 +7,7 @@
 #include "kernel/error_handling/panic.h"
 #include "interrupt.h"
 #include "memory.h"
+#include "kernel/timer/pit/pit_base.h"
 
 /* Process list */
 process_t *process_list = nNULL;
@@ -17,6 +18,7 @@ process_t *current_process = nNULL;
 static process_t g_procs[PROCESS_MAX];
 static u8 g_kstacks[PROCESS_MAX][PROCESS_KSTACK_SIZE] __attribute__((aligned(16)));
 static u32 g_next_pid = 1;
+static i32 g_last_exit_code = 0;
 
 /* 종료된 프로세스의 슬롯을 회수한다 (현재 실행 중인 것은 제외) */
 static void process_reap(void)
@@ -57,6 +59,7 @@ Nstatus process_init(void)
     idle->in_use = true;
     idle->kernel_stack = nNULL;
     idle->next = nNULL;
+    nx_handles_init(&idle->handles);
 
     process_list = idle;
     current_process = idle;
@@ -106,6 +109,7 @@ Nstatus process_create(process_entry_t entry_point, void *stack)
     proc->cr3 = nNULL;
     proc->kernel_stack = g_kstacks[slot];
     proc->in_use = true;
+    nx_handles_init(&proc->handles);
 
     /*
      * 초기 커널 스택 구성 (switch.s 주석 참고). top 은 16바이트 정렬.
@@ -189,6 +193,8 @@ Nstatus process_terminate(u32 pid)
         return NnotFound;
     }
 
+    /* 프로세스가 가진 모든 핸들(열린 파일 포함)을 닫는다. 그러지 않으면 드라이버 자원이 새어 나간다 */
+    nx_handles_close_all(&proc->handles);
     proc->state = PROCESS_TERMINATED;
 
     if (proc == current_process) {
@@ -202,13 +208,65 @@ Nstatus process_terminate(u32 pid)
     return NSTATUS_OK;
 }
 
-void process_exit(void)
+void process_exit_with_code(i32 code)
 {
     if (!current_process || current_process->pid == 0)
         kernel_panic_simple("process_exit called on idle/boot thread", NinvalidState);
 
+    current_process->exit_code = code;
+    g_last_exit_code = code;
     (void)process_terminate(current_process->pid);
     kernel_panic_simple("process_exit: unreachable", NkernelFault);
+}
+
+void process_exit(void)
+{
+    process_exit_with_code(0);
+}
+
+i32 process_last_exit_code(void)
+{
+    return g_last_exit_code;
+}
+
+Nstatus process_sleep_ticks(u64 ticks)
+{
+    process_t *self = current_process;
+    u64 flags;
+
+    if (!self || self->pid == 0)
+        return Npermission;
+
+    flags = irq_save();
+
+    /* 최소 1 tick 은 잔다 (tick 경계 때문에 0 tick 이면 즉시 깨어나는 것과 같아진다) */
+    self->wake_tick = timer_get_tick() + (ticks ? ticks : 1UL);
+    self->state = PROCESS_BLOCKED;
+
+    schedule();      /* 시간이 되면 스케줄러가 READY 로 바꾸고 다시 이 프로세스를 골라 여기로 돌아온다 */
+
+    if (self->state == PROCESS_BLOCKED) {
+        /* 아무도 실행할 수 없어서 전환이 일어나지 않았다 (idle 이 항상 있으므로 정상이라면 도달하지 않음) */
+        self->state = PROCESS_RUNNING;
+        self->wake_tick = 0;
+        irq_restore(flags);
+        return Ninterrupted;
+    }
+
+    irq_restore(flags);
+    return NSTATUS_OK;
+}
+
+u32 process_count(void)
+{
+    process_t *p;
+    u32 n = 0;
+
+    for (p = process_list; p; p = p->next) {
+        if (p->in_use && p->state != PROCESS_TERMINATED)
+            n++;
+    }
+    return n;
 }
 
 void process_thread_exit(void)

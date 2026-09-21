@@ -13,9 +13,10 @@
  *   0x00 null
  *   0x08 커널 코드 (64비트, DPL0)
  *   0x10 커널 데이터 (DPL0)
- *   0x18 유저 코드 (64비트, DPL3)   -> 셀렉터 0x1B
- *   0x20 유저 데이터 (DPL3)         -> 셀렉터 0x23
- *   0x28 TSS (16바이트 디스크립터: 0x28, 0x30 두 슬롯 차지)
+ *   0x18 유저 코드 (32비트 호환 모드, DPL3) -> 셀렉터 0x1B   (SYSRET 규칙상 데이터보다 앞에 있어야 함)
+ *   0x20 유저 데이터 (DPL3)                 -> 셀렉터 0x23
+ *   0x28 유저 코드 (64비트, DPL3)           -> 셀렉터 0x2B
+ *   0x30 TSS (16바이트 디스크립터: 0x30, 0x38 두 슬롯 차지)
  *
  * IST(Interrupt Stack Table): 더블폴트/NMI/머신체크는 스택이 망가진 상황에서도
  * 처리해야 하므로 전용 스택을 쓴다.
@@ -23,8 +24,9 @@
 
 #include "nyxis.h"
 #include "interrupt.h"
+#include "kernel/syscall/syscall.h"
 
-#define GDT_ENTRIES 7   /* null, kcode, kdata, ucode, udata, tss(2) */
+#define GDT_ENTRIES 8   /* null, kcode, kdata, ucode32, udata, ucode64, tss(2) */
 
 #define IST_STACK_SIZE 8192U
 
@@ -32,6 +34,7 @@
 #define GDT_KERNEL_CODE64  0x00AF9A000000FFFFUL
 #define GDT_KERNEL_DATA    0x00CF92000000FFFFUL
 #define GDT_USER_CODE64    0x00AFFA000000FFFFUL
+#define GDT_USER_CODE32    0x00CFFA000000FFFFUL
 #define GDT_USER_DATA      0x00CFF2000000FFFFUL
 
 static u64 g_gdt[GDT_ENTRIES] __attribute__((aligned(16)));
@@ -58,7 +61,8 @@ static void gdt_set_tss(u32 index, u64 base, u32 limit)
 
 void gdt_set_kernel_stack(u64 rsp0)
 {
-    g_tss.rsp0 = rsp0;
+    g_tss.rsp0 = rsp0;                  /* int 0x80 / 예외 / IRQ 로 ring3 -> ring0 진입할 때 */
+    g_cpu_local.kernel_rsp = rsp0;      /* syscall 명령으로 진입할 때 (syscall_entry.s) */
 }
 
 void gdt_init(void)
@@ -85,9 +89,10 @@ void gdt_init(void)
     g_gdt[0] = 0;
     g_gdt[1] = GDT_KERNEL_CODE64;
     g_gdt[2] = GDT_KERNEL_DATA;
-    g_gdt[3] = GDT_USER_CODE64;
+    g_gdt[3] = GDT_USER_CODE32;
     g_gdt[4] = GDT_USER_DATA;
-    gdt_set_tss(5, (u64)(usize)&g_tss, (u32)(sizeof(g_tss) - 1));
+    g_gdt[5] = GDT_USER_CODE64;
+    gdt_set_tss(6, (u64)(usize)&g_tss, (u32)(sizeof(g_tss) - 1));
 
     gdtr.limit = (u16)(sizeof(g_gdt) - 1);
     gdtr.base  = (u64)(usize)g_gdt;

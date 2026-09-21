@@ -628,6 +628,25 @@ static Nstatus fat16_lookup(vnode_t *dir, const char *name, vnode_t **out_vnode)
     return Nok;
 }
 
+/* 파일/디렉터리 공통 stat: vnode 에 저장된 정보를 그대로 돌려준다 */
+static Nstatus fat16_stat(vnode_t *vnode, vfs_stat_t *out)
+{
+    fat16_vnode_data_t *data;
+
+    if (!vnode || !out) {
+        return NinvalidArg;
+    }
+
+    data = (fat16_vnode_data_t *)vfs_get_vnode_private(vnode);
+    if (!data) {
+        return NinvalidArg;
+    }
+
+    out->size = data->is_directory ? 0 : data->size;
+    out->type = data->is_directory ? 2U : 1U;
+    return Nok;
+}
+
 static Nstatus fat16_dir_open(vnode_t *vnode, u32 flags, handle_t *out_handle)
 {
     (void)vnode;
@@ -972,12 +991,14 @@ Nstatus fat16_register(void)
     g_fat16_dir_ops.read = nNULL;
     g_fat16_dir_ops.write = nNULL;
     g_fat16_dir_ops.close = nNULL;
+    g_fat16_dir_ops.stat = fat16_stat;
 
     g_fat16_file_ops.lookup = nNULL;
     g_fat16_file_ops.open = fat16_file_open;
     g_fat16_file_ops.read = fat16_file_read;
     g_fat16_file_ops.write = fat16_file_write;
     g_fat16_file_ops.close = fat16_file_close;
+    g_fat16_file_ops.stat = fat16_stat;
 
     ops.mount = fat16_mount;
     ops.unmount = fat16_unmount;

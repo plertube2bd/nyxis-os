@@ -11,6 +11,7 @@
 #define KERNEL_PROCESS_SCHED_RR_H
 
 #include "kernel/process/process.h"
+#include "kernel/timer/pit/pit_base.h"
 
 /*
  * current 다음부터 리스트를 정확히 한 바퀴 돌며 READY 인 프로세스를 찾는다.
@@ -21,6 +22,13 @@ static __inline__ process_t *sched_pick_next(process_t *current, process_t *list
     process_t *proc = current->next ? current->next : list_head;
 
     while (proc != current) {
+        /* 잠든(sleep) 프로세스는 깨어날 시간이 되면 READY 로 되돌린다 */
+        if (proc->in_use && proc->state == PROCESS_BLOCKED && proc->wake_tick != 0 &&
+            timer_get_tick() >= proc->wake_tick) {
+            proc->state = PROCESS_READY;
+            proc->wake_tick = 0;
+        }
+
         if (proc->in_use && proc->state == PROCESS_READY)
             return proc;
         proc = proc->next ? proc->next : list_head;
