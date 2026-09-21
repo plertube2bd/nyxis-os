@@ -189,3 +189,52 @@
 - Multiboot2 프레임버퍼 태그가 없거나 지원하지 않는 형식이면 시리얼만 사용한다.
 - 방안 B(32비트 커널 별도 빌드)와 ELF32 로더/`linker32.lds` 는 아직 없다.
 - `userland/initrd/initrd.c` 는 컴파일 불가능한 자리 표시자, 빈 `코드분석.rtf` 는 그대로 둠.
+
+## 8. 시스템 콜 구현 (3차 작업)
+
+가장 먼저 필요한 것부터 만들었다: 시스템 콜이 사용자 입력을 다루는 코드이므로, "무엇을 만들지" 보다
+"안전하게 다루는 통로부터 만드는 것" 을 우선했다. 그 통로(uaccess, 핸들 테이블) 위에 핵심 호출들을 올렸다.
+
+- **공개 ABI 헤더** (`include/nyx_abi.h`): 시스템 콜 번호, 구조체(`nx_stat`/`nx_sysinfo`/`nx_procinfo`), 플래그, 제한값을
+  커널 내부 타입과 분리해서 정의한다. 유저랜드는 이 헤더 하나만 포함하면 된다. 구조체 크기는 `NX_STATIC_ASSERT` 로 고정한다.
+- **`uaccess.c`/`uaccess_asm.s`**: 사용자 포인터를 역참조하는 유일한 통로. `paging_is_user_range()` 로 먼저 검사하고,
+  실제 복사는 `#PF` 를 복구할 수 있는 어셈블리 루틴(`nx_uaccess_copy`) 하나로만 한다. 검사와 실제 접근 사이에 다른
+  실행 흐름이 매핑을 바꾸는 경쟁(TOCTOU)이 있어도, 그 순간의 `#PF` 는 커널을 패닉시키지 않고 시스템 콜 오류로 바뀐다.
+  `interrupt.c` 의 `#PF` 핸들러가 `uaccess_fixup()` 을 먼저 확인하고, 그 복사 명령에서 난 커널 모드 폴트가 아니면
+  (즉 진짜 커널 버그이면) 그대로 패닉한다.
+- **`handles.c`**: 프로세스별 capability 방식 핸들 테이블. 핸들 값 = `(세대 << 32) | 슬롯`. 각 핸들은 권한
+  (`NX_RIGHT_READ/WRITE/SEEK/STAT/DUP`)을 가지고, `NxDuplicateHandle` 은 `원본 권한 & 요청 마스크` 로만 계산되므로
+  ALL 을 요청해도 권한을 넓힐 수 없다. 닫힌 슬롯은 세대가 올라가서 오래된 핸들 값이 재사용을 가리키지 못한다.
+  프로세스가 종료되면 `process_terminate()` 가 남은 핸들을 전부 닫는다 (열린 파일이 새지 않는다).
+- **구현한 시스템 콜** (표 기반 디스패치, `syscall.c` 의 `g_syscalls`): `NxGetVersion`, `NxGetTime`, `NxSleep`, `NxYield`,
+  `NxSysInfo`, `NxOpen`/`NxClose`/`NxRead`/`NxWrite`/`NxSeek`/`NxStat`/`NxDuplicateHandle`, `NxProcessExit`, `NxProcessInfo`,
+  `NxKernelPrint`(이번에 유저 포인터 검증 경로로 다시 연결), `NxDebugNop`. 정확한 번호/시그니처는 `syscalls.txt` 참고.
+- **VFS/드라이버 보강**: `vfs_fstat()`(핸들 기준 stat, 경로 재해석이 없어 TOCTOU 없음), `vfs_reopen()`(핸들 복제 시
+  파일시스템 내부 상태를 공유하지 않도록 새로 연다), FAT16 에 `stat` 연산 추가.
+- **프로세스**: `wake_tick` 기반 `process_sleep_ticks()` (스케줄러가 시간이 되면 깨움), 종료 코드(`exit_code`), 핸들 테이블을
+  `process_t` 에 내장. 스케줄러 정책 함수(`sched_rr.h`)가 잠든 프로세스를 깨우는 조건도 함께 처리한다 (원칙: `schedule()`
+  하나만 외부에 공개, 정책은 인라인).
+- **printk_write()**: 사용자 프로그램의 콘솔 출력 전용 경로. 서식 문자열이 아니며, 출력 가능한 ASCII/`\n`/`\r`/`\t` 외의
+  바이트(특히 ESC 등 제어 문자)는 `?` 로 바꿔서 시리얼 터미널로의 이스케이프 시퀀스 주입을 막는다.
+- **자체 점검 확장** (`selftest_user.s`): ring 3 프로그램이 구현한 시스템 콜 전부를 `syscall` 명령과 `int 0x80` 양쪽으로
+  호출한다 — 파일 열기/읽기/탐색(seek)/상태(stat)/닫기, 핸들 복제와 권한-축소만 가능함(ALL 마스크로 복제해도 쓰기 권한이
+  생기지 않음을 확인), 이미 닫은 핸들 재사용 거부, stdout 쓰기와 그 복제본 쓰기, 프로세스 정보 조회, 버전/시간/수면/시스템 정보.
+  총 67개 점검(functional 33개 + ring3 34개)이 모두 통과한다.
+
+### 3차 작업 검증 결과
+- `make check` (`-O0`/`-O2`), `make test-host`(FAT16 + Multiboot2 어댑터) 통과.
+- `SELFTEST=1`: q35/AHCI, pc/IDE, VGA 없음, `-O0`, GRUB BIOS, GRUB UEFI 에서 부팅 + 67개 점검 전부 통과 (실패 0건).
+- `SELFTEST=2..7`(#DE/#PF/#DF/WP/NX/#UD)과 기본(SELFTEST 없는) 릴리스 빌드 부팅도 이번 변경 이후 다시 확인했다.
+
+### 검증하지 못한 것
+- 실제 하드웨어. 동시에 여러 프로세스가 같은 파일을 여는 경쟁(현재 VFS 락이 얕아서 이론상 취약, 7절 참고), `NX_MAX_HANDLES`(32개)
+  소진 시의 동작(코드는 `NoutOfMemory` 를 반환하도록 되어 있으나 점검에서 실제로 채워보지는 않았다).
+- 콘솔 입력(`NxRead(stdin, ...)`): 키보드 드라이버가 아직 인터럽트 기반이 아니라서 `NxRead` 가 콘솔 핸들에는 `Nunsupported` 를
+  반환한다. `sys_read()` 에 그 분기를 표시해 뒀다.
+
+### 다음에 만들 것 (원칙: 우선순위 높은 것부터)
+1. `NxProcessCreate`/`NxProcessWait` — 지금은 커널 스레드만 있고 실제 사용자 프로세스를 새로 만들 방법이 없다.
+2. ELF 유저 프로세스 로더 (7절의 "실제 유저 프로세스 로더 없음"과 연결). 이게 있어야 `helloworld` 를 커널에 링크해 두는
+   임시 구조를 없앨 수 있다.
+3. `NxVirtualAlloc`/`NxVirtualFree` — 지금 유저 프로세스는 커널이 미리 매핑해 준 고정 페이지만 쓸 수 있다.
+4. 콘솔 입력(키보드 인터럽트 + 대기 중인 프로세스를 깨우는 큐) — 이게 있어야 `NxRead(stdin, ...)` 이 실제로 동작한다.

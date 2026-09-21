@@ -22,6 +22,7 @@
 #include "string.h"
 #include "phys.h"
 #include "kernel/kernel.h"
+#include "nyx_abi.h"
 
 #ifndef NYX_SELFTEST
 #define NYX_SELFTEST 1
@@ -155,6 +156,68 @@ static void ring3_tests(void)
     check((i64)r[3] == (i64)NinvalidPointer, "ring3: NxKernelPrint(NULL) -> NinvalidPointer");
     check((i64)r[4] == (i64)NinvalidPointer, "ring3: NxKernelPrint(kernel address) -> NinvalidPointer");
     check(r[5] == 0, "ring3: NxYield == 0");
+
+    /* --- Core: 버전/시간/수면/시스템 정보 --- */
+    check(r[6] == NX_ABI_VERSION, "ring3: NxGetVersion == NX_ABI_VERSION");
+    check(r[8] == 0, "ring3: NxSleep(20ms) == 0");
+    check(r[9] > r[7], "ring3: NxGetTime increased across NxSleep(20ms)");
+    check(r[9] - r[7] >= 10000000UL, "ring3: elapsed >= ~10ms in nanoseconds (loose bound)");
+    check(r[10] == 0, "ring3: NxSysInfo() == 0");
+    {
+        struct nx_sysinfo si;
+
+        memcpy(&si, g_user_data + 0x140, sizeof(si));
+        check(si.abi_version_major == (u32)NX_ABI_MAJOR && si.abi_version_minor == (u32)NX_ABI_MINOR,
+              "ring3: NxSysInfo abi version matches NX_ABI_VERSION");
+        check(si.page_size == (u32)PAGE_SIZE, "ring3: NxSysInfo page_size == 4096");
+        check(si.timer_hz > 0, "ring3: NxSysInfo timer_hz > 0");
+        check(si.process_count >= 1U, "ring3: NxSysInfo process_count includes this process");
+    }
+
+    /* --- File I/O: open/read/stat/seek/close --- */
+    check((i64)r[11] >= 0, "ring3: NxOpen(app:/hellowld.run, READ) succeeded");
+    check(r[12] == 5, "ring3: NxRead first chunk == 5 bytes");
+    check(memcmp(g_user_data + 0x200, "Hello", 5) == 0, "ring3: NxRead first chunk content == \"Hello\"");
+    check(r[13] == 24, "ring3: NxRead second chunk == remaining 24 bytes (5+24 == 29-byte file)");
+    check(memcmp(g_user_data + 0x205, " from app:/hellowld.run\n", 24) == 0,
+          "ring3: NxRead second chunk content matches file tail");
+    check(r[14] == 0, "ring3: NxStat() == 0");
+    {
+        struct nx_stat st;
+
+        memcpy(&st, g_user_data + 0x100, sizeof(st));
+        check(st.size == 29, "ring3: NxStat size == 29 (file size)");
+        check(st.type == NX_TYPE_FILE, "ring3: NxStat type == NX_TYPE_FILE");
+        check((st.rights & NX_RIGHT_WRITE) == 0, "ring3: NxStat rights exclude WRITE (opened read-only)");
+    }
+    check(r[15] == 0, "ring3: NxSeek(SET, 0) -> offset 0");
+    check(r[16] == 5, "ring3: NxRead after seek(0) == 5 bytes again");
+    check(memcmp(g_user_data + 0x280, "Hello", 5) == 0, "ring3: NxRead after seek content == \"Hello\"");
+
+    /* --- 핸들: 복제는 권한을 넘길 수 없고, 닫힌 핸들은 재사용할 수 없다 --- */
+    check((i64)r[17] >= 0, "ring3: NxDuplicateHandle(READ-only file, mask=ALL) succeeded");
+    check((i64)r[18] == (i64)Npermission,
+          "ring3: writing through a duplicated read-only handle is rejected (no privilege escalation via dup)");
+    check(r[19] == 0, "ring3: NxClose(original file handle) == 0");
+    check(r[20] == 0, "ring3: NxClose(duplicated file handle) == 0");
+    check((i64)r[21] == (i64)NinvalidArg, "ring3: closing an already-closed handle is rejected (no double-close)");
+
+    /* --- 콘솔 쓰기 + stdout 복제 --- */
+    check(r[22] == 19, "ring3: NxWrite(stdout, \"ring3 stdout write\\n\") == 19 bytes");
+    check((i64)r[23] >= 0, "ring3: NxDuplicateHandle(stdout) succeeded");
+    check(r[24] == 24, "ring3: NxWrite(dup(stdout), ...) == 24 bytes");
+    check(r[25] == 0, "ring3: NxClose(duplicated stdout) == 0");
+
+    /* --- 프로세스 정보 --- */
+    check(r[26] == 0, "ring3: NxProcessInfo(SELF) == 0");
+    {
+        struct nx_procinfo pi;
+
+        memcpy(&pi, g_user_data + 0x190, sizeof(pi));
+        check(pi.pid != 0, "ring3: NxProcessInfo pid != 0 (idle thread is pid 0)");
+        check(pi.state == PROCESS_RUNNING, "ring3: NxProcessInfo state == RUNNING (queried about itself while running)");
+        check(pi.handle_count >= 3U, "ring3: NxProcessInfo handle_count includes stdin/stdout/stderr");
+    }
 
     run_user_program(user_prog2_start, user_prog2_end);
     check(live_processes() == 1, "user-mode #GP (hlt) terminated only the user process; kernel survived");

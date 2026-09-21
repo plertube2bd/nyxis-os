@@ -43,7 +43,22 @@ Cooperative kernel threads with round-robin scheduling and an assembly context s
 ### System calls (`syscall/`)
 
 `int 0x80` and `syscall`/`sysret` (`syscall_entry.s`). `rax` = number, `rdi, rsi, rdx, r10, r8, r9` = arguments,
-result in `rax` (negative = `Nstatus` error). `syscall` clobbers `rcx`/`r11`.
+result in `rax` (negative = `Nstatus` error). `syscall` clobbers `rcx`/`r11`. Numbers, struct layouts and
+constants are in `include/nyx_abi.h`, a public header shared with userland (kernel-internal types don't leak into it).
+
+Implemented so far (see `syscalls.txt` for the full ABI table): `NxGetVersion`, `NxGetTime`, `NxSleep`, `NxYield`,
+`NxSysInfo`, `NxOpen`/`NxClose`/`NxRead`/`NxWrite`/`NxSeek`/`NxStat`/`NxDuplicateHandle`, `NxProcessExit`,
+`NxProcessInfo`, `NxKernelPrint`, `NxDebugNop`. Everything else returns `NsyscallFailed`.
+
+Two supporting layers:
+- `uaccess.c`/`uaccess_asm.s`: the only code allowed to dereference a user pointer. Every access is checked against
+  the page tables (`paging_is_user_range`) *and* done through a copy routine that recovers from a page fault instead
+  of crashing the kernel, closing the check-then-use race where a page could be unmapped between the check and the
+  actual access. `#PF` in the kernel is only ever treated as "bad user access" when it happened at that exact
+  instruction; any other kernel-mode `#PF` is still a real bug and panics.
+- `handles.c`: a per-process, capability-style handle table (files + stdin/stdout/stderr). Every handle carries a
+  set of rights; `NxDuplicateHandle` can only narrow rights, never widen them. Handle values embed a generation
+  counter so a closed slot's old value can't be reused to reach whatever reuses that slot next.
 User pointers are validated with `paging_is_user_range()` before use.
 
 ### Testing
@@ -96,7 +111,22 @@ x86_64 4단계 페이징, higher-half 레이아웃입니다 (`include/phys.h` �
 ### 시스템 콜 (`syscall/`)
 
 `int 0x80` 과 `syscall`/`sysret`(`syscall_entry.s`) 둘 다 지원. `rax` = 번호, `rdi, rsi, rdx, r10, r8, r9` = 인자,
-결과는 `rax` (음수 = `Nstatus` 오류). `syscall` 은 `rcx`/`r11` 을 파괴합니다.
+결과는 `rax` (음수 = `Nstatus` 오류). `syscall` 은 `rcx`/`r11` 을 파괴합니다. 번호/구조체/상수는 유저랜드와 공유하는
+공개 헤더 `include/nyx_abi.h` 에 있습니다 (커널 내부 타입은 여기 노출되지 않습니다).
+
+지금까지 구현: `NxGetVersion`, `NxGetTime`, `NxSleep`, `NxYield`, `NxSysInfo`,
+`NxOpen`/`NxClose`/`NxRead`/`NxWrite`/`NxSeek`/`NxStat`/`NxDuplicateHandle`, `NxProcessExit`, `NxProcessInfo`,
+`NxKernelPrint`, `NxDebugNop` (전체 ABI 표는 `syscalls.txt` 참고). 나머지 번호는 `NsyscallFailed` 를 반환합니다.
+
+보조 계층 둘:
+- `uaccess.c`/`uaccess_asm.s`: 사용자 포인터를 역참조할 수 있는 유일한 코드입니다. 모든 접근은 페이지 테이블
+  검사(`paging_is_user_range`)와, 폴트가 나면 커널을 죽이는 대신 복구하는 복사 루틴 둘 다를 거칩니다. 그래서
+  "검사 -> 실제 접근" 사이에 매핑이 바뀌는 경쟁(TOCTOU)도 안전합니다. 커널 모드 `#PF` 는 그 복사 명령에서
+  정확히 발생했을 때만 "잘못된 사용자 접근" 으로 처리하고, 그 외의 커널 모드 `#PF` 는 여전히 진짜 버그로
+  간주해 패닉합니다.
+- `handles.c`: 프로세스별 capability 방식 핸들 테이블(파일 + stdin/stdout/stderr)입니다. 모든 핸들은 권한을
+  가지고, `NxDuplicateHandle` 은 권한을 줄이기만 할 수 있고 늘릴 수 없습니다. 핸들 값에는 세대(generation)가
+  들어 있어서, 닫힌 슬롯의 옛 핸들 값으로 그 슬롯을 재사용한 다른 객체에 접근할 수 없습니다.
 유저 포인터는 사용 전에 `paging_is_user_range()` 로 검증합니다.
 
 ### 테스트

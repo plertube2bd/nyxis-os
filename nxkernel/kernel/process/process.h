@@ -19,6 +19,7 @@
 
 #include "nyxis.h"
 #include "kernel/process/schedule.h"   /* schedule(): 다음 READY 프로세스로 양보 */
+#include "kernel/syscall/handles.h"      /* 프로세스별 핸들 테이블 */
 
 #define PROCESS_MAX          16U
 #define PROCESS_KSTACK_SIZE  16384U
@@ -46,6 +47,11 @@ typedef struct process {
     u64   kernel_rsp;     /* 컨텍스트 스위치 시 저장된 커널 rsp */
     void *kernel_stack;   /* 커널 스택의 최하위 주소 (부트 스레드는 NULL) */
 
+    u64   wake_tick;      /* BLOCKED(sleep) 상태일 때 깨어날 tick. 0 이면 타이머 대기 아님 */
+    i32   exit_code;      /* 종료 코드 (NxProcessExit 인자, 예외로 죽으면 -1) */
+
+    nx_handle_table_t handles;   /* 이 프로세스의 핸들 테이블 (stdin/stdout/stderr + 열린 파일) */
+
     bool  in_use;
     struct process *next;
 } process_t;
@@ -68,6 +74,21 @@ Nstatus process_terminate(u32 pid);
 
 /* 현재 프로세스 종료 (반환하지 않음). 스레드 함수가 return 하면 자동 호출된다. */
 void process_exit(void) __attribute__((noreturn));
+
+/* 종료 코드를 남기고 현재 프로세스를 종료한다 (반환하지 않음). 핸들은 모두 닫힌다. */
+void process_exit_with_code(i32 code) __attribute__((noreturn));
+
+/* 마지막으로 종료된 프로세스의 종료 코드 (자체 점검/디버그용) */
+i32 process_last_exit_code(void);
+
+/*
+ * 현재 프로세스를 ticks 만큼 재운다 (BLOCKED -> 시간이 되면 스케줄러가 READY 로 되돌림).
+ * idle(pid 0)은 재울 수 없다 (Npermission). 다른 실행 대상이 없어 못 잤으면 Ninterrupted.
+ */
+Nstatus process_sleep_ticks(u64 ticks);
+
+/* 살아 있는(종료되지 않은) 프로세스 수 */
+u32 process_count(void);
 
 /* asm 에서 호출: 스레드 함수가 반환했을 때의 종료 처리 */
 void process_thread_exit(void) __attribute__((noreturn));

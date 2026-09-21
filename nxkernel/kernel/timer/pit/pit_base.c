@@ -69,6 +69,26 @@ u64 timer_get_tick(void)
     return timer_tick;
 }
 
+u32 timer_get_hz(void)
+{
+    return g_timer_hz;
+}
+
+u64 timer_get_ns(void)
+{
+    u64 ticks = timer_tick;
+    u64 sec;
+    u64 rem;
+
+    if (g_timer_hz == 0)
+        return 0;
+
+    /* ticks * 1e9 를 바로 곱하면 약 5년 뒤 오버플로하므로 초/나머지로 나눠 계산 */
+    sec = ticks / g_timer_hz;
+    rem = ticks % g_timer_hz;
+    return sec * 1000000000UL + (rem * 1000000000UL) / g_timer_hz;
+}
+
 void sleep_ms(u64 ms)
 {
     u64 start;

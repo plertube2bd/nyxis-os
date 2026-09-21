@@ -15,11 +15,7 @@
 #include "nyxis.h"
 #include "interrupt.h"
 
-/* 시스템 콜 번호 */
-#define NX_SYS_YIELD         5U     /* NxYield() */
-#define NX_SYS_PROCESS_EXIT  65U    /* NxProcessExit() - 반환하지 않음 */
-#define NX_SYS_KERNEL_PRINT  771U   /* NxKernelPrint(const char *user_string) */
-#define NX_SYS_DEBUG_NOP     777U   /* NxDebugNop() -> 0 */
+#include "nyx_abi.h"   /* 시스템 콜 번호/구조체/상수 (유저랜드와 공유) */
 
 /* user 문자열 한 번에 커널로 복사할 최대 길이 (NUL 포함) */
 #define SYSCALL_STRING_MAX   256U

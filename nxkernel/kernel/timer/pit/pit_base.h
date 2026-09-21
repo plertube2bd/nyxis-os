@@ -20,6 +20,12 @@ Nstatus timer_init(u32 frequency_hz);
 /* 현재 tick 값 */
 u64 timer_get_tick(void);
 
+/* 타이머 주파수(Hz). timer_init 전에는 0 */
+u32 timer_get_hz(void);
+
+/* 부팅 후 경과 시간(나노초). tick 해상도. 오버플로 없이 계산한다. timer_init 전에는 0 */
+u64 timer_get_ns(void);
+
 /*
  * 밀리초 단위 sleep (hlt 기반 대기).
  * 인터럽트가 켜져(sti) 있고 timer_init 이 끝난 상태에서만 동작한다.

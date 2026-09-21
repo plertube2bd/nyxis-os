@@ -149,6 +149,8 @@ KERNEL_C_SRCS = \
 	kernel/process/process.c \
 	kernel/process/schedule.c \
 	kernel/syscall/syscall.c \
+	kernel/syscall/uaccess.c \
+	kernel/syscall/handles.c \
 	kernel/timer/pit/pit_base.c \
 	lib/memory.c \
 	lib/string.c \
@@ -174,7 +176,8 @@ KERNEL_S_SRCS = \
 	kernel/boot/boot.s \
 	kernel/interrupt/isr_stubs.s \
 	kernel/process/switch.s \
-	kernel/syscall/syscall_entry.s
+	kernel/syscall/syscall_entry.s \
+	kernel/syscall/uaccess_asm.s
 
 ifneq ($(SELFTEST),)
 KERNEL_S_SRCS += kernel/selftest_user.s
