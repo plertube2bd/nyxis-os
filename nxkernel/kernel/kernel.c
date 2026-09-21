@@ -13,6 +13,9 @@
  *  - "Entering ring 3 userland" 라고 출력만 하고 실제로는 hlt 루프에 있던 오해 소지 제거.
  *  - 깨진 zero_div()/error_handler 정리, 사용되지 않는 user_stack/idt 정적 배열 제거.
  *  - 인터럽트를 초기부터 꺼 두고(cli), 핸들러/타이머 준비가 끝난 뒤에만 sti 한다.
+ *  - higher-half 커널: 진입 코드(boot.s)가 UEFI/Multiboot2 어느 쪽으로 부팅했는지(boot_kind)와 부트 정보의
+ *    "물리 주소" 를 넘긴다. 커널은 이를 NTBLI 로 통일하고, 페이지 테이블 전환 뒤에는 주소 필드를
+ *    HHDM 가상 주소로 바꿔 사용한다 (phys.h).
  */
 
 #include "kernel/kernel.h"
@@ -27,7 +30,10 @@
 #include "drivers/filesystem/vfs.h"
 #include "drivers/filesystem/fat16/fat16.h"
 #include "drivers/pic/pic.h"
+#include "kernel/boot/multiboot2.h"
+#include "kernel/syscall/syscall.h"
 #include "boot_info.h"
+#include "phys.h"
 #include "interrupt.h"
 #include "memory.h"
 #include "nyxis.h"
@@ -38,6 +44,16 @@ bool multicore_enabled = false;
 /* 커널 소유 부트 정보 사본 */
 static NTBLI g_boot_info;
 static bool g_boot_info_valid = false;
+
+/* 메모리 맵 사본 (boot.s 의 MEMMAP_MAX 와 같은 크기). UEFI/Multiboot2 모두 여기에 담는다. */
+#define MEMMAP_STORE_SIZE 65536U
+static u8 g_memmap_store[MEMMAP_STORE_SIZE] __attribute__((aligned(8)));
+
+/* boot.s 가 NTBLI 필드 오프셋을 상수로 사용하므로 레이아웃 변경을 컴파일 타임에 검출 */
+NX_STATIC_ASSERT(ntbli_memmap_base_offset, __builtin_offsetof(NTBLI, memmap_base) == 72);
+NX_STATIC_ASSERT(ntbli_memmap_size_offset, __builtin_offsetof(NTBLI, memmap_size) == 80);
+
+extern u8 boot_stack_top[];
 
 #define TIMER_HZ 100U
 
@@ -53,11 +69,27 @@ static void fatal(Nstatus error, const char *message)
     kernel_panic_simple(message, error);
 }
 
-/* 부트로더가 넘긴 NTBLI 를 검증하고 커널 소유 메모리에 복사한다 */
-static Nstatus boot_info_validate_and_copy(const NTBLI *in)
+/* initrd 범위(물리 주소)가 RAM 안에 있는지 확인하고, 이상하면 initrd 를 사용하지 않는다 */
+static void boot_info_sanitize_initrd(void)
 {
     u64 end;
 
+    if (!g_boot_info.initrd_base && !g_boot_info.initrd_size)
+        return;
+
+    end = (u64)(usize)g_boot_info.initrd_base + g_boot_info.initrd_size;
+
+    if (!g_boot_info.initrd_base || g_boot_info.initrd_size == 0 ||
+        end < (u64)(usize)g_boot_info.initrd_base ||
+        (g_boot_info.memory_size && end > g_boot_info.memory_size)) {
+        g_boot_info.initrd_base = nNULL;
+        g_boot_info.initrd_size = 0;
+    }
+}
+
+/* UEFI(NYTB) 가 만든 NTBLI(물리 주소 in) 를 검증하고 커널 소유 메모리에 복사한다 */
+static Nstatus boot_info_from_uefi(const NTBLI *in)
+{
     if (!in)
         return NnullPointer;
 
@@ -74,20 +106,28 @@ static Nstatus boot_info_validate_and_copy(const NTBLI *in)
 
     memcpy(&g_boot_info, in, sizeof(NTBLI));
 
-    /* initrd 범위: 오버플로/메모리 밖이면 initrd 를 사용하지 않는다 */
-    if (g_boot_info.initrd_base || g_boot_info.initrd_size) {
-        end = (u64)(usize)g_boot_info.initrd_base + g_boot_info.initrd_size;
-
-        if (!g_boot_info.initrd_base || g_boot_info.initrd_size == 0 ||
-            end < (u64)(usize)g_boot_info.initrd_base ||
-            (g_boot_info.memory_size && end > g_boot_info.memory_size)) {
-            g_boot_info.initrd_base = nNULL;
-            g_boot_info.initrd_size = 0;
-        }
+    /* 메모리 맵은 boot.s 가 낮은 주소의 버퍼로 복사해 두었다. 커널 이미지 안의 사본으로 다시 복사 */
+    if (g_boot_info.memmap_base && g_boot_info.memmap_size &&
+        g_boot_info.memmap_size <= MEMMAP_STORE_SIZE) {
+        memcpy(g_memmap_store, g_boot_info.memmap_base, (usize)g_boot_info.memmap_size);
+        g_boot_info.memmap_base = g_memmap_store;
+    } else {
+        g_boot_info.memmap_base = nNULL;
+        g_boot_info.memmap_size = 0;
     }
 
-    g_boot_info_valid = true;
     return NSTATUS_OK;
+}
+
+/* 페이지 테이블 전환 후: 부트 정보의 물리 주소 필드를 HHDM 가상 주소로 바꾼다 */
+static void boot_info_relocate(void)
+{
+    if (g_boot_info.initrd_base)
+        g_boot_info.initrd_base = phys_to_virt((u64)(usize)g_boot_info.initrd_base);
+    if (g_boot_info.framebuffer_base)
+        g_boot_info.framebuffer_base = phys_to_virt((u64)(usize)g_boot_info.framebuffer_base);
+    if (g_boot_info.Rsdp)
+        g_boot_info.Rsdp = phys_to_virt((u64)(usize)g_boot_info.Rsdp);
 }
 
 /* 프레임버퍼 사용 가능 여부 판단 후 콘솔 초기화 (실패해도 시리얼 출력은 계속됨) */
@@ -218,8 +258,8 @@ void enter_ring3(void *entry, void *stack_top)
 extern void nyx_selftest(void);
 #endif
 
-/* Kernel main function - called from assembly entry point */
-void kernel_main(NTBLI *boot_info)
+/* Kernel main function - called from boot.s (higher-half) */
+void kernel_main(u32 boot_kind, u64 boot_info_phys)
 {
     Nstatus status;
 
@@ -228,35 +268,48 @@ void kernel_main(NTBLI *boot_info)
     /* 1. 로그 출력 수단부터 확보 (시리얼은 실패해도 계속 진행) */
     (void)serial_init();
 
-    /* 2. 부트 정보 검증 */
-    status = boot_info_validate_and_copy(boot_info);
+    /* 2. 부트 정보를 NTBLI 로 통일 (UEFI 는 NTBLI 를 검증/복사, Multiboot2 는 변환) */
+    if (boot_kind == BOOT_KIND_UEFI) {
+        status = boot_info_from_uefi((const NTBLI *)(usize)boot_info_phys);
+    } else if (boot_kind == BOOT_KIND_MULTIBOOT2) {
+        status = multiboot2_to_ntbli(boot_info_phys, &g_boot_info, g_memmap_store, sizeof(g_memmap_store));
+    } else {
+        status = Nunsupported;
+    }
     if (NSTATUS_IS_ERR(status)) {
-        printk("Invalid boot info from bootloader: %r\n", status);
+        printk("Invalid boot info (kind %u): %r\n", boot_kind, status);
         kernel_panic_simple("Invalid boot info", status);
     }
+    boot_info_sanitize_initrd();
+    g_boot_info_valid = true;
 
-    console_init_from_boot_info(&g_boot_info);
-
-    printk("Nyxis OS Kernel Started\n");
-    printk("Memory top: 0x%lx, initrd: %lu bytes, %ux%u framebuffer\n",
-           (unsigned long)g_boot_info.memory_size,
-           (unsigned long)g_boot_info.initrd_size,
-           g_boot_info.width, g_boot_info.height);
-
-    /* 3. CPU 구조: GDT/TSS, IDT, PIC (인터럽트는 아직 꺼져 있음) */
+    /* 3. CPU 구조: GDT/TSS, IDT, PIC, syscall (인터럽트는 아직 꺼져 있음) */
     gdt_init();
+    gdt_set_kernel_stack((u64)(usize)boot_stack_top);
     interrupt_init();
     pic_remap(VEC_IRQ_BASE, VEC_IRQ_BASE + 8);
-    printk("GDT/IDT/PIC ready\n");
+    status = syscall_init();
+    if (NSTATUS_IS_ERR(status))
+        printk("syscall/sysret unavailable (%r): int 0x80 only\n", status);
 
-    /* 4. 메모리 보호: 자체 페이지 테이블 + W^X */
+    /* 4. 메모리 보호: 자체 페이지 테이블(HHDM + higher-half 커널, W^X). 이후 낮은 주소 항등 매핑은 사라진다 */
     status = paging_init(&g_boot_info);
     if (NSTATUS_IS_ERR(status))
         fatal(status, "Paging init failed");
     paging_enable();
-    printk("Paging enabled (W^X, NX, WP)\n");
+    boot_info_relocate();
 
-    /* 5. 프로세스 / 타이머 */
+    /* 5. 콘솔 (프레임버퍼는 HHDM 주소로 접근) */
+    console_init_from_boot_info(&g_boot_info);
+
+    printk("Nyxis OS Kernel Started (%s boot)\n", boot_kind == BOOT_KIND_UEFI ? "UEFI" : "Multiboot2");
+    printk("Memory top: 0x%lx, initrd: %lu bytes, %ux%u framebuffer\n",
+           (unsigned long)g_boot_info.memory_size,
+           (unsigned long)g_boot_info.initrd_size,
+           g_boot_info.width, g_boot_info.height);
+    printk("GDT/IDT/PIC ready, paging enabled (higher-half, HHDM, W^X, NX, WP)\n");
+
+    /* 6. 프로세스 / 타이머 */
     status = process_init();
     if (NSTATUS_IS_ERR(status))
         fatal(status, "Process init failed");
@@ -265,7 +318,7 @@ void kernel_main(NTBLI *boot_info)
     if (NSTATUS_IS_ERR(status))
         fatal(status, "Timer init failed");
 
-    /* 6. 파일시스템 */
+    /* 7. 파일시스템 */
     status = vfs_init();
     if (NSTATUS_IS_ERR(status))
         fatal(status, "Failed to initialize VFS");
@@ -281,12 +334,12 @@ void kernel_main(NTBLI *boot_info)
         printk("No initrd loaded\n");
     }
 
-    /* 7. 저장장치 (없어도 계속 부팅) */
+    /* 8. 저장장치 (없어도 계속 부팅) */
     status = ahci_init();
     if (NSTATUS_IS_ERR(status))
         printk("AHCI unavailable (%r): continuing without SATA storage\n", status);
 
-    /* 8. 이제 핸들러가 모두 준비되었으므로 인터럽트를 켠다 */
+    /* 9. 이제 핸들러가 모두 준비되었으므로 인터럽트를 켠다 */
     sti();
 
     printk("Kernel initialization complete. Userland loader is not implemented yet.\n");

@@ -20,6 +20,8 @@
 #include "kernel/error_handling/panic.h"
 #include "memory.h"
 #include "string.h"
+#include "phys.h"
+#include "kernel/kernel.h"
 
 #ifndef NYX_SELFTEST
 #define NYX_SELFTEST 1
@@ -75,6 +77,89 @@ static void thread_b(void *arg)
 
 static u8 g_user_page[4096] __attribute__((aligned(4096)));
 
+/* ring 3 테스트용 사용자 페이지 (주소 배치는 selftest_user.s 주석 참고) */
+static u8 g_user_code[4096] __attribute__((aligned(4096)));
+static u8 g_user_data[4096] __attribute__((aligned(4096)));
+static u8 g_user_stack[4096] __attribute__((aligned(4096)));
+
+extern u8 user_prog1_start[];
+extern u8 user_prog1_end[];
+extern u8 user_prog2_start[];
+extern u8 user_prog2_end[];
+
+#define USER_CODE_VADDR   0x400000UL
+#define USER_DATA_VADDR   0x401000UL
+#define USER_STACK_VADDR  0x402000UL
+#define USER_SENTINEL     0xDEADBEEFDEADBEEFUL
+
+/* 커널 스레드가 ring 3 로 내려간다 (프로그램이 NxProcessExit 하거나 예외로 종료될 때까지) */
+static void user_runner(void *arg)
+{
+    (void)arg;
+    enter_ring3((void *)USER_CODE_VADDR, (void *)(USER_STACK_VADDR + PAGE_SIZE));
+}
+
+/* 살아 있는(종료되지 않은) 프로세스 수 */
+static int live_processes(void)
+{
+    process_t *p;
+    int n = 0;
+
+    for (p = process_list; p; p = p->next) {
+        if (p->in_use && p->state != PROCESS_TERMINATED)
+            n++;
+    }
+    return n;
+}
+
+static void run_user_program(const u8 *start, const u8 *end)
+{
+    u32 i;
+
+    memset(g_user_code, 0xCC, sizeof(g_user_code));
+    memcpy(g_user_code, start, (usize)(end - start));
+
+    for (i = 0; i < 8; i++)
+        ((volatile u64 *)g_user_data)[i] = USER_SENTINEL;
+
+    if (process_create(user_runner, nNULL) != Nok) {
+        check(0, "process_create(user_runner)");
+        return;
+    }
+
+    /* 사용자 프로그램이 끝날 때까지 양보하며 대기 (최대 약 1초) */
+    for (i = 0; i < 200 && live_processes() > 1; i++) {
+        schedule();
+        sleep_ms(5);
+    }
+}
+
+static void ring3_tests(void)
+{
+    volatile u64 *r = (volatile u64 *)g_user_data;
+
+    printk("SELFTEST: ring 3 (user mode)\n");
+
+    check(paging_map_page((void *)(usize)virt_to_phys(g_user_code), (void *)USER_CODE_VADDR, PAGE_USER) == Nok,
+          "map user code page (R-X)");
+    check(paging_map_page((void *)(usize)virt_to_phys(g_user_data), (void *)USER_DATA_VADDR,
+                          PAGE_RW | PAGE_USER | PAGE_NX) == Nok, "map user data page (RW-)");
+    check(paging_map_page((void *)(usize)virt_to_phys(g_user_stack), (void *)USER_STACK_VADDR,
+                          PAGE_RW | PAGE_USER | PAGE_NX) == Nok, "map user stack page (RW-)");
+
+    run_user_program(user_prog1_start, user_prog1_end);
+    check(live_processes() == 1, "user program exited via NxProcessExit (syscall)");
+    check(r[0] == 0, "ring3: syscall instruction -> NxDebugNop == 0");
+    check(r[1] == 0, "ring3: int 0x80 -> NxDebugNop == 0");
+    check(r[2] == 0, "ring3: NxKernelPrint(user string) == 0");
+    check((i64)r[3] == (i64)NinvalidPointer, "ring3: NxKernelPrint(NULL) -> NinvalidPointer");
+    check((i64)r[4] == (i64)NinvalidPointer, "ring3: NxKernelPrint(kernel address) -> NinvalidPointer");
+    check(r[5] == 0, "ring3: NxYield == 0");
+
+    run_user_program(user_prog2_start, user_prog2_end);
+    check(live_processes() == 1, "user-mode #GP (hlt) terminated only the user process; kernel survived");
+}
+
 #if NYX_SELFTEST == 4
 static unsigned long recurse(unsigned long n)
 {
@@ -114,11 +199,11 @@ static void functional_tests(void)
     memset(g_user_page, 0, sizeof(g_user_page));
     strcpy((char *)g_user_page, "hello from a user-mapped page via %s %x\n");
 
-    check(paging_map_page(g_user_page, vaddr, PAGE_RW | PAGE_USER | PAGE_NX) == Nok,
+    check(paging_map_page((void *)(usize)virt_to_phys(g_user_page), vaddr, PAGE_RW | PAGE_USER | PAGE_NX) == Nok,
           "paging_map_page(RW|USER|NX)");
-    check(paging_map_page(g_user_page, vaddr, PAGE_USER) == NalreadyExists,
+    check(paging_map_page((void *)(usize)virt_to_phys(g_user_page), vaddr, PAGE_USER) == NalreadyExists,
           "paging_map_page duplicate -> NalreadyExists");
-    check(paging_map_page(g_user_page, (void *)0x181000000UL, PAGE_RW | PAGE_USER) == Npermission,
+    check(paging_map_page((void *)(usize)virt_to_phys(g_user_page), (void *)0x181000000UL, PAGE_RW | PAGE_USER) == Npermission,
           "paging_map_page RW+X rejected (W^X)");
     check(paging_is_user_range(vaddr, 4096, true), "paging_is_user_range(mapped, write)");
     check(!paging_is_user_range(vaddr, 4097, false), "paging_is_user_range spanning unmapped page rejected");
@@ -152,6 +237,8 @@ static void functional_tests(void)
         check(strlen("abc") == 3 && strcmp("abc", "abd") < 0 && strnlen("abcdef", 3) == 3, "string basics");
         check(strstr("haystack", "st") != nNULL && strstr("ab", "abc") == nNULL, "strstr end-of-haystack safe");
     }
+
+    ring3_tests();
 
     if (g_failures == 0)
         printk("SELFTEST PASSED\n");

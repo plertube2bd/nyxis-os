@@ -21,6 +21,9 @@
 #include "kernel/paging/paging.h"
 #include "console/outputs/printk.h"
 #include "memory.h"
+#include "lowlevel.h"
+#include "phys.h"
+#include "kernel/process/process.h"
 
 /*
  * 유저 문자열을 커널 버퍼로 안전하게 복사한다.
@@ -86,6 +89,14 @@ i64 syscall_dispatch(
     case NX_SYS_DEBUG_NOP:
         return 0;
 
+    case NX_SYS_YIELD:
+        schedule();
+        return 0;
+
+    case NX_SYS_PROCESS_EXIT:
+        process_exit();
+        /* 반환하지 않는다 */
+
     default:
         return (i64)NsyscallFailed;
     }
@@ -105,4 +116,53 @@ void syscall_handle(struct trap_frame *frame)
 
     /* iretq 후 호출자의 rax 로 전달된다 */
     frame->rax = (u64)result;
+}
+
+/* ------------------------------------------------------------------ */
+/* syscall / sysret                                                    */
+/* ------------------------------------------------------------------ */
+
+#define MSR_EFER         0xC0000080U
+#define MSR_STAR         0xC0000081U
+#define MSR_LSTAR        0xC0000082U
+#define MSR_SFMASK       0xC0000084U
+#define MSR_GS_BASE      0xC0000101U
+#define MSR_KERNEL_GS    0xC0000102U
+#define EFER_SCE         1UL
+
+/* syscall 진입 시 RFLAGS 에서 지울 비트: IF(인터럽트), TF(단일 스텝), DF(방향), AC, NT */
+#define SFMASK_VALUE     (0x200UL | 0x100UL | 0x400UL | 0x40000UL | 0x4000UL)
+
+struct cpu_local g_cpu_local;
+
+Nstatus syscall_init(void)
+{
+    u32 a, b, c, d;
+
+    cpuid(0x80000000U, &a, &b, &c, &d);
+    if (a < 0x80000001U)
+        return NdeviceMissing;
+    cpuid(0x80000001U, &a, &b, &c, &d);
+    if (!(d & (1U << 11)))               /* SYSCALL/SYSRET 지원 여부 */
+        return NdeviceMissing;
+
+    wrmsr(MSR_EFER, rdmsr(MSR_EFER) | EFER_SCE);
+    wrmsr(MSR_STAR, ((u64)STAR_USER_BASE << 48) | ((u64)STAR_KERNEL_BASE << 32));
+    wrmsr(MSR_LSTAR, (u64)(usize)syscall_entry);
+    wrmsr(MSR_SFMASK, SFMASK_VALUE);
+
+    /*
+     * 커널은 GS 를 쓰지 않으므로 평상시 GS.base = 0 (사용자 GS 도 KERNEL_GS_BASE 에 보관하지 않음).
+     * syscall_entry.s 가 swapgs 로 GS.base 를 g_cpu_local 로 바꿨다가 sysret 직전에 되돌린다.
+     */
+    wrmsr(MSR_GS_BASE, 0);
+    wrmsr(MSR_KERNEL_GS, (u64)(usize)&g_cpu_local);
+
+    return NSTATUS_OK;
+}
+
+void syscall_bad_return(void)
+{
+    printk("syscall: invalid return address, terminating process\n");
+    process_exit();
 }

@@ -18,6 +18,7 @@
 #include "lowlevel.h"
 #include "nyxis.h"
 #include "memory.h"
+#include "phys.h"
 #include "console/outputs/printk.h"
 
 /* 상태 대기 반복 횟수 상한 (하드웨어가 응답하지 않아도 커널이 멈추지 않도록) */
@@ -128,7 +129,7 @@ static Nstatus ahci_find_controller(void)
                     pci_write_config(bus, device, function, 0x04, command);
                 }
 
-                ahci_base = (HBA_MEM *)(usize)abar;
+                ahci_base = (HBA_MEM *)phys_to_virt((u64)abar);   /* MMIO 는 HHDM 을 통해 접근 */
                 return NSTATUS_OK;
             }
         }
@@ -285,25 +286,26 @@ static Nstatus ahci_port_rebase(HBA_PORT *Port, i32 PortNo)
     if (NSTATUS_IS_ERR(status))
         return status;
 
-    clb_addr = (u64)(usize)&ahci_command_list[PortNo];
+    /* 컨트롤러 레지스터에는 "물리 주소" 를, CPU 접근에는 커널 가상 주소를 사용한다 */
+    clb_addr = virt_to_phys(&ahci_command_list[PortNo]);
     Port->clb = (u32)clb_addr;
     Port->clbu = (u32)(clb_addr >> 32);
-    memset((void *)(usize)clb_addr, 0, 1024);
+    memset(ahci_command_list[PortNo], 0, 1024);
 
-    fb_addr = (u64)(usize)&ahci_fis[PortNo];
+    fb_addr = virt_to_phys(&ahci_fis[PortNo]);
     Port->fb = (u32)fb_addr;
     Port->fbu = (u32)(fb_addr >> 32);
-    memset((void *)(usize)fb_addr, 0, 256);
+    memset(ahci_fis[PortNo], 0, 256);
 
-    CmdHeader = (HBA_CMD_HEADER *)(usize)clb_addr;
+    CmdHeader = (HBA_CMD_HEADER *)(void *)ahci_command_list[PortNo];
     for (slot = 0; slot < AHCI_MAX_CMD_SLOTS; slot++) {
-        u64 tbl_addr = (u64)(usize)&ahci_cmd_tables[PortNo][slot];
+        u64 tbl_addr = virt_to_phys(&ahci_cmd_tables[PortNo][slot]);
 
         CmdHeader[slot].flags = (u16)(sizeof(FIS_REG_H2D) / sizeof(u32));
         CmdHeader[slot].prdtl = 1;
         CmdHeader[slot].ctba = (u32)tbl_addr;
         CmdHeader[slot].ctbau = (u32)(tbl_addr >> 32);
-        memset((void *)(usize)tbl_addr, 0, 256);
+        memset(ahci_cmd_tables[PortNo][slot], 0, 256);
     }
 
     Port->serr = 0xFFFFFFFFU;   /* 이전 에러 상태 클리어 */
@@ -323,11 +325,11 @@ Nstatus ahci_read(
     void *Buffer
 ) {
     i32 slot;
+    i32 port_no;
     HBA_CMD_HEADER *CmdHeader;
     HBA_CMD_TBL *CmdTbl;
     HBA_PRDT_ENTRY *Prdt;
     FIS_REG_H2D *Fis;
-    u64 table_addr;
     u64 buffer_addr;
     u32 timeout;
 
@@ -340,7 +342,10 @@ Nstatus ahci_read(
     if (StartLba >= (1UL << 48) || (StartLba + SectorCount) > (1UL << 48))
         return NinvalidArg;
 
-    buffer_addr = (u64)(usize)Buffer;
+    /* DMA 는 물리 주소가 필요하다. 커널 이미지/HHDM 안의 (물리적으로 연속인) 버퍼만 허용한다 */
+    if (!virt_is_direct(Buffer))
+        return NinvalidPointer;
+    buffer_addr = virt_to_phys(Buffer);
 
     /* DMA 버퍼는 2바이트 정렬이어야 한다 (dba bit0 = 0) */
     if (buffer_addr & 1UL)
@@ -354,14 +359,18 @@ Nstatus ahci_read(
     if (slot < 0)
         return Nbusy;
 
-    CmdHeader = (HBA_CMD_HEADER *)(usize)(((u64)Port->clbu << 32) | Port->clb);
+    /* 이 포트의 command list / command table 은 정적 배열이므로 포트 번호로 바로 찾는다 */
+    port_no = (i32)(Port - &ahci_base->ports[0]);
+    if (port_no < 0 || port_no >= AHCI_MAX_PORTS)
+        return NinvalidArg;
+
+    CmdHeader = (HBA_CMD_HEADER *)(void *)ahci_command_list[port_no];
     CmdHeader += slot;
     CmdHeader->prdtl = 1;
     CmdHeader->prdbc = 0;
     CmdHeader->flags = (u16)(sizeof(FIS_REG_H2D) / sizeof(u32));
 
-    table_addr = ((u64)CmdHeader->ctbau << 32) | CmdHeader->ctba;
-    CmdTbl = (HBA_CMD_TBL *)(usize)table_addr;
+    CmdTbl = (HBA_CMD_TBL *)(void *)ahci_cmd_tables[port_no][slot];
     memset(CmdTbl, 0, 256);
 
     Prdt = (HBA_PRDT_ENTRY *)((u8 *)CmdTbl + 0x80);
