@@ -39,6 +39,13 @@ typedef struct process {
     u32   pid;
     u32   state;
 
+    /* 파일 권한 검사(UNIX 모드/ACL)가 참조하는 호출자 신원.
+     * 아직 ring3 프로세스/로그인 개념이 없어 전부 0(root)으로 시작하고, 모든
+     * process_create() 경로가 memset(0) 을 거치므로 별도 초기화 없이 안전하다.
+     * 실제 사용자 인증이 생기면 그 경로에서 이 값을 채워 넣으면 된다. */
+    u32   uid;
+    u32   gid;
+
     void *stack;          /* 인자로 전달되는 값(예: 유저 스택). 커널 스레드는 NULL 가능 */
     process_entry_t entry_point;
 

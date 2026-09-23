@@ -165,7 +165,8 @@ KERNEL_C_SRCS = \
 	$(ROOT)/drivers/ramdisk/ramdisk.c \
 	$(ROOT)/drivers/filesystem/core.c \
 	$(ROOT)/drivers/filesystem/vfs.c \
-	$(ROOT)/drivers/filesystem/fat16/fat16.c
+	$(ROOT)/drivers/filesystem/fat16/fat16.c \
+	$(ROOT)/drivers/filesystem/nyfs/nyfs.c
 
 ifneq ($(SELFTEST),)
 KERNEL_C_SRCS += kernel/selftest.c

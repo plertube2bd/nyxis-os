@@ -114,7 +114,8 @@ Nstatus filesystem_unmount(
 
 Nstatus filesystem_format(
     const char *fsname,
-    u32 diskno
+    u32 diskno,
+    void *userdata
 ) {
     filesystem_t *fs = fs_find(fsname);
 
@@ -126,5 +127,5 @@ Nstatus filesystem_format(
         return Nunsupported;
     }
 
-    return fs->ops.format(diskno);
+    return fs->ops.format(diskno, userdata);
 }

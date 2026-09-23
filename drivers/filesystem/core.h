@@ -14,7 +14,10 @@
 typedef struct {
     Nstatus (*mount)(u32 diskno, void *userdata);
     Nstatus (*unmount)(u32 diskno);
-    Nstatus (*format)(u32 diskno);
+    /* userdata 는 mount 와 동일한 규칙: 드라이버가 자신의 전용 파라미터 구조체로
+     * 캐스팅해서 쓴다. mkfs(포맷)에는 블록 장치 read/write 콜백과 총 블록 수 같은
+     * 정보가 필요하므로 mount 와 마찬가지로 userdata 를 받아야 한다. */
+    Nstatus (*format)(u32 diskno, void *userdata);
 } filesystem_ops_t;
 
 typedef struct {
@@ -49,7 +52,8 @@ Nstatus filesystem_unmount(
 
 Nstatus filesystem_format(
     const char *fsname,
-    u32 diskno
+    u32 diskno,
+    void *userdata
 );
 
 #endif /* FILESYSTEMCORE_H */
