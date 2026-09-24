@@ -32,6 +32,15 @@ typedef struct vfs_ops {
     Nstatus (*write)(handle_t *handle, const void *buffer, usize size, usize *bytes_written);
     Nstatus (*close)(handle_t *handle);
     Nstatus (*stat)(vnode_t *vnode, vfs_stat_t *out);   /* 선택 사항 (NULL 이면 Nunsupported) */
+
+    /* 아래 네 개도 전부 선택 사항이다(NULL 이면 Nunsupported) - 읽기 전용 파일시스템
+     * (fat16 등)은 그냥 NULL 로 둔다. */
+    Nstatus (*create)(vnode_t *dir, const char *name, u32 mode, vnode_t **out_vnode);  /* 새 파일 */
+    Nstatus (*mkdir)(vnode_t *dir, const char *name, u32 mode, vnode_t **out_vnode);   /* 새 디렉터리 */
+    Nstatus (*unlink)(vnode_t *dir, const char *name);   /* 파일 제거, 또는 빈 디렉터리 제거(rmdir 겸용) */
+    /* index 번째(0부터) 자식의 이름을 name_out 에 채운다. index 가 자식 수 이상이면
+     * NnotFound 로 "더 이상 없음"을 알린다. */
+    Nstatus (*readdir)(vnode_t *dir, u64 index, char *name_out, usize name_out_max, u32 *type_out);
 } vfs_ops_t;
 
 struct vfs_filesystem {
@@ -62,6 +71,23 @@ Nstatus vfs_close(handle_t *handle);
 
 /* 열린 핸들이 가리키는 파일의 정보를 얻는다 (경로가 아니라 핸들 기준이라 경로 경쟁이 없다) */
 Nstatus vfs_fstat(handle_t *handle, vfs_stat_t *out);
+
+/*
+ * path 의 부모 디렉터리 아래에 새 파일/디렉터리를 만든다. 부모까지의 경로는 이미
+ * 존재해야 한다(mkdir -p 처럼 중간 디렉터리를 자동으로 만들지 않는다).
+ * 대상 파일시스템이 create/mkdir 을 지원하지 않으면 Nunsupported.
+ */
+Nstatus vfs_create(const char *path, u32 mode);
+Nstatus vfs_mkdir(const char *path, u32 mode);
+
+/* 파일을 지우거나(링크 수가 0 이 되면 실제로 회수), 빈 디렉터리를 지운다(rmdir 겸용).
+ * 디렉터리가 비어있지 않으면 파일시스템 드라이버가 Nunsupported 나 다른 오류를 돌려준다. */
+Nstatus vfs_unlink(const char *path);
+
+/* path(디렉터리) 의 index 번째(0부터) 자식 이름을 name_out 에 채운다.
+ * index 가 자식 수 이상이면 NnotFound ("더 이상 없음"). 호출자는 index 를 0부터
+ * 하나씩 늘려가며 NnotFound 가 나올 때까지 반복 호출해서 목록 전체를 얻는다. */
+Nstatus vfs_readdir(const char *path, u64 index, char *name_out, usize name_out_max, u32 *type_out);
 
 /*
  * src 와 같은 파일을 새로 열어 dst 에 넣는다. 오프셋/플래그는 복사되지만 이후에는 서로 독립이다.

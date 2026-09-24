@@ -959,3 +959,222 @@ Nstatus vfs_reopen(const handle_t *src, handle_t *dst)
     free_handle(slot);
     return Nok;
 }
+
+/*
+ * create/mkdir/unlink 은 dentry 트리를 바꾸므로(자식을 새로 붙이거나 떼어낸다)
+ * mount/unmount 와 같은 이유로 g_vfs_lock 을 잡는다. 반면 open/read/write 는
+ * 트리 구조 자체는 바꾸지 않아서(단순 조회/캐싱) 파일 위쪽의 주석대로 락이 없다.
+ */
+
+Nstatus vfs_create(const char *path, u32 mode)
+{
+    vfs_namespace_t *ns = nNULL;
+    const char *local_path = nNULL;
+    dentry_t *parent = nNULL;
+    dentry_t *existing;
+    char name[VFS_NAME_MAX + 1];
+    vnode_t *child = nNULL;
+    Nstatus status;
+
+    if (!path || strlen(path) == 0) {
+        return NinvalidArg;
+    }
+
+    spin_lock(&g_vfs_lock);
+
+    status = resolve_namespace_path(path, &ns, &local_path, false);
+    if (NSTATUS_IS_ERR(status)) {
+        spin_unlock(&g_vfs_lock);
+        return status;
+    }
+
+    status = resolve_parent_ns(ns, local_path, &parent, name, sizeof(name));
+    if (NSTATUS_IS_ERR(status)) {
+        spin_unlock(&g_vfs_lock);
+        return status;
+    }
+
+    if (name[0] == '\0' || !parent) {
+        spin_unlock(&g_vfs_lock);
+        return NinvalidArg;   /* 루트 자체를 "생성"할 수는 없다 */
+    }
+
+    if (!parent->node || !parent->node->ops || !parent->node->ops->create) {
+        spin_unlock(&g_vfs_lock);
+        return Nunsupported;
+    }
+
+    existing = find_child(parent, name);
+    if (existing && existing->node) {
+        spin_unlock(&g_vfs_lock);
+        return NalreadyExists;
+    }
+
+    status = parent->node->ops->create(parent->node, name, mode, &child);
+    if (NSTATUS_IS_ERR(status)) {
+        spin_unlock(&g_vfs_lock);
+        return status;
+    }
+
+    if (existing) {
+        existing->node = child;
+    } else {
+        dentry_t *new_dentry = alloc_dentry(name, child, parent);
+
+        if (!new_dentry) {
+            spin_unlock(&g_vfs_lock);
+            vfs_free_vnode(child);
+            return NoutOfMemory;
+        }
+        attach_child(parent, new_dentry);
+    }
+
+    spin_unlock(&g_vfs_lock);
+    return Nok;
+}
+
+Nstatus vfs_mkdir(const char *path, u32 mode)
+{
+    vfs_namespace_t *ns = nNULL;
+    const char *local_path = nNULL;
+    dentry_t *parent = nNULL;
+    dentry_t *existing;
+    char name[VFS_NAME_MAX + 1];
+    vnode_t *child = nNULL;
+    Nstatus status;
+
+    if (!path || strlen(path) == 0) {
+        return NinvalidArg;
+    }
+
+    spin_lock(&g_vfs_lock);
+
+    status = resolve_namespace_path(path, &ns, &local_path, false);
+    if (NSTATUS_IS_ERR(status)) {
+        spin_unlock(&g_vfs_lock);
+        return status;
+    }
+
+    status = resolve_parent_ns(ns, local_path, &parent, name, sizeof(name));
+    if (NSTATUS_IS_ERR(status)) {
+        spin_unlock(&g_vfs_lock);
+        return status;
+    }
+
+    if (name[0] == '\0' || !parent) {
+        spin_unlock(&g_vfs_lock);
+        return NinvalidArg;
+    }
+
+    if (!parent->node || !parent->node->ops || !parent->node->ops->mkdir) {
+        spin_unlock(&g_vfs_lock);
+        return Nunsupported;
+    }
+
+    existing = find_child(parent, name);
+    if (existing && existing->node) {
+        spin_unlock(&g_vfs_lock);
+        return NalreadyExists;
+    }
+
+    status = parent->node->ops->mkdir(parent->node, name, mode, &child);
+    if (NSTATUS_IS_ERR(status)) {
+        spin_unlock(&g_vfs_lock);
+        return status;
+    }
+
+    if (existing) {
+        existing->node = child;
+    } else {
+        dentry_t *new_dentry = alloc_dentry(name, child, parent);
+
+        if (!new_dentry) {
+            spin_unlock(&g_vfs_lock);
+            vfs_free_vnode(child);
+            return NoutOfMemory;
+        }
+        attach_child(parent, new_dentry);
+    }
+
+    spin_unlock(&g_vfs_lock);
+    return Nok;
+}
+
+Nstatus vfs_unlink(const char *path)
+{
+    vfs_namespace_t *ns = nNULL;
+    const char *local_path = nNULL;
+    dentry_t *parent = nNULL;
+    dentry_t *existing;
+    char name[VFS_NAME_MAX + 1];
+    Nstatus status;
+
+    if (!path || strlen(path) == 0) {
+        return NinvalidArg;
+    }
+
+    spin_lock(&g_vfs_lock);
+
+    status = resolve_namespace_path(path, &ns, &local_path, false);
+    if (NSTATUS_IS_ERR(status)) {
+        spin_unlock(&g_vfs_lock);
+        return status;
+    }
+
+    status = resolve_parent_ns(ns, local_path, &parent, name, sizeof(name));
+    if (NSTATUS_IS_ERR(status)) {
+        spin_unlock(&g_vfs_lock);
+        return status;
+    }
+
+    if (name[0] == '\0' || !parent) {
+        spin_unlock(&g_vfs_lock);
+        return NinvalidArg;
+    }
+
+    if (!parent->node || !parent->node->ops || !parent->node->ops->unlink) {
+        spin_unlock(&g_vfs_lock);
+        return Nunsupported;
+    }
+
+    status = parent->node->ops->unlink(parent->node, name);
+    if (NSTATUS_IS_ERR(status)) {
+        spin_unlock(&g_vfs_lock);
+        return status;
+    }
+
+    /* dentry 캐시에 남아있으면(예전에 한 번이라도 열어봤으면) 지운다 - 안 그러면
+     * 지운 뒤에도 캐시를 통해 예전 vnode 로 계속 접근할 수 있게 된다 */
+    existing = find_child(parent, name);
+    if (existing) {
+        detach_child(parent, existing);
+        if (existing->node) {
+            vfs_free_vnode(existing->node);
+        }
+        free_dentry(existing);
+    }
+
+    spin_unlock(&g_vfs_lock);
+    return Nok;
+}
+
+Nstatus vfs_readdir(const char *path, u64 index, char *name_out, usize name_out_max, u32 *type_out)
+{
+    dentry_t *target = nNULL;
+    Nstatus status;
+
+    if (!path || !name_out || name_out_max == 0 || !type_out) {
+        return NinvalidArg;
+    }
+
+    status = resolve_path_internal(path, &target);
+    if (NSTATUS_IS_ERR(status)) {
+        return status;
+    }
+
+    if (!target || !target->node || !target->node->ops || !target->node->ops->readdir) {
+        return Nunsupported;
+    }
+
+    return target->node->ops->readdir(target->node, index, name_out, name_out_max, type_out);
+}

@@ -302,6 +302,8 @@ static Nstatus nyfs_bitmap_put(nyfs_volume_t *vol, u64 region_start_block, u64 b
 
 static Nstatus nyfs_flush_superblock(nyfs_volume_t *vol)
 {
+    vol->sb.checksum = 0;
+    vol->sb.checksum = nyfs_crc32(&vol->sb, sizeof(vol->sb));
     return nyfs_raw_write(vol, 0, &vol->sb, sizeof(vol->sb));
 }
 
@@ -407,6 +409,24 @@ static Nstatus nyfs_alloc_inode(nyfs_volume_t *vol, nyfs_ino_t *out_ino)
 
     spin_unlock(&vol->lock);
     return NoutOfMemory;
+}
+
+static Nstatus nyfs_free_inode(nyfs_volume_t *vol, nyfs_ino_t ino)
+{
+    Nstatus status;
+
+    if (!vol || ino == NYFS_INO_NONE || ino >= vol->sb.inode_count) {
+        return NinvalidArg;
+    }
+
+    spin_lock(&vol->lock);
+    status = nyfs_bitmap_put(vol, vol->sb.inode_bitmap_start, (u64)ino, false);
+    if (!NSTATUS_IS_ERR(status)) {
+        vol->sb.free_inode_count++;
+        status = nyfs_flush_superblock(vol);
+    }
+    spin_unlock(&vol->lock);
+    return status;
 }
 
 /* ------------------------------------------------------------------ */
@@ -547,6 +567,62 @@ static Nstatus nyfs_extent_total_blocks(nyfs_volume_t *vol, nyfs_blkno_t root, u
     }
 
     *out_total = total;
+    return Nok;
+}
+
+/* 스트림 전체(데이터 블록 + extent 리스트 블록 자신)를 회수한다. unlink 로
+ * 파일이나 빈 디렉터리를 지울 때 쓴다. 일부만 회수하다 실패해도 이미 회수한
+ * 블록은 되돌리지 않는다 - 저널이 없는 v1 에서는 "일부 회수 후 중단"이 최선이며,
+ * 최소한 이미 지워진 것을 이중 회수하지는 않는다(같은 블록을 두 번 free 하지 않음). */
+static Nstatus nyfs_free_extent_chain(nyfs_volume_t *vol, nyfs_blkno_t root)
+{
+    nyfs_blkno_t cur;
+
+    cur = root;
+
+    while (cur != NYFS_BLKNO_NONE) {
+        nyfs_extent_block_header_t hdr;
+        nyfs_extent_t extents[NYFS_MAX_EXTENTS_PER_BLOCK];
+        nyfs_blkno_t next;
+        Nstatus status;
+        u32 i;
+
+        status = nyfs_raw_read(vol, (u64)cur * vol->block_size, &hdr, sizeof(hdr));
+        if (NSTATUS_IS_ERR(status)) {
+            return status;
+        }
+        if (hdr.magic != NYFS_EXTENT_MAGIC || hdr.extent_count > NYFS_MAX_EXTENTS_PER_BLOCK) {
+            return Ncorrupted;
+        }
+
+        if (hdr.extent_count > 0) {
+            status = nyfs_raw_read(vol, (u64)cur * vol->block_size + sizeof(hdr),
+                                    extents, (usize)hdr.extent_count * sizeof(nyfs_extent_t));
+            if (NSTATUS_IS_ERR(status)) {
+                return status;
+            }
+
+            for (i = 0; i < hdr.extent_count; i++) {
+                u64 j;
+
+                for (j = 0; j < extents[i].length; j++) {
+                    status = nyfs_free_block(vol, extents[i].start_block + j);
+                    if (NSTATUS_IS_ERR(status)) {
+                        return status;
+                    }
+                }
+            }
+        }
+
+        next = hdr.next_block;
+        status = nyfs_free_block(vol, cur);
+        if (NSTATUS_IS_ERR(status)) {
+            return status;
+        }
+
+        cur = next;
+    }
+
     return Nok;
 }
 
@@ -1034,14 +1110,6 @@ static Nstatus nyfs_dirhash_lookup(nyfs_volume_t *vol, const nyfs_inode_t *dir, 
     return NnotFound;
 }
 
-/* 아직 vfs_ops_t 에는 create/mkdir 훅이 없어 이 함수를 호출하는 코드가 지금은
- * 없다. 다음 단계(VFS 에 create/mkdir 을 추가하는 작업)에서 그 구현이 이 함수를
- * 쓰게 된다. 그때까지 -Werror=unused-function 에 걸리지 않도록 GCC 속성으로
- * 표시해 둔다(pack 매크로도 같은 방식으로 컴파일러 확장 기능을 쓰고 있어 이
- * 프로젝트 관례와 맞는다). */
-static Nstatus nyfs_dirhash_insert(nyfs_volume_t *vol, nyfs_inode_t *dir, const char *name,
-                                    nyfs_ino_t ino, u32 file_type) __attribute__((unused));
-
 static Nstatus nyfs_dirhash_insert(nyfs_volume_t *vol, nyfs_inode_t *dir, const char *name,
                                     nyfs_ino_t ino, u32 file_type)
 {
@@ -1126,6 +1194,109 @@ static Nstatus nyfs_dirhash_insert(nyfs_volume_t *vol, nyfs_inode_t *dir, const 
 
     dir->dir_entry_count = hdr.entry_count;
     return Nok;
+}
+
+/* 이름 하나를 체인에서 떼어낸다. 레코드 자체의 바이트는 회수하지 않는다(free_offset
+ * 은 여전히 단순 bump 이므로 - nyfs_dirhash_insert 위의 설명과 같은 이유) - 다만
+ * 체인에서 빠지고 나면 lookup/readdir 어느 쪽으로도 더는 보이지 않으므로 기능적으로는
+ * 완전히 지워진 것과 같다. */
+static Nstatus nyfs_dirhash_remove(nyfs_volume_t *vol, nyfs_inode_t *dir, const char *name)
+{
+    nyfs_dirhash_header_t hdr;
+    usize namelen;
+    u32 hash;
+    u64 bucket_slot_offset;
+    u64 prev_offset;   /* 0 = "아직 없음"(= 지금까지 본 게 버킷 슬롯 자신뿐) */
+    u64 cur;
+    usize got;
+    usize written;
+    nyfs_blkno_t root;   /* &dir->dir_hash_root 를 바로 넘기면 packed 멤버 주소라
+                          * -Werror=address-of-packed-member 에 걸리므로 로컬 변수를 거친다 */
+    Nstatus status;
+
+    if (dir->dir_hash_root == NYFS_BLKNO_NONE) {
+        return NnotFound;
+    }
+    root = dir->dir_hash_root;
+
+    namelen = strlen(name);
+    if (namelen == 0 || namelen > NYFS_NAME_MAX) {
+        return NinvalidArg;
+    }
+
+    status = nyfs_extent_read_at(vol, root, 0, &hdr, sizeof(hdr), &got);
+    if (NSTATUS_IS_ERR(status)) {
+        return status;
+    }
+    if (got != sizeof(hdr) || hdr.magic != NYFS_DIRHASH_MAGIC || hdr.bucket_count == 0) {
+        return Ncorrupted;
+    }
+
+    hash = nyfs_hash_name(name, namelen);
+    bucket_slot_offset = (u64)sizeof(hdr) + (u64)(hash % hdr.bucket_count) * sizeof(u64);
+
+    status = nyfs_extent_read_at(vol, root, bucket_slot_offset, &cur, sizeof(cur), &got);
+    if (NSTATUS_IS_ERR(status)) {
+        return status;
+    }
+
+    prev_offset = 0;
+
+    while (cur != 0) {
+        nyfs_dirent_t de;
+
+        status = nyfs_extent_read_at(vol, root, cur, &de, sizeof(de), &got);
+        if (NSTATUS_IS_ERR(status)) {
+            return status;
+        }
+        if (got != sizeof(de)) {
+            return Ncorrupted;
+        }
+
+        if (de.name_hash == hash && (usize)de.name_len == namelen) {
+            char namebuf[NYFS_NAME_MAX + 1U];
+
+            status = nyfs_extent_read_at(vol, root, cur + sizeof(de), namebuf, namelen, &got);
+            if (NSTATUS_IS_ERR(status)) {
+                return status;
+            }
+            namebuf[namelen] = '\0';
+
+            if (memcmp(namebuf, name, namelen) == 0) {
+                u64 next = de.next_offset;
+
+                if (prev_offset == 0) {
+                    status = nyfs_extent_write_at(vol, &root, bucket_slot_offset,
+                                                   &next, sizeof(next), &written);
+                } else {
+                    /* 이전 dirent 의 next_offset 필드(레코드 시작에서 8바이트 뒤, ino
+                     * 바로 다음)만 고쳐 쓴다 - 레코드 전체를 다시 쓸 필요는 없다 */
+                    status = nyfs_extent_write_at(vol, &root,
+                                                   prev_offset + sizeof(u64),
+                                                   &next, sizeof(next), &written);
+                }
+                dir->dir_hash_root = root;
+                if (NSTATUS_IS_ERR(status)) {
+                    return status;
+                }
+
+                hdr.entry_count--;
+                status = nyfs_extent_write_at(vol, &root, 0, &hdr, sizeof(hdr), &written);
+                dir->dir_hash_root = root;
+                if (NSTATUS_IS_ERR(status)) {
+                    return status;
+                }
+
+                dir->dir_entry_count = hdr.entry_count;
+                return Nok;
+            }
+        }
+
+        prev_offset = cur;
+        cur = de.next_offset;
+    }
+
+    return NnotFound;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1369,6 +1540,393 @@ static Nstatus nyfs_stat(vnode_t *vnode, vfs_stat_t *out)
     return Nok;
 }
 
+static Nstatus nyfs_create(vnode_t *dir, const char *name, u32 mode, vnode_t **out_vnode)
+{
+    nyfs_vnode_data_t *dirdata;
+    nyfs_inode_t dir_inode;
+    nyfs_inode_t new_inode;
+    nyfs_cred_t cred;
+    nyfs_ino_t new_ino;
+    nyfs_ino_t existing_ino;
+    u32 existing_type;
+    vnode_t *child;
+    nyfs_vnode_data_t *childdata;
+    Nstatus status;
+
+    if (!dir || !name || !out_vnode) {
+        return NinvalidArg;
+    }
+
+    dirdata = (nyfs_vnode_data_t *)vfs_get_vnode_private(dir);
+    if (!dirdata || !dirdata->vol) {
+        return NinvalidArg;
+    }
+    if (!dirdata->vol->write) {
+        return NreadOnly;
+    }
+
+    status = nyfs_read_inode(dirdata->vol, dirdata->ino, &dir_inode);
+    if (NSTATUS_IS_ERR(status)) {
+        return status;
+    }
+    if (dir_inode.type != NYFS_INO_TYPE_DIR) {
+        return Nunsupported;
+    }
+
+    nyfs_current_cred(&cred);
+    status = nyfs_check_access(dirdata->vol, &dir_inode, &cred, NYFS_ACE_WRITE_DATA);
+    if (NSTATUS_IS_ERR(status)) {
+        return status;
+    }
+
+    /* vfs_create() 에는 O_EXCL 같은 플래그가 없으니 항상 "이미 있으면 거부"로 동작한다 */
+    status = nyfs_dirhash_lookup(dirdata->vol, &dir_inode, name, &existing_ino, &existing_type);
+    if (!NSTATUS_IS_ERR(status)) {
+        return NalreadyExists;
+    }
+    if (status != NnotFound) {
+        return status;
+    }
+
+    status = nyfs_alloc_inode(dirdata->vol, &new_ino);
+    if (NSTATUS_IS_ERR(status)) {
+        return status;
+    }
+
+    memset(&new_inode, 0, sizeof(new_inode));
+    new_inode.ino = new_ino;
+    new_inode.type = NYFS_INO_TYPE_FILE;
+    new_inode.unix_mode = (u16)(mode & 0x0FFFU);   /* rwxrwxrwx + set-uid/set-gid/sticky (12비트) */
+    new_inode.uid = cred.uid;
+    new_inode.gid = cred.gid;
+    new_inode.link_count = 1;
+
+    status = nyfs_write_inode(dirdata->vol, new_ino, &new_inode);
+    if (NSTATUS_IS_ERR(status)) {
+        (void)nyfs_free_inode(dirdata->vol, new_ino);
+        return status;
+    }
+
+    status = nyfs_dirhash_insert(dirdata->vol, &dir_inode, name, new_ino, NYFS_DIRENT_TYPE_FILE);
+    if (NSTATUS_IS_ERR(status)) {
+        (void)nyfs_free_inode(dirdata->vol, new_ino);
+        return status;
+    }
+
+    /* dirhash_insert 가 dir_inode.dir_hash_root/dir_entry_count 를 바꿨을 수 있으니
+     * 디렉터리 inode 를 다시 써서 반영한다 */
+    status = nyfs_write_inode(dirdata->vol, dirdata->ino, &dir_inode);
+    if (NSTATUS_IS_ERR(status)) {
+        return status;
+    }
+
+    child = vfs_alloc_vnode();
+    if (!child) {
+        return NoutOfMemory;
+    }
+
+    childdata = nyfs_alloc_vnode_data();
+    if (!childdata) {
+        vfs_free_vnode(child);
+        return NoutOfMemory;
+    }
+    childdata->vol = dirdata->vol;
+    childdata->ino = new_ino;
+
+    status = vfs_init_vnode(child, new_ino, 1U, &g_nyfs_ops, nNULL, childdata);
+    if (NSTATUS_IS_ERR(status)) {
+        nyfs_free_vnode_data(childdata);
+        vfs_free_vnode(child);
+        return status;
+    }
+
+    *out_vnode = child;
+    return Nok;
+}
+
+static Nstatus nyfs_mkdir(vnode_t *dir, const char *name, u32 mode, vnode_t **out_vnode)
+{
+    nyfs_vnode_data_t *dirdata;
+    nyfs_inode_t dir_inode;
+    nyfs_inode_t new_inode;
+    nyfs_cred_t cred;
+    nyfs_ino_t new_ino;
+    nyfs_ino_t existing_ino;
+    u32 existing_type;
+    vnode_t *child;
+    nyfs_vnode_data_t *childdata;
+    Nstatus status;
+
+    if (!dir || !name || !out_vnode) {
+        return NinvalidArg;
+    }
+
+    dirdata = (nyfs_vnode_data_t *)vfs_get_vnode_private(dir);
+    if (!dirdata || !dirdata->vol) {
+        return NinvalidArg;
+    }
+    if (!dirdata->vol->write) {
+        return NreadOnly;
+    }
+
+    status = nyfs_read_inode(dirdata->vol, dirdata->ino, &dir_inode);
+    if (NSTATUS_IS_ERR(status)) {
+        return status;
+    }
+    if (dir_inode.type != NYFS_INO_TYPE_DIR) {
+        return Nunsupported;
+    }
+
+    nyfs_current_cred(&cred);
+    status = nyfs_check_access(dirdata->vol, &dir_inode, &cred, NYFS_ACE_WRITE_DATA);
+    if (NSTATUS_IS_ERR(status)) {
+        return status;
+    }
+
+    status = nyfs_dirhash_lookup(dirdata->vol, &dir_inode, name, &existing_ino, &existing_type);
+    if (!NSTATUS_IS_ERR(status)) {
+        return NalreadyExists;
+    }
+    if (status != NnotFound) {
+        return status;
+    }
+
+    status = nyfs_alloc_inode(dirdata->vol, &new_ino);
+    if (NSTATUS_IS_ERR(status)) {
+        return status;
+    }
+
+    memset(&new_inode, 0, sizeof(new_inode));
+    new_inode.ino = new_ino;
+    new_inode.type = NYFS_INO_TYPE_DIR;
+    new_inode.unix_mode = (u16)(mode & 0x0FFFU);
+    new_inode.uid = cred.uid;
+    new_inode.gid = cred.gid;
+    new_inode.link_count = 1;
+
+    status = nyfs_dirhash_create(dirdata->vol, &new_inode);
+    if (NSTATUS_IS_ERR(status)) {
+        (void)nyfs_free_inode(dirdata->vol, new_ino);
+        return status;
+    }
+
+    status = nyfs_write_inode(dirdata->vol, new_ino, &new_inode);
+    if (NSTATUS_IS_ERR(status)) {
+        (void)nyfs_free_inode(dirdata->vol, new_ino);
+        return status;
+    }
+
+    status = nyfs_dirhash_insert(dirdata->vol, &dir_inode, name, new_ino, NYFS_DIRENT_TYPE_DIR);
+    if (NSTATUS_IS_ERR(status)) {
+        (void)nyfs_free_inode(dirdata->vol, new_ino);
+        return status;
+    }
+
+    status = nyfs_write_inode(dirdata->vol, dirdata->ino, &dir_inode);
+    if (NSTATUS_IS_ERR(status)) {
+        return status;
+    }
+
+    child = vfs_alloc_vnode();
+    if (!child) {
+        return NoutOfMemory;
+    }
+
+    childdata = nyfs_alloc_vnode_data();
+    if (!childdata) {
+        vfs_free_vnode(child);
+        return NoutOfMemory;
+    }
+    childdata->vol = dirdata->vol;
+    childdata->ino = new_ino;
+
+    status = vfs_init_vnode(child, new_ino, 2U, &g_nyfs_ops, nNULL, childdata);
+    if (NSTATUS_IS_ERR(status)) {
+        nyfs_free_vnode_data(childdata);
+        vfs_free_vnode(child);
+        return status;
+    }
+
+    *out_vnode = child;
+    return Nok;
+}
+
+static Nstatus nyfs_unlink(vnode_t *dir, const char *name)
+{
+    nyfs_vnode_data_t *dirdata;
+    nyfs_inode_t dir_inode;
+    nyfs_inode_t target_inode;
+    nyfs_cred_t cred;
+    nyfs_ino_t target_ino;
+    u32 target_type;
+    Nstatus status;
+
+    if (!dir || !name) {
+        return NinvalidArg;
+    }
+
+    dirdata = (nyfs_vnode_data_t *)vfs_get_vnode_private(dir);
+    if (!dirdata || !dirdata->vol) {
+        return NinvalidArg;
+    }
+    if (!dirdata->vol->write) {
+        return NreadOnly;
+    }
+
+    status = nyfs_read_inode(dirdata->vol, dirdata->ino, &dir_inode);
+    if (NSTATUS_IS_ERR(status)) {
+        return status;
+    }
+    if (dir_inode.type != NYFS_INO_TYPE_DIR) {
+        return Nunsupported;
+    }
+
+    nyfs_current_cred(&cred);
+    status = nyfs_check_access(dirdata->vol, &dir_inode, &cred, NYFS_ACE_DELETE_CHILD);
+    if (NSTATUS_IS_ERR(status)) {
+        return status;
+    }
+
+    status = nyfs_dirhash_lookup(dirdata->vol, &dir_inode, name, &target_ino, &target_type);
+    if (NSTATUS_IS_ERR(status)) {
+        return status;
+    }
+
+    status = nyfs_read_inode(dirdata->vol, target_ino, &target_inode);
+    if (NSTATUS_IS_ERR(status)) {
+        return status;
+    }
+
+    if (target_inode.type == NYFS_INO_TYPE_DIR && target_inode.dir_entry_count > 0) {
+        /* "디렉터리가 비어있지 않음" 전용 에러 코드가 없어 Nbusy 로 대신한다 -
+         * 연산 자체는 지원하지만(Nunsupported 가 아니라) 지금 상태에서는 거부한다는 뜻 */
+        return Nbusy;
+    }
+
+    status = nyfs_dirhash_remove(dirdata->vol, &dir_inode, name);
+    if (NSTATUS_IS_ERR(status)) {
+        return status;
+    }
+
+    status = nyfs_write_inode(dirdata->vol, dirdata->ino, &dir_inode);
+    if (NSTATUS_IS_ERR(status)) {
+        return status;
+    }
+
+    if (target_inode.link_count > 0) {
+        target_inode.link_count--;
+    }
+
+    if (target_inode.link_count == 0) {
+        /* 저널이 없어 아래 두 회수가 중간에 끊기면 블록이 새는(leak) 상태로 남을 수
+         * 있다 - 저널을 붙일 때 반드시 같이 다뤄야 할 지점이다(파일 상단 주석 참고) */
+        if (target_inode.type == NYFS_INO_TYPE_DIR) {
+            (void)nyfs_free_extent_chain(dirdata->vol, target_inode.dir_hash_root);
+        }
+        (void)nyfs_free_extent_chain(dirdata->vol, target_inode.data_extent_root);
+        (void)nyfs_free_inode(dirdata->vol, target_ino);
+    } else {
+        (void)nyfs_write_inode(dirdata->vol, target_ino, &target_inode);
+    }
+
+    return Nok;
+}
+
+static Nstatus nyfs_readdir(vnode_t *dir, u64 index, char *name_out, usize name_out_max, u32 *type_out)
+{
+    nyfs_vnode_data_t *dirdata;
+    nyfs_inode_t dir_inode;
+    nyfs_cred_t cred;
+    nyfs_dirhash_header_t hdr;
+    usize got;
+    u64 seen;
+    u32 b;
+    Nstatus status;
+
+    if (!dir || !name_out || name_out_max == 0 || !type_out) {
+        return NinvalidArg;
+    }
+
+    dirdata = (nyfs_vnode_data_t *)vfs_get_vnode_private(dir);
+    if (!dirdata || !dirdata->vol) {
+        return NinvalidArg;
+    }
+
+    status = nyfs_read_inode(dirdata->vol, dirdata->ino, &dir_inode);
+    if (NSTATUS_IS_ERR(status)) {
+        return status;
+    }
+    if (dir_inode.type != NYFS_INO_TYPE_DIR) {
+        return Nunsupported;
+    }
+
+    nyfs_current_cred(&cred);
+    status = nyfs_check_access(dirdata->vol, &dir_inode, &cred, NYFS_ACE_READ_DATA);
+    if (NSTATUS_IS_ERR(status)) {
+        return status;
+    }
+
+    if (dir_inode.dir_hash_root == NYFS_BLKNO_NONE) {
+        return NnotFound;
+    }
+
+    status = nyfs_extent_read_at(dirdata->vol, dir_inode.dir_hash_root, 0, &hdr, sizeof(hdr), &got);
+    if (NSTATUS_IS_ERR(status)) {
+        return status;
+    }
+    if (got != sizeof(hdr) || hdr.magic != NYFS_DIRHASH_MAGIC || hdr.bucket_count == 0) {
+        return Ncorrupted;
+    }
+
+    seen = 0;
+    for (b = 0; b < hdr.bucket_count; b++) {
+        u64 bucket_off;
+        u64 cur;
+
+        status = nyfs_extent_read_at(dirdata->vol, dir_inode.dir_hash_root,
+                                      (u64)sizeof(hdr) + (u64)b * sizeof(u64),
+                                      &bucket_off, sizeof(bucket_off), &got);
+        if (NSTATUS_IS_ERR(status)) {
+            return status;
+        }
+
+        cur = bucket_off;
+        while (cur != 0) {
+            nyfs_dirent_t de;
+
+            status = nyfs_extent_read_at(dirdata->vol, dir_inode.dir_hash_root, cur, &de, sizeof(de), &got);
+            if (NSTATUS_IS_ERR(status)) {
+                return status;
+            }
+            if (got != sizeof(de)) {
+                return Ncorrupted;
+            }
+
+            if (seen == index) {
+                usize copy_len = (usize)de.name_len;
+
+                if (copy_len >= name_out_max) {
+                    copy_len = name_out_max - 1U;
+                }
+
+                status = nyfs_extent_read_at(dirdata->vol, dir_inode.dir_hash_root, cur + sizeof(de),
+                                              name_out, copy_len, &got);
+                if (NSTATUS_IS_ERR(status)) {
+                    return status;
+                }
+                name_out[copy_len] = '\0';
+                *type_out = de.file_type;
+                return Nok;
+            }
+
+            seen++;
+            cur = de.next_offset;
+        }
+    }
+
+    return NnotFound;
+}
+
 /* ------------------------------------------------------------------ */
 /* mount / unmount / format                                            */
 /* ------------------------------------------------------------------ */
@@ -1602,7 +2160,7 @@ Nstatus nyfs_format(u32 diskno, void *userdata)
 
     vol.sb = sb;
 
-    status = nyfs_raw_write(&vol, 0, &sb, sizeof(sb));
+    status = nyfs_flush_superblock(&vol);
     if (NSTATUS_IS_ERR(status)) {
         return status;
     }
@@ -1680,8 +2238,9 @@ Nstatus nyfs_format(u32 diskno, void *userdata)
     }
 
     /* 위 단계들에서 vol.sb.free_blocks/free_inode_count 가 바뀌었으니 최신 값으로
-     * 슈퍼블록을 다시 쓴다(각 alloc 호출이 이미 썼겠지만, 안전하게 한 번 더) */
-    return nyfs_raw_write(&vol, 0, &vol.sb, sizeof(vol.sb));
+     * 슈퍼블록을 다시 쓴다(각 alloc 호출이 이미 썼겠지만, 안전하게 한 번 더 -
+     * nyfs_flush_superblock 을 거쳐야 체크섬도 같이 갱신된다) */
+    return nyfs_flush_superblock(&vol);
 }
 
 Nstatus nyfs_register(void)
@@ -1695,6 +2254,10 @@ Nstatus nyfs_register(void)
     g_nyfs_ops.write = nyfs_write;
     g_nyfs_ops.close = nyfs_close;
     g_nyfs_ops.stat = nyfs_stat;
+    g_nyfs_ops.create = nyfs_create;
+    g_nyfs_ops.mkdir = nyfs_mkdir;
+    g_nyfs_ops.unlink = nyfs_unlink;
+    g_nyfs_ops.readdir = nyfs_readdir;
 
     ops.mount = nyfs_mount;
     ops.unmount = nyfs_unmount;

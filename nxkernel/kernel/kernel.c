@@ -29,6 +29,7 @@
 #include "drivers/ramdisk/ramdisk.h"
 #include "drivers/filesystem/vfs.h"
 #include "drivers/filesystem/fat16/fat16.h"
+#include "drivers/filesystem/nyfs/nyfs.h"
 #include "drivers/pic/pic.h"
 #include "kernel/boot/multiboot2.h"
 #include "kernel/syscall/syscall.h"
@@ -36,6 +37,7 @@
 #include "phys.h"
 #include "interrupt.h"
 #include "memory.h"
+#include "string.h"
 #include "nyxis.h"
 
 /* 멀티코어 여부 (현재는 BSP 만 사용) */
@@ -227,6 +229,121 @@ static void probe_first_app(void)
 }
 
 /*
+ * nyfs 스모크 테스트: 커널 이미지 안에 예약해 둔 1MiB 짜리 메모리 영역을 램디스크
+ * (diskno=1 - initrd 가 이미 0을 쓰고 있다)로 등록하고, 그 위에 nyfs 를 mkfs 한 뒤
+ * mount, mkdir, create, write, read, readdir, unlink 를 순서대로 실제로 실행해본다.
+ * 실패해도 AHCI 와 같은 방식으로 경고만 남기고 부팅은 계속한다 - 이건 어디까지나
+ * "새로 만든 파일시스템이 최소한 동작은 한다"를 확인하는 용도다.
+ */
+#define NYFS_TEST_RAMDISK_DISKNO  1U
+#define NYFS_TEST_RAMDISK_SIZE    (1024U * 1024U)   /* 1 MiB */
+#define NYFS_TEST_BLOCK_SHIFT     12U                /* 4 KiB 블록 */
+
+static u8 g_nyfs_test_ramdisk[NYFS_TEST_RAMDISK_SIZE] __attribute__((aligned(4096)));
+
+static void test_nyfs(NTBLI *info)
+{
+    nyfs_mount_params_t params;
+    Nstatus status;
+    handle_t h;
+    char readback[64];
+    usize done;
+    const char *payload = "hello from nyfs\n";
+    u64 idx;
+    char entry_name[64];
+    u32 entry_type;
+
+    status = ramdisk_init(NYFS_TEST_RAMDISK_DISKNO, (usize)g_nyfs_test_ramdisk,
+                           NYFS_TEST_RAMDISK_SIZE, info);
+    if (NSTATUS_IS_ERR(status)) {
+        printk("nyfs test: ramdisk init failed: %r\n", status);
+        return;
+    }
+
+    memset(&params, 0, sizeof(params));
+    params.info = info;
+    params.read = ramdisk_read;
+    params.write = ramdisk_write;
+    params.total_blocks = NYFS_TEST_RAMDISK_SIZE / (1U << NYFS_TEST_BLOCK_SHIFT);
+    params.inode_count = 0;   /* 자동 */
+    params.block_size_shift = (u8)NYFS_TEST_BLOCK_SHIFT;
+
+    status = nyfs_format(NYFS_TEST_RAMDISK_DISKNO, &params);
+    if (NSTATUS_IS_ERR(status)) {
+        printk("nyfs test: format failed: %r\n", status);
+        return;
+    }
+
+    params.mount_path = "nyfs:/";
+    status = nyfs_mount(NYFS_TEST_RAMDISK_DISKNO, &params);
+    if (NSTATUS_IS_ERR(status)) {
+        printk("nyfs test: mount failed: %r\n", status);
+        return;
+    }
+
+    status = vfs_mkdir("nyfs:/hello", 0755);
+    if (NSTATUS_IS_ERR(status)) {
+        printk("nyfs test: mkdir failed: %r\n", status);
+        return;
+    }
+
+    status = vfs_create("nyfs:/hello/world.txt", 0644);
+    if (NSTATUS_IS_ERR(status)) {
+        printk("nyfs test: create failed: %r\n", status);
+        return;
+    }
+
+    status = vfs_open("nyfs:/hello/world.txt", NX_O_WRITE, &h);
+    if (NSTATUS_IS_ERR(status)) {
+        printk("nyfs test: open(write) failed: %r\n", status);
+        return;
+    }
+    status = vfs_write(&h, payload, strlen(payload), &done);
+    (void)vfs_close(&h);
+    if (NSTATUS_IS_ERR(status) || done != strlen(payload)) {
+        printk("nyfs test: write failed: %r\n", status);
+        return;
+    }
+
+    status = vfs_open("nyfs:/hello/world.txt", NX_O_READ, &h);
+    if (NSTATUS_IS_ERR(status)) {
+        printk("nyfs test: open(read) failed: %r\n", status);
+        return;
+    }
+    status = vfs_read(&h, readback, sizeof(readback) - 1U, &done);
+    (void)vfs_close(&h);
+    if (NSTATUS_IS_ERR(status)) {
+        printk("nyfs test: read failed: %r\n", status);
+        return;
+    }
+    readback[done] = '\0';
+    printk("nyfs test: read back %lu bytes: %s", (unsigned long)done, readback);
+
+    printk("nyfs test: nyfs:/hello listing:\n");
+    idx = 0;
+    for (;;) {
+        status = vfs_readdir("nyfs:/hello", idx, entry_name, sizeof(entry_name), &entry_type);
+        if (status == NnotFound) {
+            break;
+        }
+        if (NSTATUS_IS_ERR(status)) {
+            printk("nyfs test: readdir failed: %r\n", status);
+            break;
+        }
+        printk("  - %s (type=%u)\n", entry_name, (unsigned int)entry_type);
+        idx++;
+    }
+
+    status = vfs_unlink("nyfs:/hello/world.txt");
+    if (NSTATUS_IS_ERR(status)) {
+        printk("nyfs test: unlink failed: %r\n", status);
+        return;
+    }
+
+    printk("nyfs test: all steps completed\n");
+}
+
+/*
  * ring3 로 진입한다. iretq 프레임: ss, rsp, rflags, cs, rip 순서로 push.
  * 주의: 유저 주소 공간이 준비되지 않은 현재는 사용할 수 없다 (미검증).
  */
@@ -327,12 +444,18 @@ void kernel_main(u32 boot_kind, u64 boot_info_phys)
     if (NSTATUS_IS_ERR(status))
         fatal(status, "Failed to register FAT16 file system");
 
+    status = nyfs_register();
+    if (NSTATUS_IS_ERR(status))
+        fatal(status, "Failed to register nyfs file system");
+
     if (g_boot_info.initrd_base && g_boot_info.initrd_size) {
         mount_initrd(&g_boot_info);
         probe_first_app();
     } else {
         printk("No initrd loaded\n");
     }
+
+    test_nyfs(&g_boot_info);
 
     /* 8. 저장장치 (없어도 계속 부팅) */
     status = ahci_init();
