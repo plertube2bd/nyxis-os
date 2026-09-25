@@ -1178,3 +1178,106 @@ Nstatus vfs_readdir(const char *path, u64 index, char *name_out, usize name_out_
 
     return target->node->ops->readdir(target->node, index, name_out, name_out_max, type_out);
 }
+
+Nstatus vfs_rename(const char *old_path, const char *new_path)
+{
+    vfs_namespace_t *old_ns = nNULL;
+    vfs_namespace_t *new_ns = nNULL;
+    const char *old_local = nNULL;
+    const char *new_local = nNULL;
+    dentry_t *old_parent = nNULL;
+    dentry_t *new_parent = nNULL;
+    dentry_t *existing_old;
+    dentry_t *existing_new;
+    char old_name[VFS_NAME_MAX + 1];
+    char new_name[VFS_NAME_MAX + 1];
+    dentry_t *walk;
+    Nstatus status;
+
+    if (!old_path || !new_path || strlen(old_path) == 0 || strlen(new_path) == 0) {
+        return NinvalidArg;
+    }
+
+    spin_lock(&g_vfs_lock);
+
+    status = resolve_namespace_path(old_path, &old_ns, &old_local, false);
+    if (NSTATUS_IS_ERR(status)) {
+        spin_unlock(&g_vfs_lock);
+        return status;
+    }
+    status = resolve_namespace_path(new_path, &new_ns, &new_local, false);
+    if (NSTATUS_IS_ERR(status)) {
+        spin_unlock(&g_vfs_lock);
+        return status;
+    }
+
+    if (old_ns != new_ns) {
+        /* 서로 다른 네임스페이스 사이의 rename 은 지원하지 않는다(cp+rm 이 필요) */
+        spin_unlock(&g_vfs_lock);
+        return Nunsupported;
+    }
+
+    status = resolve_parent_ns(old_ns, old_local, &old_parent, old_name, sizeof(old_name));
+    if (NSTATUS_IS_ERR(status)) {
+        spin_unlock(&g_vfs_lock);
+        return status;
+    }
+    status = resolve_parent_ns(new_ns, new_local, &new_parent, new_name, sizeof(new_name));
+    if (NSTATUS_IS_ERR(status)) {
+        spin_unlock(&g_vfs_lock);
+        return status;
+    }
+
+    if (old_name[0] == '\0' || new_name[0] == '\0' || !old_parent || !new_parent) {
+        spin_unlock(&g_vfs_lock);
+        return NinvalidArg;
+    }
+
+    if (!old_parent->node || !old_parent->node->ops || !old_parent->node->ops->rename) {
+        spin_unlock(&g_vfs_lock);
+        return Nunsupported;
+    }
+
+    /* dentry 캐시에 있는 한도 안에서만 순환(옮기려는 디렉터리 자신의 하위로
+     * 옮기기)을 막는다 - 캐시에 없는 조상까지는 이 계층에서 못 잡는다. 나머지는
+     * 아래 드라이버가 자기 계층에서 잡을 수 있는 만큼만 잡는다(nyfs 는 "자기 자신
+     * 위로" 만 잡는다 - 파일 자체 주석 참고). */
+    existing_old = find_child(old_parent, old_name);
+    if (existing_old) {
+        for (walk = new_parent; walk; walk = walk->parent) {
+            if (walk == existing_old) {
+                spin_unlock(&g_vfs_lock);
+                return NinvalidArg;
+            }
+        }
+    }
+
+    status = old_parent->node->ops->rename(old_parent->node, old_name, new_parent->node, new_name);
+    if (NSTATUS_IS_ERR(status)) {
+        spin_unlock(&g_vfs_lock);
+        return status;
+    }
+
+    /* dentry 캐시 갱신: old 쪽 이름은 떼어내고, new 쪽 이름으로 옮겨 붙인다 */
+    existing_new = find_child(new_parent, new_name);
+    if (existing_new) {
+        /* v1 드라이버는 덮어쓰기 rename 자체를 거부하므로 정상적으로는 여기 오지
+         * 않지만, 방어적으로 캐시에 남은 자리를 치운다 */
+        detach_child(new_parent, existing_new);
+        if (existing_new->node) {
+            vfs_free_vnode(existing_new->node);
+        }
+        free_dentry(existing_new);
+    }
+
+    if (existing_old) {
+        detach_child(old_parent, existing_old);
+        strncpy(existing_old->name, new_name, VFS_NAME_MAX);
+        existing_old->name[VFS_NAME_MAX] = '\0';
+        existing_old->parent = new_parent;
+        attach_child(new_parent, existing_old);
+    }
+
+    spin_unlock(&g_vfs_lock);
+    return Nok;
+}

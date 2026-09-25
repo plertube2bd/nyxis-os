@@ -334,7 +334,40 @@ static void test_nyfs(NTBLI *info)
         idx++;
     }
 
-    status = vfs_unlink("nyfs:/hello/world.txt");
+    /* rename: 같은 디렉터리 안에서 이름 바꾸기 */
+    status = vfs_rename("nyfs:/hello/world.txt", "nyfs:/hello/renamed.txt");
+    if (NSTATUS_IS_ERR(status)) {
+        printk("nyfs test: rename(same dir) failed: %r\n", status);
+        return;
+    }
+
+    /* rename: 다른 디렉터리로 옮기기 */
+    status = vfs_mkdir("nyfs:/moved", 0755);
+    if (NSTATUS_IS_ERR(status)) {
+        printk("nyfs test: mkdir(moved) failed: %r\n", status);
+        return;
+    }
+    status = vfs_rename("nyfs:/hello/renamed.txt", "nyfs:/moved/final.txt");
+    if (NSTATUS_IS_ERR(status)) {
+        printk("nyfs test: rename(cross dir) failed: %r\n", status);
+        return;
+    }
+
+    status = vfs_open("nyfs:/moved/final.txt", NX_O_READ, &h);
+    if (NSTATUS_IS_ERR(status)) {
+        printk("nyfs test: open after rename failed: %r\n", status);
+        return;
+    }
+    status = vfs_read(&h, readback, sizeof(readback) - 1U, &done);
+    (void)vfs_close(&h);
+    if (NSTATUS_IS_ERR(status)) {
+        printk("nyfs test: read after rename failed: %r\n", status);
+        return;
+    }
+    readback[done] = '\0';
+    printk("nyfs test: after rename, nyfs:/moved/final.txt = %s", readback);
+
+    status = vfs_unlink("nyfs:/moved/final.txt");
     if (NSTATUS_IS_ERR(status)) {
         printk("nyfs test: unlink failed: %r\n", status);
         return;

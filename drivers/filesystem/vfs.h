@@ -41,6 +41,11 @@ typedef struct vfs_ops {
     /* index 번째(0부터) 자식의 이름을 name_out 에 채운다. index 가 자식 수 이상이면
      * NnotFound 로 "더 이상 없음"을 알린다. */
     Nstatus (*readdir)(vnode_t *dir, u64 index, char *name_out, usize name_out_max, u32 *type_out);
+
+    /* 같은 파일시스템 안에서만 지원한다(old_dir/new_dir 은 반드시 같은 마운트에
+     * 속해야 한다 - 드라이버가 이를 검사한다). new_name 이 이미 있으면 거부한다
+     * (v1 은 덮어쓰기 rename 을 지원하지 않는다 - 필요하면 먼저 unlink 한다). */
+    Nstatus (*rename)(vnode_t *old_dir, const char *old_name, vnode_t *new_dir, const char *new_name);
 } vfs_ops_t;
 
 struct vfs_filesystem {
@@ -88,6 +93,11 @@ Nstatus vfs_unlink(const char *path);
  * index 가 자식 수 이상이면 NnotFound ("더 이상 없음"). 호출자는 index 를 0부터
  * 하나씩 늘려가며 NnotFound 가 나올 때까지 반복 호출해서 목록 전체를 얻는다. */
 Nstatus vfs_readdir(const char *path, u64 index, char *name_out, usize name_out_max, u32 *type_out);
+
+/* old_path 를 new_path 로 옮기거나 이름을 바꾼다. 서로 다른 네임스페이스 사이의
+ * rename 은 지원하지 않는다(Nunsupported). new_path 가 이미 있으면 NalreadyExists
+ * (v1 은 덮어쓰기 rename 을 지원하지 않는다). */
+Nstatus vfs_rename(const char *old_path, const char *new_path);
 
 /*
  * src 와 같은 파일을 새로 열어 dst 에 넣는다. 오프셋/플래그는 복사되지만 이후에는 서로 독립이다.
