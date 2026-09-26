@@ -71,7 +71,8 @@ typedef enum {
     NreadOnly         = -31,
     NdiskFull         = -32,
     NbadFilesystem    = -33,
-    NnameTooLong      = -34
+    NnameTooLong      = -34,
+    Noverflow         = -8
 } nyfs_status_t;
 
 #define NSTATUS_IS_ERR(x) ((x) != Nok)

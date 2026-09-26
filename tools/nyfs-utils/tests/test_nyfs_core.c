@@ -116,6 +116,102 @@ int main(void)
         CHECK(status == Npermission, "다른 uid 읽기 거부(0600)");
     }
 
+    /* rename: 같은 디렉터리 안에서 이름 바꾸기, 다른 디렉터리로 옮기기,
+     * 이미 있는 이름으로는 거부, 디렉터리를 자기 자신 위로 옮기는 순환
+     * 거부까지 확인한다. */
+    {
+        nyfs_ino_t moved_ino;
+        nyfs_ino_t moved2_ino;
+        nyfs_ino_t dir2_ino;
+
+        status = nyfs_op_rename(&vol, NYFS_ROOT_INO, "hello.txt", NYFS_ROOT_INO, "renamed.txt", &root_cred);
+        CHECK(status == Nok, "같은 디렉터리 안에서 rename");
+
+        status = nyfs_path_lookup(&vol, "/hello.txt", &root_cred, &looked_up);
+        CHECK(status == NnotFound, "옛 이름은 더 이상 없음");
+
+        status = nyfs_path_lookup(&vol, "/renamed.txt", &root_cred, &moved_ino);
+        CHECK(status == Nok, "새 이름으로 찾을 수 있음");
+
+        status = nyfs_op_write(&vol, moved_ino, &root_cred, 0, "x", 1, &n);
+        CHECK(status == Nok, "rename 후에도 같은 inode 라 쓰기 가능(내용 보존 확인용)");
+
+        status = nyfs_op_rename(&vol, NYFS_ROOT_INO, "renamed.txt", dir_ino, "moved.txt", &root_cred);
+        CHECK(status == Nok, "다른 디렉터리로 rename");
+
+        status = nyfs_path_lookup(&vol, "/renamed.txt", &root_cred, &looked_up);
+        CHECK(status == NnotFound, "루트에는 더 이상 없음");
+
+        status = nyfs_path_lookup(&vol, "/subdir/moved.txt", &root_cred, &moved2_ino);
+        CHECK(status == Nok && moved2_ino == moved_ino, "subdir 안에서 같은 inode 로 찾음");
+
+        status = nyfs_op_create(&vol, NYFS_ROOT_INO, "already.txt", 0644, &root_cred, &looked_up);
+        CHECK(status == Nok, "already.txt 준비");
+        status = nyfs_op_rename(&vol, dir_ino, "moved.txt", NYFS_ROOT_INO, "already.txt", &root_cred);
+        CHECK(status == NalreadyExists, "이미 있는 이름으로 rename 하면 거부(덮어쓰기 미지원)");
+
+        status = nyfs_op_mkdir(&vol, dir_ino, "childdir", 0755, &root_cred, &dir2_ino);
+        CHECK(status == Nok, "순환 테스트용 하위 디렉터리 생성");
+        status = nyfs_op_rename(&vol, NYFS_ROOT_INO, "subdir", dir_ino, "self", &root_cred);
+        CHECK(status == NinvalidArg, "디렉터리를 자기 자신 위로 옮기는 순환 거부");
+
+        /* 원상 복구(이후 unlink/rmdir 검증이 기대하는 이름으로) */
+        status = nyfs_op_remove(&vol, NYFS_ROOT_INO, "already.txt", &root_cred, nfalse);
+        CHECK(status == Nok, "already.txt 정리");
+        status = nyfs_op_remove(&vol, dir_ino, "childdir", &root_cred, ntrue);
+        CHECK(status == Nok, "childdir 정리");
+        status = nyfs_op_rename(&vol, dir_ino, "moved.txt", NYFS_ROOT_INO, "hello.txt", &root_cred);
+        CHECK(status == Nok, "이후 검증을 위해 hello.txt 로 다시 되돌림");
+    }
+
+    /* ACL 상속: 부모 디렉터리에 INHERIT_FILE ACE 를 하나 넣고 파일을
+     * 만들면 자식이 그 ACE 를 상속받는지 확인한다(NTFS 관례). */
+    {
+        nyfs_inode_t parent_inode;
+        nyfs_inode_t child_inode;
+        nyfs_ino_t acl_dir_ino;
+        nyfs_ino_t child_ino;
+        usize wn;
+
+        status = nyfs_op_mkdir(&vol, NYFS_ROOT_INO, "acltest", 0755, &root_cred, &acl_dir_ino);
+        CHECK(status == Nok, "ACL 상속 테스트용 디렉터리 생성");
+
+        status = nyfs_read_inode(&vol, acl_dir_ino, &parent_inode);
+        CHECK(status == Nok, "부모 inode 읽기");
+
+        parent_inode.ace_count = 1;
+        parent_inode.ace[0].id = other_cred.uid;
+        parent_inode.ace[0].access_mask = NYFS_ACE_READ_DATA;
+        parent_inode.ace[0].type = NYFS_ACE_TYPE_ALLOW;
+        parent_inode.ace[0].flags = NYFS_ACE_FLAG_INHERIT_FILE;
+        parent_inode.ace[0].reserved = 0;
+        status = nyfs_write_inode(&vol, acl_dir_ino, &parent_inode);
+        CHECK(status == Nok, "부모에 상속형 ACE 직접 기록(테스트 전용 - 실제 ACL 설정 API 는 아직 없음)");
+
+        status = nyfs_op_create(&vol, acl_dir_ino, "inherited.txt", 0600, &root_cred, &child_ino);
+        CHECK(status == Nok, "ACL 있는 디렉터리 밑에 파일 생성");
+
+        status = nyfs_read_inode(&vol, child_ino, &child_inode);
+        CHECK(status == Nok && child_inode.ace_count == 1
+              && child_inode.ace[0].id == other_cred.uid
+              && child_inode.ace[0].access_mask == NYFS_ACE_READ_DATA
+              && !(child_inode.ace[0].flags & NYFS_ACE_FLAG_INHERIT_ONLY),
+              "자식이 부모의 INHERIT_FILE ACE 를 상속받음(0600 UNIX 모드는 무시되고 ACL 로만 판정)");
+
+        /* other_cred 는 0600 의 UNIX 소유자가 아니지만, 상속받은 ACE 가
+         * READ_DATA 를 허용하므로 읽기는 되고 쓰기는 여전히 막혀야 한다. */
+        status = nyfs_op_read(&vol, child_ino, &other_cred, 0, readbuf, sizeof(readbuf), &wn);
+        CHECK(status == Nok, "상속된 ACE 덕분에 다른 uid 도 읽기 허용됨");
+
+        status = nyfs_op_write(&vol, child_ino, &other_cred, 0, "y", 1, &wn);
+        CHECK(status == Npermission, "READ_DATA 만 상속했으므로 쓰기는 여전히 거부");
+
+        status = nyfs_op_remove(&vol, acl_dir_ino, "inherited.txt", &root_cred, nfalse);
+        CHECK(status == Nok, "ACL 테스트 파일 정리");
+        status = nyfs_op_remove(&vol, NYFS_ROOT_INO, "acltest", &root_cred, ntrue);
+        CHECK(status == Nok, "ACL 테스트 디렉터리 정리");
+    }
+
     /* unlink/rmdir 타입 검사 */
     status = nyfs_op_remove(&vol, NYFS_ROOT_INO, "hello.txt", &root_cred, ntrue);
     CHECK(status == Nunsupported, "파일을 rmdir 대상으로 요청하면 거부");

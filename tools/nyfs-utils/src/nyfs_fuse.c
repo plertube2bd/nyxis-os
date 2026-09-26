@@ -57,6 +57,7 @@ static int nyfs_status_to_errno(nyfs_status_t status)
         case NdiskFull:      return -ENOSPC;
         case NbadFilesystem: return -EIO;
         case NnameTooLong:   return -ENAMETOOLONG;
+        case Noverflow:      return -ENOSPC;   /* 상속받을 ACE 가 블록 하나에도 안 들어감 */
         default:             return -EIO;
     }
 }
@@ -366,6 +367,37 @@ static int op_rmdir(const char *path)
     return nyfs_status_to_errno(status);
 }
 
+static int op_rename(const char *old_path, const char *new_path, unsigned int flags)
+{
+    nyfs_cred_t cred;
+    nyfs_ino_t old_parent_ino;
+    nyfs_ino_t new_parent_ino;
+    char old_name[NYFS_NAME_MAX + 1U];
+    char new_name[NYFS_NAME_MAX + 1U];
+    nyfs_status_t status;
+
+    /* RENAME_EXCHANGE/RENAME_NOREPLACE 같은 리눅스 전용 플래그는 지원하지
+     * 않는다(커널 nyfs_rename() 도 덮어쓰기/맞교환 rename 은 v1 범위 밖) -
+     * 플래그가 오면 조용히 무시하지 않고 명시적으로 거부한다. */
+    if (flags != 0) {
+        return -ENOTSUP;
+    }
+
+    nyfs_cred_from_context(&cred);
+
+    status = nyfs_path_lookup_parent(&g_vol, old_path, &cred, &old_parent_ino, old_name, sizeof(old_name));
+    if (NSTATUS_IS_ERR(status)) {
+        return nyfs_status_to_errno(status);
+    }
+    status = nyfs_path_lookup_parent(&g_vol, new_path, &cred, &new_parent_ino, new_name, sizeof(new_name));
+    if (NSTATUS_IS_ERR(status)) {
+        return nyfs_status_to_errno(status);
+    }
+
+    status = nyfs_op_rename(&g_vol, old_parent_ino, old_name, new_parent_ino, new_name, &cred);
+    return nyfs_status_to_errno(status);
+}
+
 static int op_truncate(const char *path, off_t size, struct fuse_file_info *fi)
 {
     nyfs_cred_t cred;
@@ -478,6 +510,7 @@ static const struct fuse_operations nyfs_fuse_ops = {
     .write    = op_write,
     .unlink   = op_unlink,
     .rmdir    = op_rmdir,
+    .rename   = op_rename,
     .truncate = op_truncate,
     .chmod    = op_chmod,
     .chown    = op_chown,

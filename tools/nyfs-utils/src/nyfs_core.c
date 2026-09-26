@@ -814,7 +814,14 @@ static nyfs_status_t nyfs_check_access(nyfs_volume_t *vol, const nyfs_inode_t *i
             return status;
         }
 
+        /* NTFS 관례: deny 를 먼저 본다. 요청한 비트 중 하나라도 막으면 즉시 거부.
+         * INHERIT_ONLY ACE 는 이 항목 자신에게는 적용되지 않고 자식에게 상속만
+         * 되는 것이므로 평가에서 제외한다(커널 nyfs.c 와 동일 - 2026-09-26
+         * 커널 쪽에서 빠져있던 걸 고친 버그를 여기도 같이 맞춘다). */
         for (i = 0; i < count; i++) {
+            if (aces[i].flags & NYFS_ACE_FLAG_INHERIT_ONLY) {
+                continue;
+            }
             if (aces[i].type == NYFS_ACE_TYPE_DENY && nyfs_ace_id_matches(&aces[i], cred)) {
                 if (aces[i].access_mask & requested_mask) {
                     return Npermission;
@@ -824,12 +831,116 @@ static nyfs_status_t nyfs_check_access(nyfs_volume_t *vol, const nyfs_inode_t *i
 
         granted = 0;
         for (i = 0; i < count; i++) {
+            if (aces[i].flags & NYFS_ACE_FLAG_INHERIT_ONLY) {
+                continue;
+            }
             if (aces[i].type == NYFS_ACE_TYPE_ALLOW && nyfs_ace_id_matches(&aces[i], cred)) {
                 granted |= aces[i].access_mask;
             }
         }
 
         return ((requested_mask & granted) == requested_mask) ? Nok : Npermission;
+    }
+}
+
+/*
+ * 부모 디렉터리의 ACL 중 상속 플래그(NYFS_ACE_FLAG_INHERIT_FILE/INHERIT_DIR)가
+ * 붙은 ACE 를 새로 만드는 자식(child_is_dir 로 파일/디렉터리 구분)에게 복사한다.
+ * NTFS 관례대로: 복사된 ACE 에서는 INHERIT_ONLY 를 지운다(자식에게는 실제로
+ * 적용돼야 하므로). 원본에 NO_PROPAGATE 가 있었다면 복사본에서 상속 플래그
+ * 자체를 지워서 그 자식 아래로는 더 이상 전파되지 않게 한다.
+ *
+ * 상속받은 ACE 가 하나라도 있으면 자식의 권한 판정은 그때부터 UNIX 모드가
+ * 아니라 ACL 로만 이뤄진다(nyfs_check_access 의 "ACL 이 있으면 ACL 만 본다"
+ * 규칙과 동일) - 즉 create()/mkdir() 에 넘긴 mode 인자는 ACL 이 상속되는
+ * 순간부터 사실상 무시된다. (커널 nyfs_inherit_acl() 과 1:1 대응)
+ */
+static nyfs_status_t nyfs_inherit_acl(nyfs_volume_t *vol, const nyfs_inode_t *parent,
+                                       nyfs_inode_t *child, nbool child_is_dir)
+{
+    nyfs_ace_t parent_aces[NYFS_MAX_TOTAL_ACES];
+    nyfs_ace_t inherited[NYFS_MAX_TOTAL_ACES];
+    u32 parent_count;
+    u32 inherited_count;
+    u32 need_flag;
+    u32 i;
+    nyfs_status_t status;
+
+    need_flag = child_is_dir ? NYFS_ACE_FLAG_INHERIT_DIR : NYFS_ACE_FLAG_INHERIT_FILE;
+
+    status = nyfs_gather_aces(vol, parent, parent_aces, NYFS_MAX_TOTAL_ACES, &parent_count);
+    if (NSTATUS_IS_ERR(status)) {
+        return status;
+    }
+
+    inherited_count = 0;
+    for (i = 0; i < parent_count; i++) {
+        nyfs_ace_t ace;
+
+        if (!(parent_aces[i].flags & need_flag)) {
+            continue;
+        }
+        if (inherited_count >= NYFS_MAX_TOTAL_ACES) {
+            break;   /* 상속받을 ACE 가 너무 많다 - 나머지는 포기한다(매우 드문 경우) */
+        }
+
+        ace = parent_aces[i];
+        ace.flags = (u8)(ace.flags & (u8)~NYFS_ACE_FLAG_INHERIT_ONLY);
+        if (parent_aces[i].flags & NYFS_ACE_FLAG_NO_PROPAGATE) {
+            ace.flags = (u8)(ace.flags & (u8)~(NYFS_ACE_FLAG_INHERIT_FILE
+                                              | NYFS_ACE_FLAG_INHERIT_DIR
+                                              | NYFS_ACE_FLAG_NO_PROPAGATE));
+        }
+
+        inherited[inherited_count] = ace;
+        inherited_count++;
+    }
+
+    if (inherited_count == 0) {
+        return Nok;
+    }
+
+    if (inherited_count <= NYFS_ACL_INLINE_COUNT) {
+        for (i = 0; i < inherited_count; i++) {
+            child->ace[i] = inherited[i];
+        }
+        child->ace_count = (u16)inherited_count;
+        child->acl_overflow_block = NYFS_BLKNO_NONE;
+        child->acl_overflow_count = 0;
+        return Nok;
+    }
+
+    {
+        nyfs_blkno_t overflow_block;
+        u32 overflow_count = inherited_count - NYFS_ACL_INLINE_COUNT;
+
+        if ((u64)overflow_count * sizeof(nyfs_ace_t) > vol->block_size) {
+            /* 블록 하나에 다 안 들어간다 - 조용히 잘라내면 deny ACE 가 빠질 수
+             * 있어 안전하지 않으므로 차라리 실패시킨다(블록 크기가 아주 작고
+             * 부모에 상속형 ACE 가 매우 많을 때만 벌어지는 드문 경우다). */
+            return Noverflow;
+        }
+
+        for (i = 0; i < NYFS_ACL_INLINE_COUNT; i++) {
+            child->ace[i] = inherited[i];
+        }
+        child->ace_count = NYFS_ACL_INLINE_COUNT;
+
+        status = nyfs_alloc_block(vol, &overflow_block);
+        if (NSTATUS_IS_ERR(status)) {
+            return status;
+        }
+        status = nyfs_raw_write(vol, (u64)overflow_block * vol->block_size,
+                                 &inherited[NYFS_ACL_INLINE_COUNT],
+                                 (usize)overflow_count * sizeof(nyfs_ace_t));
+        if (NSTATUS_IS_ERR(status)) {
+            (void)nyfs_free_block(vol, overflow_block);
+            return status;
+        }
+
+        child->acl_overflow_block = overflow_block;
+        child->acl_overflow_count = overflow_count;
+        return Nok;
     }
 }
 
@@ -1355,6 +1466,12 @@ nyfs_status_t nyfs_op_create(nyfs_volume_t *vol, nyfs_ino_t parent_ino, const ch
     new_inode.gid = cred->gid;
     new_inode.link_count = 1;
 
+    status = nyfs_inherit_acl(vol, &dir_inode, &new_inode, nfalse);
+    if (NSTATUS_IS_ERR(status)) {
+        (void)nyfs_free_inode(vol, new_ino);
+        return status;
+    }
+
     status = nyfs_write_inode(vol, new_ino, &new_inode);
     if (NSTATUS_IS_ERR(status)) {
         (void)nyfs_free_inode(vol, new_ino);
@@ -1426,6 +1543,12 @@ nyfs_status_t nyfs_op_mkdir(nyfs_volume_t *vol, nyfs_ino_t parent_ino, const cha
     new_inode.uid = cred->uid;
     new_inode.gid = cred->gid;
     new_inode.link_count = 1;
+
+    status = nyfs_inherit_acl(vol, &dir_inode, &new_inode, ntrue);
+    if (NSTATUS_IS_ERR(status)) {
+        (void)nyfs_free_inode(vol, new_ino);
+        return status;
+    }
 
     status = nyfs_dirhash_create(vol, &new_inode);
     if (NSTATUS_IS_ERR(status)) {
@@ -1696,6 +1819,115 @@ nyfs_status_t nyfs_op_readdir_at(nyfs_volume_t *vol, nyfs_ino_t dir_ino, const n
     }
 
     return NnotFound;
+}
+
+/* 커널 nyfs_rename() 과 1:1 대응(커널은 vnode/dentry 를 거치지만 여기서는
+ * 이 라이브러리가 볼륨 하나만 다루므로 부모 inode 번호 두 개를 직접
+ * 받는다 - "다른 볼륨 사이의 rename" 제약은 호출자가 볼륨을 하나만 열어
+ * 쓰는 구조상 자동으로 성립한다). */
+nyfs_status_t nyfs_op_rename(nyfs_volume_t *vol, nyfs_ino_t old_parent_ino, const char *old_name,
+                              nyfs_ino_t new_parent_ino, const char *new_name, const nyfs_cred_t *cred)
+{
+    nyfs_inode_t old_dir_inode;
+    nyfs_inode_t new_dir_inode_storage;
+    nyfs_inode_t *new_dir_inode;
+    nyfs_ino_t moved_ino;
+    u32 moved_type;
+    nyfs_ino_t existing_ino;
+    u32 existing_type;
+    nbool same_dir;
+    nyfs_status_t status;
+
+    if (!vol || !old_name || !new_name || !cred) {
+        return NinvalidArg;
+    }
+    if (!vol->writable) {
+        return NreadOnly;
+    }
+
+    same_dir = (nbool)(old_parent_ino == new_parent_ino);
+
+    status = nyfs_read_inode(vol, old_parent_ino, &old_dir_inode);
+    if (NSTATUS_IS_ERR(status)) {
+        return status;
+    }
+    if (old_dir_inode.type != NYFS_INO_TYPE_DIR) {
+        return Nunsupported;
+    }
+
+    if (same_dir) {
+        new_dir_inode = &old_dir_inode;   /* 같은 디렉터리면 사본 하나만 갱신한다 */
+    } else {
+        status = nyfs_read_inode(vol, new_parent_ino, &new_dir_inode_storage);
+        if (NSTATUS_IS_ERR(status)) {
+            return status;
+        }
+        if (new_dir_inode_storage.type != NYFS_INO_TYPE_DIR) {
+            return Nunsupported;
+        }
+        new_dir_inode = &new_dir_inode_storage;
+    }
+
+    status = nyfs_check_access(vol, &old_dir_inode, cred, NYFS_ACE_DELETE_CHILD);
+    if (NSTATUS_IS_ERR(status)) {
+        return status;
+    }
+    status = nyfs_check_access(vol, new_dir_inode, cred, NYFS_ACE_WRITE_DATA);
+    if (NSTATUS_IS_ERR(status)) {
+        return status;
+    }
+
+    status = nyfs_dirhash_lookup(vol, &old_dir_inode, old_name, &moved_ino, &moved_type);
+    if (NSTATUS_IS_ERR(status)) {
+        return status;
+    }
+
+    if (same_dir && strcmp(old_name, new_name) == 0) {
+        return Nok;   /* 이름이 같으면 할 일이 없다 */
+    }
+
+    /* 디렉터리를 자기 자신의 새 부모로 옮기는(즉 자기 자신 위로 옮기는)
+     * 가장 자명한 순환만 여기서 막는다. 더 깊은 순환(자기 하위 디렉터리
+     * 밑으로 옮기기)은 nyfs inode 에 부모 포인터가 없어 이 계층만으로는
+     * 잡지 못한다 - 커널과 동일한 알려진 한계다. */
+    if (moved_type == NYFS_DIRENT_TYPE_DIR && moved_ino == new_parent_ino) {
+        return NinvalidArg;
+    }
+
+    status = nyfs_dirhash_lookup(vol, new_dir_inode, new_name, &existing_ino, &existing_type);
+    if (!NSTATUS_IS_ERR(status)) {
+        return NalreadyExists;   /* v1: 덮어쓰기 rename 은 지원하지 않는다 */
+    }
+    if (status != NnotFound) {
+        return status;
+    }
+
+    status = nyfs_dirhash_remove(vol, &old_dir_inode, old_name);
+    if (NSTATUS_IS_ERR(status)) {
+        return status;
+    }
+
+    status = nyfs_dirhash_insert(vol, new_dir_inode, new_name, moved_ino, moved_type);
+    if (NSTATUS_IS_ERR(status)) {
+        /* 저널이 없어 완전한 롤백은 못 한다 - 최소한 원래 이름으로 복구를
+         * 시도한다(실패해도 무시한다 - 할 수 있는 최선을 다한 것이다) */
+        (void)nyfs_dirhash_insert(vol, &old_dir_inode, old_name, moved_ino, moved_type);
+        (void)nyfs_write_inode(vol, old_parent_ino, &old_dir_inode);
+        return status;
+    }
+
+    status = nyfs_write_inode(vol, old_parent_ino, &old_dir_inode);
+    if (NSTATUS_IS_ERR(status)) {
+        return status;
+    }
+    if (!same_dir) {
+        status = nyfs_write_inode(vol, new_parent_ino, new_dir_inode);
+        if (NSTATUS_IS_ERR(status)) {
+            return status;
+        }
+    }
+
+    return Nok;
 }
 
 nyfs_status_t nyfs_op_setattr(nyfs_volume_t *vol, nyfs_ino_t ino, const nyfs_cred_t *cred,

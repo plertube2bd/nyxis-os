@@ -11,9 +11,17 @@
  * 검사(UNIX 모드 + NTFS 스타일 ACE) 로직은 바이트 단위로 동일하다 - 그래야
  * 이 툴로 만들거나 손댄 볼륨을 커널이 그대로 마운트할 수 있다.
  *
- * 범위(커널과 동일하게 맞춤 - 2026-09-25 사용자와 합의):
- *   - rename 없음
- *   - ACL 상속 없음(생성 시 항상 UNIX 모드만 받고, ACE 는 빈 채로 시작)
+ * 범위(커널과 동일하게 맞춤 - 2026-09-25 사용자와 합의, 2026-09-26 커널의
+ * rename/ACL 상속 구현에 맞춰 이 라이브러리도 같이 갱신함):
+ *   - rename 지원(같은 볼륨 안에서만 - 이 라이브러리는 애초에 볼륨을
+ *     하나만 다루므로 "다른 볼륨 사이 rename 금지"는 자동으로 성립).
+ *     저널이 없어 두 번째 dirhash_insert 실패 시 최선을 다해 복구를
+ *     시도한다. 디렉터리를 자기 자신 위로 옮기는 가장 자명한 순환만
+ *     막는다 - 더 깊은 순환(자기 하위 디렉터리 밑으로 옮기기)은 inode 에
+ *     부모 포인터가 없어 이 계층만으로는 못 잡는다(커널과 동일한 알려진
+ *     한계).
+ *   - ACL 상속 지원(create/mkdir 시 부모의 INHERIT_FILE/INHERIT_DIR ACE 를
+ *     자식에게 복사, NTFS 관례대로 INHERIT_ONLY/NO_PROPAGATE 처리)
  *   - extent depth 는 0(직접 리스트)만 지원 - data_extent_depth 는 항상 0으로 쓴다
  *   - 저널 없음(journal_version == 0 로 항상 포맷)
  *   - "." / ".." 디렉터리 엔트리 없음(커널 readdir 과 동일하게 실제 자식만 나열)
@@ -124,6 +132,14 @@ nyfs_status_t nyfs_op_write(nyfs_volume_t *vol, nyfs_ino_t ino, const nyfs_cred_
 nyfs_status_t nyfs_op_readdir_at(nyfs_volume_t *vol, nyfs_ino_t dir_ino,
                                   const nyfs_cred_t *cred, u64 index,
                                   nyfs_dirent_view_t *out);
+
+/* old_parent_ino 안의 old_name 을 new_parent_ino 안의 new_name 으로 옮긴다
+ * (같은 디렉터리 안에서의 이름 변경도 포함 - old_parent_ino==new_parent_ino
+ * 면 그 경우다). 대상 이름이 이미 있으면 NalreadyExists(v1 은 덮어쓰기
+ * rename 미지원). 커널 nyfs_rename() 과 1:1 대응 - 알려진 한계는
+ * nyfs_core.h 상단 주석 참고. */
+nyfs_status_t nyfs_op_rename(nyfs_volume_t *vol, nyfs_ino_t old_parent_ino, const char *old_name,
+                              nyfs_ino_t new_parent_ino, const char *new_name, const nyfs_cred_t *cred);
 
 /* chmod/chown/utimens 대응. 커널에 아직 없는 시스템 콜이지만 위 주석대로
  * 온디스크 포맷은 그대로다. mtime_ns/atime_ns 가 각각 NYFS_TIME_KEEP 이면
