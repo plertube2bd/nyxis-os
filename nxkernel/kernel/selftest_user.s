@@ -21,6 +21,7 @@
     .set NX_SYS_SLEEP, 4
     .set NX_SYS_YIELD, 5
     .set NX_SYS_SYSINFO, 7
+    .set NX_SYS_PROCESS_CREATE, 64
     .set NX_SYS_OPEN, 32
     .set NX_SYS_CLOSE, 33
     .set NX_SYS_READ, 34
@@ -207,6 +208,11 @@ user_prog1_start:
     syscall
     movq %rax, 0xD0(%rbx)
 
+    movl $NX_SYS_PROCESS_CREATE, %eax  /* [0xD8] NxProcessCreate(존재하지 않는 경로) -> 음수 */
+    leaq path_bad(%rip), %rdi
+    syscall
+    movq %rax, 0xD8(%rbx)
+
     movl $NX_SYS_PROCESS_EXIT, %eax  /* NxProcessExit(0) */
     xorl %edi, %edi
     syscall
@@ -214,6 +220,8 @@ user_prog1_start:
 
 umsg:
     .asciz "hello from ring 3 (syscall + int 0x80)\n"
+path_bad:
+    .asciz "app:/nonexistent.run"
 path_hello:
     .asciz "app:/hellowld.run"
 wmsg:

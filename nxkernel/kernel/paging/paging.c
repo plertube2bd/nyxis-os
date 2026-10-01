@@ -3,6 +3,7 @@
  */
 
 #include "kernel/paging/paging.h"
+#include "kernel/mm/pfa.h"
 #include "boot_info.h"
 #include "phys.h"
 #include "memory.h"
@@ -46,6 +47,7 @@ static u64 *g_pdpt_hhdm = nNULL;
 static u64 *g_pd_kernel = nNULL;
 static bool g_nx_supported = false;
 static bool g_smep_supported = false;
+static u64 g_hhdm_limit = 0;   /* paging_init() 이 실제로 HHDM 매핑한 물리 주소 상한 */
 
 /* ------------------------------------------------------------------ */
 /* 유틸                                                                */
@@ -320,6 +322,7 @@ Nstatus paging_init(const NTBLI *info)
         limit = HHDM_MAX_LIMIT;
     }
     limit = align_up(limit, PAGE_SIZE_2M);
+    g_hhdm_limit = limit;
 
     status = map_hhdm_2m(0, limit);
     if (NSTATUS_IS_ERR(status))
@@ -365,9 +368,51 @@ void paging_enable(void)
     write_cr3(table_phys(g_pml4));
 }
 
+u64 paging_hhdm_limit(void)
+{
+    return g_hhdm_limit;
+}
+
+u64 paging_kernel_cr3(void)
+{
+    return table_phys(g_pml4);
+}
+
+addr_space_t paging_kernel_addrspace(void)
+{
+    addr_space_t as;
+
+    as.pml4 = g_pml4;
+    return as;
+}
+
 /* ------------------------------------------------------------------ */
-/* 일반 매핑 API (사용자 공간)                                          */
+/* 동적(프로세스별) 매핑 API                                            */
+/*                                                                      */
+/* 아래 함수들은 오직 "사용자 영역"(PML4 0~255번)만 다룬다. 그 영역은     */
+/* paging_addrspace_create() 로 만든 주소 공간마다 완전히 독립적이며,     */
+/* 모든 중간 페이지 테이블과 데이터 프레임을 pfa.h 의 물리 프레임         */
+/* 할당자에서 가져온다. 그 프레임들은 커널 이미지 밖의 임의의 RAM 이므로   */
+/* table_of() (KERNEL_VMA_BASE 기반)가 아니라 HHDM(phys_to_virt) 로만     */
+/* 커널에서 접근할 수 있다 — 그래서 아래는 별도의 변환/할당 함수를 쓴다.   */
 /* ------------------------------------------------------------------ */
+
+/* 0 으로 채워진 4KiB 테이블 하나를 물리 프레임 할당자에서 할당 (커널 가상 주소 반환) */
+static u64 *alloc_table_dyn(void)
+{
+    u64 phys;
+
+    if (NSTATUS_IS_ERR(pfa_alloc(&phys)))
+        return nNULL;
+
+    return (u64 *)(usize)phys_to_virt(phys);   /* pfa_alloc() 이 이미 0 으로 채워 돌려준다 */
+}
+
+/* 엔트리가 가리키는, pfa.h 로 할당된 테이블의 커널 가상 주소 (HHDM 경유) */
+static u64 *table_of_dyn(u64 entry)
+{
+    return (u64 *)(usize)phys_to_virt(entry & ENTRY_ADDR_MASK);
+}
 
 /* 정규(canonical) 주소인지 (48비트 부호 확장 확인) */
 static bool is_canonical(u64 addr)
@@ -377,34 +422,108 @@ static bool is_canonical(u64 addr)
 }
 
 /*
- * 하위 테이블을 얻는다. create 이면 없을 때 새로 만든다.
+ * 하위 테이블을 얻는다 (동적/PFA 기반). create 이면 없을 때 새로 만든다.
  * user 이면 중간 엔트리에 USER 비트를 켠다 (최종 접근 권한은 leaf 가 결정).
  */
-static u64 *next_level(u64 *table, u32 idx, bool create, bool user)
+static u64 *next_level_dyn(u64 *table, u32 idx, bool create)
 {
     u64 entry = table[idx];
 
     if (entry & PAGE_PRESENT) {
         if (entry & PAGE_HUGE)
-            return nNULL;          /* 큰 페이지: 더 내려갈 수 없음 */
-        if (user && !(entry & PAGE_USER))
+            return nNULL;          /* 큰 페이지: 더 내려갈 수 없음 (사용자 영역에는 만들지 않는다) */
+        if (!(entry & PAGE_USER))
             table[idx] = entry | PAGE_USER;
-        return table_of(entry);
+        return table_of_dyn(entry);
     }
 
     if (!create) {
         return nNULL;
     } else {
-        u64 *fresh = alloc_table();
+        u64 *fresh = alloc_table_dyn();
 
         if (!fresh)
             return nNULL;
-        table[idx] = table_phys(fresh) | PAGE_PRESENT | PAGE_RW | (user ? PAGE_USER : 0UL);
+        table[idx] = virt_to_phys(fresh) | PAGE_PRESENT | PAGE_RW | PAGE_USER;
         return fresh;
     }
 }
 
-Nstatus paging_map_page(void *phys, void *virt, u64 flags)
+Nstatus paging_addrspace_create(addr_space_t *as)
+{
+    u64 *pml4;
+
+    if (!as)
+        return NinvalidArg;
+    if (!g_pml4)
+        return NnotInitialized;
+
+    pml4 = alloc_table_dyn();
+    if (!pml4)
+        return NoutOfMemory;
+
+    /* 상위 절반(HHDM/커널 이미지)은 전역 커널 주소 공간과 동일한 엔트리를 그대로 공유한다.
+     * 이 엔트리들이 가리키는 테이블은 정적 풀(부트스트랩) 소유이므로 이 주소 공간을 없앨 때도
+     * 건드리지 않는다 (paging_addrspace_destroy 는 0~255번만 순회한다). */
+    pml4[HHDM_PML4_INDEX] = g_pml4[HHDM_PML4_INDEX];
+    pml4[KERNEL_PML4_INDEX] = g_pml4[KERNEL_PML4_INDEX];
+
+    as->pml4 = pml4;
+    return NSTATUS_OK;
+}
+
+void paging_addrspace_destroy(addr_space_t *as)
+{
+    u32 i4, i3, i2, i1;
+
+    if (!as || !as->pml4)
+        return;
+
+    for (i4 = 0; i4 < HHDM_PML4_INDEX; i4++) {          /* 사용자 영역(0~255번)만 순회 */
+        u64 e4 = as->pml4[i4];
+        u64 *pdpt;
+
+        if (!(e4 & PAGE_PRESENT))
+            continue;
+        pdpt = table_of_dyn(e4);
+
+        for (i3 = 0; i3 < ENTRIES_PER_TABLE; i3++) {
+            u64 e3 = pdpt[i3];
+            u64 *pd;
+
+            if (!(e3 & PAGE_PRESENT) || (e3 & PAGE_HUGE))
+                continue;                                 /* 사용자 영역에 1GiB 페이지는 만들지 않는다 */
+            pd = table_of_dyn(e3);
+
+            for (i2 = 0; i2 < ENTRIES_PER_TABLE; i2++) {
+                u64 e2 = pd[i2];
+                u64 *pt;
+
+                if (!(e2 & PAGE_PRESENT) || (e2 & PAGE_HUGE))
+                    continue;                             /* 사용자 영역에 2MiB 페이지는 만들지 않는다 */
+                pt = table_of_dyn(e2);
+
+                for (i1 = 0; i1 < ENTRIES_PER_TABLE; i1++) {
+                    u64 e1 = pt[i1];
+
+                    if (e1 & PAGE_PRESENT)
+                        (void)pfa_free(e1 & ENTRY_ADDR_MASK);   /* 실제 데이터 프레임 회수 */
+                }
+
+                (void)pfa_free(virt_to_phys(pt));               /* PT 테이블 자신 회수 */
+            }
+
+            (void)pfa_free(virt_to_phys(pd));                   /* PD 테이블 자신 회수 */
+        }
+
+        (void)pfa_free(virt_to_phys(pdpt));                     /* PDPT 테이블 자신 회수 */
+    }
+
+    (void)pfa_free(virt_to_phys(as->pml4));                     /* PML4 자신 회수 */
+    as->pml4 = nNULL;
+}
+
+Nstatus paging_map_page(addr_space_t *as, void *phys, void *virt, u64 flags)
 {
     u64 p = (u64)(usize)phys;
     u64 v = (u64)(usize)virt;
@@ -412,9 +531,8 @@ Nstatus paging_map_page(void *phys, void *virt, u64 flags)
     u64 *pd;
     u64 *pt;
     u32 pt_idx;
-    bool user;
 
-    if (!g_pml4)
+    if (!as || !as->pml4)
         return NnotInitialized;
 
     if ((p & (PAGE_SIZE - 1)) || (v & (PAGE_SIZE - 1)))
@@ -431,15 +549,13 @@ Nstatus paging_map_page(void *phys, void *virt, u64 flags)
     if (g_nx_supported && (flags & PAGE_RW) && !(flags & PAGE_NX))
         return Npermission;
 
-    user = (flags & PAGE_USER) ? true : false;
-
-    pdpt = next_level(g_pml4, (u32)((v >> 39) & 0x1FFU), true, user);
+    pdpt = next_level_dyn(as->pml4, (u32)((v >> 39) & 0x1FFU), true);
     if (!pdpt)
         return NoutOfMemory;
-    pd = next_level(pdpt, (u32)((v >> 30) & 0x1FFU), true, user);
+    pd = next_level_dyn(pdpt, (u32)((v >> 30) & 0x1FFU), true);
     if (!pd)
         return NoutOfMemory;
-    pt = next_level(pd, (u32)((v >> 21) & 0x1FFU), true, user);
+    pt = next_level_dyn(pd, (u32)((v >> 21) & 0x1FFU), true);
     if (!pt)
         return NoutOfMemory;
 
@@ -448,31 +564,31 @@ Nstatus paging_map_page(void *phys, void *virt, u64 flags)
         return NalreadyExists;
 
     pt[pt_idx] = p | (flags & (PAGE_RW | PAGE_USER | PAGE_PWT | PAGE_PCD | PAGE_GLOBAL | PAGE_NX))
-                   | PAGE_PRESENT;
+                   | PAGE_PRESENT | PAGE_USER;
 
     invlpg(virt);
     return NSTATUS_OK;
 }
 
-Nstatus paging_unmap_page(void *virt)
+Nstatus paging_unmap_page(addr_space_t *as, void *virt)
 {
     u64 v = (u64)(usize)virt;
     u64 *pdpt;
     u64 *pd;
     u64 *pt;
 
-    if (!g_pml4)
+    if (!as || !as->pml4)
         return NnotInitialized;
     if (!virt || (v & (PAGE_SIZE - 1)) || !is_canonical(v) || v >= USER_SPACE_END)
         return NinvalidArg;
 
-    pdpt = next_level(g_pml4, (u32)((v >> 39) & 0x1FFU), false, false);
+    pdpt = next_level_dyn(as->pml4, (u32)((v >> 39) & 0x1FFU), false);
     if (!pdpt)
         return NinvalidArg;
-    pd = next_level(pdpt, (u32)((v >> 30) & 0x1FFU), false, false);
+    pd = next_level_dyn(pdpt, (u32)((v >> 30) & 0x1FFU), false);
     if (!pd)
         return NinvalidArg;
-    pt = next_level(pd, (u32)((v >> 21) & 0x1FFU), false, false);
+    pt = next_level_dyn(pd, (u32)((v >> 21) & 0x1FFU), false);
     if (!pt)
         return NinvalidArg;
 
@@ -484,11 +600,45 @@ Nstatus paging_unmap_page(void *virt)
     return NSTATUS_OK;
 }
 
+Nstatus paging_unmap_free_page(addr_space_t *as, void *virt)
+{
+    u64 v = (u64)(usize)virt;
+    u64 *pdpt;
+    u64 *pd;
+    u64 *pt;
+    u64 entry;
+
+    if (!as || !as->pml4)
+        return NnotInitialized;
+    if (!virt || (v & (PAGE_SIZE - 1)) || !is_canonical(v) || v >= USER_SPACE_END)
+        return NinvalidArg;
+
+    pdpt = next_level_dyn(as->pml4, (u32)((v >> 39) & 0x1FFU), false);
+    if (!pdpt)
+        return NinvalidArg;
+    pd = next_level_dyn(pdpt, (u32)((v >> 30) & 0x1FFU), false);
+    if (!pd)
+        return NinvalidArg;
+    pt = next_level_dyn(pd, (u32)((v >> 21) & 0x1FFU), false);
+    if (!pt)
+        return NinvalidArg;
+
+    entry = pt[(v >> 12) & 0x1FFU];
+    if (!(entry & PAGE_PRESENT))
+        return NinvalidArg;
+
+    pt[(v >> 12) & 0x1FFU] = 0;
+    invlpg(virt);
+
+    /* 매핑을 먼저 지운 뒤에 프레임을 돌려준다 (반대 순서면 잠깐 동안 남의 프레임이 매핑된 채로 남는다) */
+    return pfa_free(entry & ENTRY_ADDR_MASK);
+}
+
 /* 한 페이지가 유저 접근 가능한지: 모든 단계의 U(및 write 시 RW) 비트를 확인 */
-static bool user_page_ok(u64 v, bool write)
+static bool user_page_ok(const addr_space_t *as, u64 v, bool write)
 {
     u64 e;
-    u64 *t = g_pml4;
+    u64 *t = as->pml4;
     u32 idx[4];
     u32 level;
 
@@ -507,24 +657,20 @@ static bool user_page_ok(u64 v, bool write)
         if (write && !(e & PAGE_RW))
             return false;
 
-        /* 큰 페이지(PDPT/PD 레벨)이면 여기서 종료 */
-        if (level >= 1 && level <= 2 && (e & PAGE_HUGE))
-            return true;
-
         if (level < 3)
-            t = table_of(e);
+            t = table_of_dyn(e);
     }
 
     return true;
 }
 
-bool paging_is_user_range(const void *virt, usize len, bool write)
+bool paging_is_user_range(const addr_space_t *as, const void *virt, usize len, bool write)
 {
     u64 start = (u64)(usize)virt;
     u64 end;
     u64 page;
 
-    if (!g_pml4)
+    if (!as || !as->pml4)
         return false;
     if (len == 0)
         return true;
@@ -536,7 +682,7 @@ bool paging_is_user_range(const void *virt, usize len, bool write)
         return false;
 
     for (page = start & ~(PAGE_SIZE - 1); page < end; page += PAGE_SIZE) {
-        if (!user_page_ok(page, write))
+        if (!user_page_ok(as, page, write))
             return false;
     }
 

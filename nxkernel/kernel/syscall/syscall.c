@@ -19,6 +19,8 @@
 #include "kernel/syscall/handles.h"
 #include "kernel/paging/paging.h"
 #include "kernel/process/process.h"
+#include "kernel/process/spawn.h"
+#include "kernel/process/umem.h"
 #include "kernel/timer/pit/pit_base.h"
 #include "console/outputs/printk.h"
 #include "drivers/filesystem/vfs.h"
@@ -399,6 +401,39 @@ static i64 sys_duplicate_handle(const u64 *a)
 /* Process                                                             */
 /* ------------------------------------------------------------------ */
 
+/* NxProcessCreate(const char *path) -> pid */
+static i64 sys_process_create(const u64 *a)
+{
+    char path[NX_PATH_MAX];
+    u32 pid = 0;
+    Nstatus status = copy_string_from_user(path, a[0], sizeof(path));
+
+    if (NSTATUS_IS_ERR(status))
+        return (i64)status;
+
+    status = process_spawn(path, &pid);
+    if (NSTATUS_IS_ERR(status))
+        return (i64)status;
+
+    return (i64)pid;
+}
+
+/* NxVirtualAlloc(increment) -> 새 brk (brk 방식 힙 늘리기/줄이기, 자세한 규약은 nyx_abi.h) */
+static i64 sys_virtual_alloc(const u64 *a)
+{
+    u64 brk = 0;
+    Nstatus status;
+
+    if (!current_process)
+        return (i64)NnotInitialized;
+
+    status = umem_brk(current_process, (i64)a[0], &brk);
+    if (NSTATUS_IS_ERR(status))
+        return (i64)status;
+
+    return (i64)brk;
+}
+
 /* NxProcessExit(exit_code) - 반환하지 않는다 */
 static i64 sys_process_exit(const u64 *a)
 {
@@ -473,8 +508,11 @@ static const struct syscall_entry g_syscalls[] = {
     { NX_SYS_STAT,             sys_stat },
     { NX_SYS_DUPLICATE_HANDLE, sys_duplicate_handle },
 
+    { NX_SYS_PROCESS_CREATE,   sys_process_create },
     { NX_SYS_PROCESS_EXIT,     sys_process_exit },
     { NX_SYS_PROCESS_INFO,     sys_process_info },
+
+    { NX_SYS_VIRTUAL_ALLOC,    sys_virtual_alloc },
 
     { NX_SYS_KERNEL_PRINT,     sys_kernel_print },
     { NX_SYS_DEBUG_NOP,        sys_debug_nop }

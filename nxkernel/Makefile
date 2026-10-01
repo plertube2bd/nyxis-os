@@ -147,6 +147,10 @@ KERNEL_C_SRCS = \
 	kernel/interrupt/gdt.c \
 	kernel/paging/paging.c \
 	kernel/process/process.c \
+	kernel/process/elf.c \
+	kernel/process/umem.c \
+	kernel/process/spawn.c \
+	kernel/mm/pfa.c \
 	kernel/process/schedule.c \
 	kernel/syscall/syscall.c \
 	kernel/syscall/uaccess.c \
@@ -184,17 +188,12 @@ ifneq ($(SELFTEST),)
 KERNEL_S_SRCS += kernel/selftest_user.s
 endif
 
-# 임시로 커널 이미지에 함께 링크되는 유저랜드 예제 (유저 프로그램 로더가 생기면 제거 예정)
-USER_HELLO_SRC = $(ROOT)/userland/helloworld/helloworld.c
-USER_HELLO_OBJ = $(BUILD)/obj/helloworld.o
-
 # 소스 경로 -> 오브젝트 경로 ("../" 접두사 제거하여 out/obj 아래에 배치)
 obj_of = $(BUILD)/obj/$(patsubst ../%,%,$(1))
 
 KERNEL_OBJS = \
 	$(foreach s,$(KERNEL_S_SRCS),$(call obj_of,$(s:.s=.o))) \
-	$(foreach s,$(KERNEL_C_SRCS),$(call obj_of,$(s:.c=.o))) \
-	$(USER_HELLO_OBJ)
+	$(foreach s,$(KERNEL_C_SRCS),$(call obj_of,$(s:.c=.o)))
 
 # =========================
 # Targets
@@ -241,10 +240,6 @@ $(BUILD)/obj/drivers/%.o: $(ROOT)/drivers/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(USER_HELLO_OBJ): $(USER_HELLO_SRC)
-	@mkdir -p $(dir $@)
-	$(CC) $(KERNEL_CFLAGS) -I$(ROOT)/userland/nlibc/library -c $< -o $@
-
 # Kernel: assembly
 $(BUILD)/obj/%.o: %.s
 	@mkdir -p $(dir $@)
@@ -259,11 +254,33 @@ $(KERNEL): $(KERNEL_OBJS) kernel/linker64.lds
 # =========================
 # Disk images
 # =========================
+# =========================
+# 사용자 프로그램 (커널과 별개로 링크되는 정적 ELF64 ET_EXEC, initrd 에 넣어 NxProcessCreate 로 실행)
+#   유저 코드도 프로젝트 규칙(C89, -Werror)을 따른다. 커널 전용 옵션(-mcmodel=kernel 등)은 쓰지 않는다.
+# =========================
+USER_CFLAGS = \
+	-std=c89 -pedantic -Wall -Wextra -Werror \
+	-Wstrict-prototypes -Wmissing-prototypes -Wshadow -Wdeclaration-after-statement -Wvla \
+	$(OPT) -m64 -ffreestanding -nostdinc -fno-builtin -fno-stack-protector \
+	-fno-pie -fno-pic -fcf-protection=none -fno-asynchronous-unwind-tables \
+	-fno-tree-loop-distribute-patterns -mgeneral-regs-only \
+	-I$(INCLUDE_DIR) -I$(ROOT)/userland/nlibc/library
+
+ELFTEST_DIR = $(ROOT)/userland/elftest
+ELFTEST_ELF = $(BUILD)/elftest.run
+
+$(ELFTEST_ELF): $(ELFTEST_DIR)/elftest.c $(ELFTEST_DIR)/start.s $(ELFTEST_DIR)/linker.lds
+	@mkdir -p $(BUILD)/obj/elftest
+	$(CC) $(USER_CFLAGS) -c $(ELFTEST_DIR)/elftest.c -o $(BUILD)/obj/elftest/elftest.o
+	$(AS) $(ASFLAGS) $(ELFTEST_DIR)/start.s -o $(BUILD)/obj/elftest/start.o
+	$(LD) -m elf_x86_64 -nostdlib -z max-page-size=0x1000 -z noexecstack --no-warn-rwx-segments \
+		-T $(ELFTEST_DIR)/linker.lds -o $@ $(BUILD)/obj/elftest/start.o $(BUILD)/obj/elftest/elftest.o
+
 INITRD_RUN = $(ROOT)/userland/initrd/_ns_/app/hellowld.run
 INITRD_IMG = $(BUILD)/initrd.img
 OS_IMG     = $(BUILD)/esp.img
 
-$(INITRD_IMG): $(INITRD_RUN)
+$(INITRD_IMG): $(INITRD_RUN) $(ELFTEST_ELF)
 	@mkdir -p $(BUILD)
 	rm -f $@
 	dd if=/dev/zero of=$@ bs=1M count=16 status=none
@@ -271,6 +288,7 @@ $(INITRD_IMG): $(INITRD_RUN)
 	mmd -i $@ ::_ns_
 	mmd -i $@ ::_ns_/app
 	mcopy -i $@ $(INITRD_RUN) ::_ns_/app/hellowld.run
+	mcopy -i $@ $(ELFTEST_ELF) ::_ns_/app/elftest.run
 
 os: $(OS_IMG)
 

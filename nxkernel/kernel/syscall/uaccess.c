@@ -4,6 +4,7 @@
 
 #include "kernel/syscall/uaccess.h"
 #include "kernel/paging/paging.h"
+#include "kernel/process/process.h"
 
 /* uaccess.s */
 extern long nx_uaccess_copy(void *dst, const void *src, unsigned long len);
@@ -16,8 +17,10 @@ Nstatus copy_from_user(void *dst, u64 user_src, usize len)
         return NSTATUS_OK;
     if (!dst)
         return NinvalidArg;
+    if (!current_process)
+        return NnotInitialized;
 
-    if (!paging_is_user_range((const void *)(usize)user_src, len, false))
+    if (!paging_is_user_range(&current_process->addrspace, (const void *)(usize)user_src, len, false))
         return NinvalidPointer;
 
     if (nx_uaccess_copy(dst, (const void *)(usize)user_src, (unsigned long)len) != 0)
@@ -32,8 +35,10 @@ Nstatus copy_to_user(u64 user_dst, const void *src, usize len)
         return NSTATUS_OK;
     if (!src)
         return NinvalidArg;
+    if (!current_process)
+        return NnotInitialized;
 
-    if (!paging_is_user_range((const void *)(usize)user_dst, len, true))
+    if (!paging_is_user_range(&current_process->addrspace, (const void *)(usize)user_dst, len, true))
         return NinvalidPointer;
 
     if (nx_uaccess_copy((void *)(usize)user_dst, src, (unsigned long)len) != 0)

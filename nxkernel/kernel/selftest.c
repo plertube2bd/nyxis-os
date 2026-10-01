@@ -2,7 +2,8 @@
  * selftest.c - 커널 부팅 후 실행되는 자체 점검 (make SELFTEST=1 로 빌드할 때만 포함)
  *
  * NYX_SELFTEST 값:
- *   1 : 기능 점검 (시스템 콜, printk 서식, 커널 스레드 전환, 타이머, 페이징 API)
+ *   1 : 기능 점검 (시스템 콜, printk 서식, 커널 스레드 전환, 타이머, 페이징 API,
+ *       ring3 flat 바이너리, NxProcessCreate/ELF 로더/힙/프로세스별 주소 공간)
  *   2 : #DE (0 으로 나누기) 발생 -> 예외 덤프 + 패닉이 나와야 함
  *   3 : #PF (NULL 역참조)   발생 -> 예외 덤프 + 패닉이 나와야 함 (0 번 페이지 매핑 해제 확인)
  *   4 : 커널 스택 오버플로  -> 가드 페이지 #PF -> IST 스택 #DF 덤프 후 패닉이 나와야 함
@@ -14,14 +15,15 @@
 #include "nyxis.h"
 #include "console/outputs/printk.h"
 #include "kernel/paging/paging.h"
+#include "kernel/mm/pfa.h"
 #include "kernel/process/process.h"
+#include "kernel/process/spawn.h"
 #include "kernel/syscall/syscall.h"
 #include "kernel/timer/pit/pit_base.h"
 #include "kernel/error_handling/panic.h"
 #include "memory.h"
 #include "string.h"
 #include "phys.h"
-#include "kernel/kernel.h"
 #include "nyx_abi.h"
 
 #ifndef NYX_SELFTEST
@@ -76,13 +78,15 @@ static void thread_b(void *arg)
     }
 }
 
-static u8 g_user_page[4096] __attribute__((aligned(4096)));
+/* --- 일반 페이징 API 점검용 페이지 (idle 스레드가 공유하는 "커널 전용" 주소 공간에 매핑한다:
+ * paging_kernel_addrspace() 의 문서 참고 — 실제 프로세스가 아니라 매핑 API 자체를 검사할
+ * 때만 쓰는 방법이다) */
+static u8 g_scratch_page[4096] __attribute__((aligned(4096)));
 
-/* ring 3 테스트용 사용자 페이지 (주소 배치는 selftest_user.s 주석 참고) */
-static u8 g_user_code[4096] __attribute__((aligned(4096)));
-static u8 g_user_data[4096] __attribute__((aligned(4096)));
-static u8 g_user_stack[4096] __attribute__((aligned(4096)));
-
+/* ring 3 테스트용 사용자 페이지: 반드시 PFA 로 할당한다. 이 프로세스들은 전용 주소 공간을
+ * 갖고, 종료되면 process_reap() 이 paging_addrspace_destroy() 로 그 안의 프레임을 전부
+ * pfa_free() 하기 때문이다 — 커널 .bss 정적 배열을 매핑하면 그 프레임이 실수로 "회수"되어
+ * 시스템 전체가 오염된다. */
 extern u8 user_prog1_start[];
 extern u8 user_prog1_end[];
 extern u8 user_prog2_start[];
@@ -92,13 +96,6 @@ extern u8 user_prog2_end[];
 #define USER_DATA_VADDR   0x401000UL
 #define USER_STACK_VADDR  0x402000UL
 #define USER_SENTINEL     0xDEADBEEFDEADBEEFUL
-
-/* 커널 스레드가 ring 3 로 내려간다 (프로그램이 NxProcessExit 하거나 예외로 종료될 때까지) */
-static void user_runner(void *arg)
-{
-    (void)arg;
-    enter_ring3((void *)USER_CODE_VADDR, (void *)(USER_STACK_VADDR + PAGE_SIZE));
-}
 
 /* 살아 있는(종료되지 않은) 프로세스 수 */
 static int live_processes(void)
@@ -113,18 +110,52 @@ static int live_processes(void)
     return n;
 }
 
-static void run_user_program(const u8 *start, const u8 *end)
+/*
+ * 새 전용 주소 공간을 만들어 [start,end) 의 flat 바이너리를 USER_CODE_VADDR 에, 사용자
+ * 스택을 USER_STACK_VADDR 에 매핑하고 ring3 로 실행한다. 종료를 기다린 뒤(reap 은 하지 않음:
+ * 호출자가 데이터 페이지를 읽어야 하므로), 데이터 페이지의 커널 쪽 별칭(HHDM)을 돌려준다.
+ * 실패하면 *out_data_kva 를 NULL 로 남긴다.
+ */
+static void run_user_program(const u8 *start, const u8 *end, volatile u64 **out_data_kva)
 {
+    addr_space_t as;
+    u64 code_phys;
+    u64 data_phys;
+    u64 stack_phys;
     u32 i;
+    Nstatus status;
 
-    memset(g_user_code, 0xCC, sizeof(g_user_code));
-    memcpy(g_user_code, start, (usize)(end - start));
+    *out_data_kva = nNULL;
 
+    if (NSTATUS_IS_ERR(paging_addrspace_create(&as))) {
+        check(0, "paging_addrspace_create() for ring3 test");
+        return;
+    }
+    if (NSTATUS_IS_ERR(pfa_alloc(&code_phys)) ||
+        NSTATUS_IS_ERR(pfa_alloc(&data_phys)) ||
+        NSTATUS_IS_ERR(pfa_alloc(&stack_phys))) {
+        check(0, "pfa_alloc() for ring3 test pages");
+        paging_addrspace_destroy(&as);
+        return;
+    }
+
+    memset((void *)(usize)phys_to_virt(code_phys), 0xCC, PAGE_SIZE);
+    memcpy((void *)(usize)phys_to_virt(code_phys), start, (usize)(end - start));
     for (i = 0; i < 8; i++)
-        ((volatile u64 *)g_user_data)[i] = USER_SENTINEL;
+        ((volatile u64 *)(usize)phys_to_virt(data_phys))[i] = USER_SENTINEL;
 
-    if (process_create(user_runner, nNULL) != Nok) {
-        check(0, "process_create(user_runner)");
+    check(paging_map_page(&as, (void *)(usize)code_phys, (void *)USER_CODE_VADDR, PAGE_USER) == Nok,
+          "map user code page (R-X)");
+    check(paging_map_page(&as, (void *)(usize)data_phys, (void *)USER_DATA_VADDR,
+                          PAGE_RW | PAGE_USER | PAGE_NX) == Nok, "map user data page (RW-)");
+    check(paging_map_page(&as, (void *)(usize)stack_phys, (void *)USER_STACK_VADDR,
+                          PAGE_RW | PAGE_USER | PAGE_NX) == Nok, "map user stack page (RW-)");
+
+    status = process_create_user(as, USER_CODE_VADDR, USER_STACK_VADDR + PAGE_SIZE, 0, &i);
+    (void)status;
+    if (status != Nok) {
+        check(0, "process_create_user() for ring3 test");
+        paging_addrspace_destroy(&as);
         return;
     }
 
@@ -133,22 +164,21 @@ static void run_user_program(const u8 *start, const u8 *end)
         schedule();
         sleep_ms(5);
     }
+
+    *out_data_kva = (volatile u64 *)(usize)phys_to_virt(data_phys);
 }
 
 static void ring3_tests(void)
 {
-    volatile u64 *r = (volatile u64 *)g_user_data;
+    volatile u64 *r = nNULL;
 
     printk("SELFTEST: ring 3 (user mode)\n");
 
-    check(paging_map_page((void *)(usize)virt_to_phys(g_user_code), (void *)USER_CODE_VADDR, PAGE_USER) == Nok,
-          "map user code page (R-X)");
-    check(paging_map_page((void *)(usize)virt_to_phys(g_user_data), (void *)USER_DATA_VADDR,
-                          PAGE_RW | PAGE_USER | PAGE_NX) == Nok, "map user data page (RW-)");
-    check(paging_map_page((void *)(usize)virt_to_phys(g_user_stack), (void *)USER_STACK_VADDR,
-                          PAGE_RW | PAGE_USER | PAGE_NX) == Nok, "map user stack page (RW-)");
+    run_user_program(user_prog1_start, user_prog1_end, &r);
+    check(r != nNULL, "run_user_program(user_prog1) produced a data page");
+    if (!r)
+        return;
 
-    run_user_program(user_prog1_start, user_prog1_end);
     check(live_processes() == 1, "user program exited via NxProcessExit (syscall)");
     check(r[0] == 0, "ring3: syscall instruction -> NxDebugNop == 0");
     check(r[1] == 0, "ring3: int 0x80 -> NxDebugNop == 0");
@@ -166,7 +196,7 @@ static void ring3_tests(void)
     {
         struct nx_sysinfo si;
 
-        memcpy(&si, g_user_data + 0x140, sizeof(si));
+        memcpy(&si, (const void *)(r + (0x140 / 8)), sizeof(si));
         check(si.abi_version_major == (u32)NX_ABI_MAJOR && si.abi_version_minor == (u32)NX_ABI_MINOR,
               "ring3: NxSysInfo abi version matches NX_ABI_VERSION");
         check(si.page_size == (u32)PAGE_SIZE, "ring3: NxSysInfo page_size == 4096");
@@ -177,22 +207,22 @@ static void ring3_tests(void)
     /* --- File I/O: open/read/stat/seek/close --- */
     check((i64)r[11] >= 0, "ring3: NxOpen(app:/hellowld.run, READ) succeeded");
     check(r[12] == 5, "ring3: NxRead first chunk == 5 bytes");
-    check(memcmp(g_user_data + 0x200, "Hello", 5) == 0, "ring3: NxRead first chunk content == \"Hello\"");
+    check(memcmp((const void *)(r + (0x200 / 8)), "Hello", 5) == 0, "ring3: NxRead first chunk content == \"Hello\"");
     check(r[13] == 24, "ring3: NxRead second chunk == remaining 24 bytes (5+24 == 29-byte file)");
-    check(memcmp(g_user_data + 0x205, " from app:/hellowld.run\n", 24) == 0,
+    check(memcmp((const u8 *)r + 0x205, " from app:/hellowld.run\n", 24) == 0,
           "ring3: NxRead second chunk content matches file tail");
     check(r[14] == 0, "ring3: NxStat() == 0");
     {
         struct nx_stat st;
 
-        memcpy(&st, g_user_data + 0x100, sizeof(st));
+        memcpy(&st, (const void *)(r + (0x100 / 8)), sizeof(st));
         check(st.size == 29, "ring3: NxStat size == 29 (file size)");
         check(st.type == NX_TYPE_FILE, "ring3: NxStat type == NX_TYPE_FILE");
         check((st.rights & NX_RIGHT_WRITE) == 0, "ring3: NxStat rights exclude WRITE (opened read-only)");
     }
     check(r[15] == 0, "ring3: NxSeek(SET, 0) -> offset 0");
     check(r[16] == 5, "ring3: NxRead after seek(0) == 5 bytes again");
-    check(memcmp(g_user_data + 0x280, "Hello", 5) == 0, "ring3: NxRead after seek content == \"Hello\"");
+    check(memcmp((const u8 *)r + 0x280, "Hello", 5) == 0, "ring3: NxRead after seek content == \"Hello\"");
 
     /* --- 핸들: 복제는 권한을 넘길 수 없고, 닫힌 핸들은 재사용할 수 없다 --- */
     check((i64)r[17] >= 0, "ring3: NxDuplicateHandle(READ-only file, mask=ALL) succeeded");
@@ -213,14 +243,75 @@ static void ring3_tests(void)
     {
         struct nx_procinfo pi;
 
-        memcpy(&pi, g_user_data + 0x190, sizeof(pi));
+        memcpy(&pi, (const void *)(r + (0x190 / 8)), sizeof(pi));
         check(pi.pid != 0, "ring3: NxProcessInfo pid != 0 (idle thread is pid 0)");
         check(pi.state == PROCESS_RUNNING, "ring3: NxProcessInfo state == RUNNING (queried about itself while running)");
         check(pi.handle_count >= 3U, "ring3: NxProcessInfo handle_count includes stdin/stdout/stderr");
     }
 
-    run_user_program(user_prog2_start, user_prog2_end);
+    /* --- NxProcessCreate 가 알 수 없는(존재하지 않는) 실행 파일을 거부하는지 (syscall 경로) --- */
+    check((i64)r[27] < 0, "ring3: NxProcessCreate(nonexistent path) via syscall is rejected");
+
+    run_user_program(user_prog2_start, user_prog2_end, &r);
     check(live_processes() == 1, "user-mode #GP (hlt) terminated only the user process; kernel survived");
+
+    process_reap_terminated();   /* 두 테스트 프로세스의 전용 주소 공간을 즉시 회수 */
+}
+
+/*
+ * NxProcessCreate 전체 경로 검증: 실제 ELF64 실행 파일(app:/elftest.run, 별도로 빌드되어
+ * initrd 에 들어 있다 — userland/elftest/)을 열고, 검증하고, 새 주소 공간에 세그먼트를
+ * 매핑하고, 64KiB 스택(+가드 페이지)을 만들고, ring3 로 실행한다. 그 프로그램 자신이
+ * .data/.bss/.rodata/스택/파일 읽기/힙(brk 늘리기·줄이기·재확장)을 내부적으로 검사하고
+ * 종료 코드로 결과를 알려준다 (userland/elftest/elftest.c 참고).
+ *
+ * 또한 process_spawn() 이 실패하는 입력(존재하지 않는 파일, ELF 가 아닌 파일)에서 프레임을
+ * 하나도 새어나가게 하지 않는지, 그리고 성공한 프로세스가 완전히 끝난 뒤 process_reap() 이
+ * 전용 주소 공간(ELF 세그먼트 + 힙 + 스택 + 페이지 테이블 전부)을 물리 프레임 할당자에
+ * 정확히 돌려주는지 — 즉 "1-2. 프로세스별 독립 주소공간 / 프로세스 종료 시 페이지테이블 회수"
+ * 요구사항을 자체 점검으로 직접 확인한다.
+ */
+static void spawn_tests(void)
+{
+    u32 pid = 0;
+    i32 code = 0;
+    u64 pfa_before;
+    u64 pfa_after;
+    Nstatus status;
+    int waited;
+
+    printk("SELFTEST: NxProcessCreate (ELF loader, address spaces, heap)\n");
+
+    process_reap_terminated();
+    pfa_before = pfa_free_count();
+
+    status = process_spawn("app:/nonexistent.run", &pid);
+    check(NSTATUS_IS_ERR(status), "process_spawn() rejects a missing executable");
+
+    status = process_spawn("app:/hellowld.run", &pid);   /* 존재하지만 ELF 가 아닌 평문 파일 */
+    check(NSTATUS_IS_ERR(status), "process_spawn() rejects a non-ELF file");
+
+    check(pfa_free_count() == pfa_before, "rejected process_spawn() attempts leaked no frames");
+
+    status = process_spawn("app:/elftest.run", &pid);
+    check(status == Nok, "process_spawn(app:/elftest.run) succeeded");
+
+    if (status == Nok) {
+        for (waited = 0; waited < 400; waited++) {
+            if (process_get_exit_code(pid, &code) == NSTATUS_OK)
+                break;
+            schedule();
+            sleep_ms(5);
+        }
+        check(waited < 400, "elftest process finished within ~2s");
+        check(code == 42,
+              "elftest process exited with code 42 (ELF segments, stack, heap, file I/O all verified inside it)");
+    }
+
+    process_reap_terminated();
+    pfa_after = pfa_free_count();
+    check(pfa_after == pfa_before,
+          "process teardown returned every frame to the allocator (address space + heap + stack, no leak)");
 }
 
 #if NYX_SELFTEST == 4
@@ -240,7 +331,8 @@ static void functional_tests(void)
     u32 i;
     u64 t0;
     u64 t1;
-    void *vaddr = (void *)0x180000000UL;   /* 6GiB: 항등 매핑 범위 밖 (유저 영역) */
+    void *vaddr = (void *)0x180000000UL;   /* 커널 전용 주소 공간의 사용자 영역 안 임의 주소 */
+    addr_space_t kernel_as = paging_kernel_addrspace();
 
     printk("SELFTEST: functional tests\n");
 
@@ -258,22 +350,32 @@ static void functional_tests(void)
     check(sys(NX_SYS_KERNEL_PRINT, 0xFFFFFFFFFFFFFFF0UL) == (i64)NinvalidPointer,
           "syscall 771 non-canonical/kernel-range pointer rejected");
 
-    /* --- 페이징 API + 유저 포인터 검증 --- */
-    memset(g_user_page, 0, sizeof(g_user_page));
-    strcpy((char *)g_user_page, "hello from a user-mapped page via %s %x\n");
+    /* --- 페이징 API + 유저 포인터 검증 (idle 스레드가 쓰는 "커널 전용" 주소 공간에 매핑:
+     * paging_kernel_addrspace() 문서 참고) ---
+     * NxKernelPrint 를 통한 실제 uaccess 검증은 current_process->addrspace 를 보므로,
+     * idle 스레드(addrspace.pml4 == NULL, 즉 "이 프로세스에 속한 사용자 메모리는 없음")로는
+     * 통과할 수 없는 게 맞다. 이 아래 블록만 잠깐 idle 의 addrspace 를 kernel_as 로 바꿔서
+     * "이 주소 공간을 가진 프로세스가 시스템 콜을 했다면" 을 흉내 낸다 (스케줄링이 끼어들지
+     * 않는 동기 구간이므로 안전하다 — 이 함수는 schedule()/sleep_ms() 를 부르지 않는다). */
+    memset(g_scratch_page, 0, sizeof(g_scratch_page));
+    strcpy((char *)g_scratch_page, "hello from a user-mapped page via %s %x\n");
 
-    check(paging_map_page((void *)(usize)virt_to_phys(g_user_page), vaddr, PAGE_RW | PAGE_USER | PAGE_NX) == Nok,
-          "paging_map_page(RW|USER|NX)");
-    check(paging_map_page((void *)(usize)virt_to_phys(g_user_page), vaddr, PAGE_USER) == NalreadyExists,
-          "paging_map_page duplicate -> NalreadyExists");
-    check(paging_map_page((void *)(usize)virt_to_phys(g_user_page), (void *)0x181000000UL, PAGE_RW | PAGE_USER) == Npermission,
-          "paging_map_page RW+X rejected (W^X)");
-    check(paging_is_user_range(vaddr, 4096, true), "paging_is_user_range(mapped, write)");
-    check(!paging_is_user_range(vaddr, 4097, false), "paging_is_user_range spanning unmapped page rejected");
-    check(!paging_is_user_range((void *)0x1000UL, 16, false), "paging_is_user_range(kernel/identity) rejected");
+    check(paging_map_page(&kernel_as, (void *)(usize)virt_to_phys(g_scratch_page), vaddr,
+                          PAGE_RW | PAGE_USER | PAGE_NX) == Nok, "paging_map_page(RW|USER|NX)");
+    check(paging_map_page(&kernel_as, (void *)(usize)virt_to_phys(g_scratch_page), vaddr,
+                          PAGE_USER) == NalreadyExists, "paging_map_page duplicate -> NalreadyExists");
+    check(paging_map_page(&kernel_as, (void *)(usize)virt_to_phys(g_scratch_page), (void *)0x181000000UL,
+                          PAGE_RW | PAGE_USER) == Npermission, "paging_map_page RW+X rejected (W^X)");
+    check(paging_is_user_range(&kernel_as, vaddr, 4096, true), "paging_is_user_range(mapped, write)");
+    check(!paging_is_user_range(&kernel_as, vaddr, 4097, false), "paging_is_user_range spanning unmapped page rejected");
+    check(!paging_is_user_range(&kernel_as, (void *)0x1000UL, 16, false), "paging_is_user_range(kernel/identity) rejected");
+
+    current_process->addrspace = kernel_as;
     check(sys(NX_SYS_KERNEL_PRINT, (u64)(usize)vaddr) == 0, "syscall 771 with user page (format string not expanded above)");
-    check(paging_unmap_page(vaddr) == Nok, "paging_unmap_page");
-    check(!paging_is_user_range(vaddr, 1, false), "unmapped page no longer user-accessible");
+    current_process->addrspace.pml4 = nNULL;
+
+    check(paging_unmap_page(&kernel_as, vaddr) == Nok, "paging_unmap_page");
+    check(!paging_is_user_range(&kernel_as, vaddr, 1, false), "unmapped page no longer user-accessible");
     check(sys(NX_SYS_KERNEL_PRINT, (u64)(usize)vaddr) == (i64)NinvalidPointer, "syscall 771 after unmap rejected");
 
     /* --- 커널 스레드 컨텍스트 스위치 --- */
@@ -302,6 +404,7 @@ static void functional_tests(void)
     }
 
     ring3_tests();
+    spawn_tests();
 
     if (g_failures == 0)
         printk("SELFTEST PASSED\n");
@@ -328,13 +431,13 @@ void nyx_selftest(void)
     *(volatile u8 *)(usize)nyx_selftest = 0x90;
 #elif NYX_SELFTEST == 6
     printk("SELFTEST: executing data page\n");
-    g_user_page[0] = 0xC3;              /* ret */
-    __asm__ volatile ("call *%0" : : "r"(g_user_page) : "memory");
+    g_scratch_page[0] = 0xC3;              /* ret */
+    __asm__ volatile ("call *%0" : : "r"(g_scratch_page) : "memory");
 #elif NYX_SELFTEST == 7
     printk("SELFTEST: triggering #UD\n");
     __asm__ volatile ("ud2");
 #endif
-    (void)g_user_page;
+    (void)g_scratch_page;
     (void)functional_tests;
     (void)kernel_panic_simple;
 }

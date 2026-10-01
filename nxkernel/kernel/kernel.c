@@ -21,6 +21,7 @@
 #include "kernel/kernel.h"
 #include "kernel/process/process.h"
 #include "kernel/paging/paging.h"
+#include "kernel/mm/pfa.h"
 #include "kernel/timer/pit/pit_base.h"
 #include "kernel/error_handling/panic.h"
 #include "console/outputs/printk.h"
@@ -56,6 +57,8 @@ NX_STATIC_ASSERT(ntbli_memmap_base_offset, __builtin_offsetof(NTBLI, memmap_base
 NX_STATIC_ASSERT(ntbli_memmap_size_offset, __builtin_offsetof(NTBLI, memmap_size) == 80);
 
 extern u8 boot_stack_top[];
+extern u8 __boot_start[];
+extern u8 __kernel_end[];
 
 #define TIMER_HZ 100U
 
@@ -449,6 +452,22 @@ void kernel_main(u32 boot_kind, u64 boot_info_phys)
     paging_enable();
     boot_info_relocate();
 
+    /* 4.5. 물리 프레임 할당자: HHDM 이 막 켜졌으므로 이제부터 물리 페이지를 동적으로 내줄 수
+     * 있다. 커널 이미지 자신과 initrd 의 물리 범위는 절대 자유 목록에 들어가면 안 된다 —
+     * Multiboot2(E820 기반) 는 그 두 영역도 "사용 가능"으로 보고할 수 있으므로 메모리 타입과
+     * 무관하게 항상 명시적으로 제외한다 (pfa.h 주석 참고). */
+    {
+        u64 kernel_phys_start = (u64)(usize)__boot_start;
+        u64 kernel_phys_end = ((u64)(usize)__kernel_end - KERNEL_VMA_BASE + (PAGE_SIZE - 1)) & ~(PAGE_SIZE - 1);
+        u64 initrd_phys_start = g_boot_info.initrd_base ? virt_to_phys(g_boot_info.initrd_base) : 0;
+        u64 initrd_phys_end = g_boot_info.initrd_base ? initrd_phys_start + g_boot_info.initrd_size : 0;
+
+        status = pfa_init(&g_boot_info, kernel_phys_start, kernel_phys_end,
+                          initrd_phys_start, initrd_phys_end, paging_hhdm_limit());
+        if (NSTATUS_IS_ERR(status))
+            fatal(status, "Physical frame allocator init failed");
+    }
+
     /* 5. 콘솔 (프레임버퍼는 HHDM 주소로 접근) */
     console_init_from_boot_info(&g_boot_info);
 
@@ -458,6 +477,8 @@ void kernel_main(u32 boot_kind, u64 boot_info_phys)
            (unsigned long)g_boot_info.initrd_size,
            g_boot_info.width, g_boot_info.height);
     printk("GDT/IDT/PIC ready, paging enabled (higher-half, HHDM, W^X, NX, WP)\n");
+    printk("Physical frame allocator ready: %lu free pages (%lu MiB)\n",
+           (unsigned long)pfa_free_count(), (unsigned long)(pfa_free_count() * PAGE_SIZE / (1024UL * 1024UL)));
 
     /* 6. 프로세스 / 타이머 */
     status = process_init();
@@ -498,7 +519,7 @@ void kernel_main(u32 boot_kind, u64 boot_info_phys)
     /* 9. 이제 핸들러가 모두 준비되었으므로 인터럽트를 켠다 */
     sti();
 
-    printk("Kernel initialization complete. Userland loader is not implemented yet.\n");
+    printk("Kernel initialization complete.\n");
 
 #ifdef NYX_SELFTEST
     nyx_selftest();

@@ -33,8 +33,26 @@
 #define NX_SYS_STAT             37U
 #define NX_SYS_DUPLICATE_HANDLE 41U
 
+/*
+ * NxProcessCreate(const char *path) -> pid (실행 파일을 열 수 없거나 ELF 로 인식할 수 없으면
+ * 음수 Nstatus). v1 은 인자를 경로 하나만 받는다 — argv/envp 전달은 아직 없다 (crt0 은
+ * argc=0, argv=[NULL], envp=[NULL] 로 시작한다). 새 프로세스는 부모와 완전히 독립된
+ * 주소 공간을 갖고, 자신만의 stdin/stdout/stderr(콘솔에 새로 연결됨, nx_handles_init)를
+ * 갖는다 — 부모의 다른 핸들을 상속하지는 않는다.
+ */
+#define NX_SYS_PROCESS_CREATE   64U
 #define NX_SYS_PROCESS_EXIT     65U
 #define NX_SYS_PROCESS_INFO     68U
+
+/*
+ * NxVirtualAlloc(increment) -> 새 brk 가상 주소 (u64, 항상 >= 0 이므로 오류와 헷갈리지 않는다)
+ *   increment 는 부호 있는 바이트 수(i64 로 해석): 양수면 힙을 늘리고, 음수면 줄이고,
+ *   0 이면 아무것도 바꾸지 않고 현재 brk 를 그대로 돌려준다 (고전적인 sbrk(0) 관용구).
+ *   현재는 brk(증가분) 방식만 지원한다 — 주소/길이를 직접 지정하는 mmap 스타일 할당이나
+ *   보호 속성 변경은 아직 없다 (NxVirtualFree(97) 은 그 미래 API를 위해 번호만 예약해
+ *   두었고, v1 에서는 구현하지 않는다: 지금은 NxVirtualAlloc 에 음수를 넘기는 것이 "해제"다).
+ */
+#define NX_SYS_VIRTUAL_ALLOC    96U
 
 #define NX_SYS_KERNEL_PRINT     771U
 #define NX_SYS_DEBUG_NOP        777U
@@ -71,6 +89,13 @@
 
 /* ---------------- NxGetTime ---------------- */
 #define NX_CLOCK_MONOTONIC 0UL   /* 부팅 후 경과 시간(나노초). 해상도는 타이머 주기(현재 10ms) */
+/*
+ * NX_CLOCK_REALTIME(1): 번호만 예약해 둔다. 커널에 RTC(실시간 시계) 드라이버가 아직 없어서
+ * NxGetTime 은 이 clock_id 에 대해 Nunsupported 를 반환한다. libc 의 time()/gettimeofday()
+ * 는 이 오류를 (time_t)-1 로 변환해 알려야 한다(정하지 않은 값을 지어내지 않는다) — 실제
+ * 벽시계가 생기기 전까지는 이것이 "모른다"를 정직하게 표현하는 유일한 방법이다.
+ */
+#define NX_CLOCK_REALTIME  1UL
 
 /* ---------------- 제한 ---------------- */
 #define NX_PATH_MAX        256UL      /* NxOpen 경로 (NUL 포함) */
@@ -78,6 +103,11 @@
 #define NX_MAX_HANDLES     32UL       /* 프로세스당 핸들 수 */
 #define NX_SLEEP_MAX_MS    3600000UL  /* NxSleep 최대 1시간 */
 #define NX_PID_SELF        0xFFFFFFFFUL
+
+/* NxVirtualAlloc 남용을 막는 상한(기초적인 DoS 방지). 물리 프레임 할당자는 유한하므로
+ * 프로세스 하나가 한 번의 호출로, 또는 누적으로 전체 RAM 을 다 가져가지 못하게 한다. */
+#define NX_HEAP_GROW_MAX_PER_CALL (256UL * 1024UL * 1024UL)  /* 한 번의 NxVirtualAlloc 상한: 256MiB */
+#define NX_HEAP_MAX_TOTAL         (512UL * 1024UL * 1024UL)  /* 프로세스당 힙 총량 상한: 512MiB */
 
 /* ---------------- 구조체 ---------------- */
 

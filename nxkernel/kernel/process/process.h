@@ -11,8 +11,19 @@
  *    -> 어셈블리(switch.s)로 작성한 callee-saved 레지스터 + rsp 교체 방식으로 교체.
  *  - 프로세스 구조체를 정적 테이블에서 할당하도록 변경했다. (동적 메모리 할당자 부재)
  *
- * 현재 지원: 커널 스레드 생성/종료/양보(협력형 라운드 로빈).
- * 미지원(추후): 타이머 기반 선점, ring3 프로세스 로딩, 프로세스별 주소 공간.
+ * [프로세스별 주소 공간]
+ *  - 커널 스레드(process_create)는 전용 주소 공간이 없다 (addrspace.pml4 == NULL). 이런
+ *    스레드는 항상 "커널 전용" 주소 공간(paging_kernel_cr3())을 공유해서 실행된다 — 사용자
+ *    영역이 아예 없는, HHDM/커널 이미지만 있는 주소 공간이다.
+ *  - 사용자 프로세스(process_create_user)는 paging_addrspace_create() 로 만든 독립된
+ *    PML4 를 가진다 (addrspace.pml4 != NULL). process_switch() 가 이 필드를 보고 CR3 를
+ *    항상 "현재 실행하는 프로세스에 맞게" 바꾼다 — 그래야 시스템 콜이 검사하는 주소 공간
+ *    (current_process->addrspace)과 CPU 가 실제로 쓰는 CR3 가 항상 일치한다.
+ *  - 프로세스가 완전히 정리(process_reap)될 때 전용 주소 공간이면 paging_addrspace_destroy()
+ *    로 회수한다 (모든 PT/PD/PDPT/PML4 및 그 안의 데이터 프레임이 pfa.h 로 돌아간다).
+ *
+ * 현재 지원: 커널 스레드/사용자 프로세스 생성·종료·양보(협력형 라운드 로빈), 프로세스별 주소 공간.
+ * 미지원(추후): 타이머 기반 선점, 프로세스 간 fork/exec, 자식 프로세스 wait.
  */
 #ifndef KERNEL_PROCESS_H
 #define KERNEL_PROCESS_H
@@ -20,6 +31,7 @@
 #include "nyxis.h"
 #include "kernel/process/schedule.h"   /* schedule(): 다음 READY 프로세스로 양보 */
 #include "kernel/syscall/handles.h"      /* 프로세스별 핸들 테이블 */
+#include "kernel/paging/paging.h"        /* addr_space_t */
 
 #define PROCESS_MAX          16U
 #define PROCESS_KSTACK_SIZE  16384U
@@ -49,7 +61,11 @@ typedef struct process {
     void *stack;          /* 인자로 전달되는 값(예: 유저 스택). 커널 스레드는 NULL 가능 */
     process_entry_t entry_point;
 
-    void *cr3;            /* 0 이면 주소 공간 전환 없음 */
+    addr_space_t addrspace;   /* pml4 == NULL 이면 전용 주소 공간이 없는 커널 스레드 */
+    u64   user_entry;         /* 사용자 프로세스: ring3 진입점 가상 주소 (ELF e_entry) */
+    u64   user_stack_top;     /* 사용자 프로세스: ring3 진입 시 RSP (스택 최상단) */
+    u64   heap_start;         /* 사용자 프로세스: 힙(brk) 시작 = ELF 로드 이미지 끝 (페이지 정렬) */
+    u64   heap_brk;           /* 사용자 프로세스: 현재 brk (힙 끝). heap_start 로 초기화됨 */
 
     u64   kernel_rsp;     /* 컨텍스트 스위치 시 저장된 커널 rsp */
     void *kernel_stack;   /* 커널 스택의 최하위 주소 (부트 스레드는 NULL) */
@@ -72,6 +88,24 @@ Nstatus process_init(void);
 
 /* 새 커널 스레드를 만든다. stack 값이 entry_point 의 인자로 전달된다. */
 Nstatus process_create(process_entry_t entry_point, void *stack);
+
+/*
+ * 독립된 주소 공간을 가진 새 사용자(ring3) 프로세스를 만든다.
+ *   as             : paging_addrspace_create() 로 이미 만들어진, 사용자 영역(ELF 세그먼트 +
+ *                     스택)까지 전부 매핑이 끝난 주소 공간. 실패하면 이 함수가 대신 회수하지
+ *                     않으므로 호출자가 paging_addrspace_destroy() 해야 한다.
+ *   entry_vaddr    : ring3 에서 실행을 시작할 가상 주소 (ELF e_entry)
+ *   stack_top_vaddr: ring3 진입 시 RSP (스택 최상단, 이미 as 안에 매핑되어 있어야 함)
+ *   heap_start_vaddr : 힙(brk) 시작 가상 주소 (보통 ELF 로드 이미지 끝, 페이지 정렬)
+ *   out_pid        : 성공하면 새 프로세스의 pid
+ */
+Nstatus process_create_user(
+    addr_space_t as,
+    u64 entry_vaddr,
+    u64 stack_top_vaddr,
+    u64 heap_start_vaddr,
+    u32 *out_pid
+);
 
 /* proc 으로 문맥 전환한다. (proc 은 READY 상태여야 함) */
 Nstatus process_switch(process_t *proc);
@@ -96,6 +130,20 @@ Nstatus process_sleep_ticks(u64 ticks);
 
 /* 살아 있는(종료되지 않은) 프로세스 수 */
 u32 process_count(void);
+
+/*
+ * 이미 종료된(TERMINATED) 프로세스들의 자원(전용 주소 공간 등)을 지금 즉시 회수한다.
+ * 평소에는 다음 프로세스 생성/종료 때 자동으로 수행되지만, 자원 회수를 정확히 확인해야 하는
+ * 자체 점검이나 메모리 압박 시 명시적으로 부를 수 있다.
+ */
+void process_reap_terminated(void);
+
+/*
+ * 종료된(TERMINATED) 프로세스의 종료 코드를 조회한다. 아직 회수(reap)되기 전이어야 한다.
+ * 살아 있으면 Nbusy, 그런 pid 가 없으면(이미 회수되었거나 잘못된 pid) NnotFound.
+ * (이후 NxProcessWait 의 기반이 된다)
+ */
+Nstatus process_get_exit_code(u32 pid, i32 *out_code);
 
 /* asm 에서 호출: 스레드 함수가 반환했을 때의 종료 처리 */
 void process_thread_exit(void) __attribute__((noreturn));

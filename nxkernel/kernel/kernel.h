@@ -20,8 +20,9 @@ void kernel_main(u32 boot_kind, u64 boot_info_phys) __attribute__((noreturn));
 const NTBLI *get_kernel_info(void);
 
 /*
- * ring3 로 진입한다 (iretq). 사용자 주소 공간/유저 스택이 준비된 이후에만 사용할 수 있으며
- * 현재는 유저 프로세스 로더가 없어 사용되지 않는다.
+ * ring3 로 진입한다 (iretq). 호출 시점에 "현재 프로세스의" 주소 공간(CR3)에 entry/stack_top
+ * 이 이미 유효하게 매핑되어 있어야 한다. process_create_user() 가 만든 커널 스레드가 이
+ * 함수를 통해서만 ring3 로 내려간다 (kernel/process/process.c 의 user_process_entry_thunk).
  */
 void enter_ring3(void *entry, void *stack_top) __attribute__((noreturn));
 
