@@ -19,6 +19,9 @@
 #define NX_HANDLE_FREE     0U
 #define NX_HANDLE_CONSOLE  1U   /* stdin/stdout/stderr */
 #define NX_HANDLE_FILE     2U   /* VFS 파일 */
+#define NX_HANDLE_PROCESS  3U   /* 자식 프로세스 (NxProcessCreate). 프로세스 참조 1 개를 가진다 */
+
+struct process;
 
 #define NX_HANDLE_INVALID  0xFFFFFFFFFFFFFFFFUL
 
@@ -28,6 +31,7 @@ typedef struct nx_handle {
     u32 generation;         /* 슬롯 재사용 횟수 */
     u32 console_fd;         /* 콘솔 핸들일 때: 0=in 1=out 2=err */
     handle_t file;          /* 파일 핸들일 때 VFS 핸들 (사본) */
+    struct process *proc;   /* 프로세스 핸들일 때 대상 (이 핸들이 참조 1 개를 소유: 닫을 때 process_release) */
 } nx_handle_t;
 
 typedef struct nx_handle_table {
@@ -51,7 +55,7 @@ Nstatus nx_handle_alloc(nx_handle_table_t *table, u32 type, u32 rights, u64 *out
 Nstatus nx_handle_lookup(nx_handle_table_t *table, u64 handle, u32 required_rights,
                          nx_handle_t **out_slot);
 
-/* 핸들을 닫는다 (파일이면 VFS 핸들도 닫는다). */
+/* 핸들을 닫는다 (파일이면 VFS 핸들도 닫고, 프로세스면 그 참조를 놓는다). */
 Nstatus nx_handle_close(nx_handle_table_t *table, u64 handle);
 
 /* 방금 alloc 했지만 아직 쓰지 않은 슬롯을 되돌린다 (VFS 핸들은 닫지 않는다). 세대는 증가시켜 값을 무효화 */

@@ -18,6 +18,7 @@
 #include "interrupt.h"
 #include "drivers/pic/pic.h"
 #include "kernel/timer/pit/pit_base.h"
+#include "kernel/process/schedule.h"
 
 #define PIT_CMD   0x43
 #define PIT_DATA  0x40
@@ -41,6 +42,7 @@ static void timer_interrupt_handler(struct trap_frame *frame)
 {
     (void)frame;
     timer_tick++;
+    sched_timer_tick();     /* 타임슬라이스 소모. 실제 전환은 interrupt_dispatch 의 선점 지점에서 */
 }
 
 Nstatus timer_init(u32 frequency_hz)

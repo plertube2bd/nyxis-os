@@ -7,23 +7,20 @@
 #include "kernel/process/elf.h"
 #include "kernel/process/umem.h"
 #include "kernel/mm/pfa.h"
+#include "kernel/mm/kheap.h"
 #include "kernel/paging/paging.h"
 #include "drivers/filesystem/vfs.h"
 #include "phys.h"
 #include "memory.h"
 
-/*
- * 스택 페이지들을 할당·매핑하고 System V 초기 스택(argc=0, argv/envp 빈 배열, auxv AT_NULL)을 쓴다.
- * 가드 페이지(NX_USER_STACK_GUARD)는 일부러 매핑하지 않는다.
- */
+/* 스택 페이지들을 할당·매핑한다. 가드 페이지(NX_USER_STACK_GUARD)는 일부러 매핑하지 않는다. */
 static Nstatus map_user_stack(addr_space_t *as)
 {
     u64 page;
-    u64 top_phys = 0;
 
     for (page = NX_USER_STACK_BASE; page < NX_USER_STACK_TOP; page += PAGE_SIZE) {
         u64 phys;
-        Nstatus status = pfa_alloc(&phys);
+        Nstatus status = pfa_alloc(&phys);    /* 0 으로 채워져 있다 */
 
         if (NSTATUS_IS_ERR(status))
             return status;          /* 이미 매핑된 앞쪽 페이지는 호출자가 주소 공간째 파기한다 */
@@ -34,29 +31,128 @@ static Nstatus map_user_stack(addr_space_t *as)
             (void)pfa_free(phys);
             return status;
         }
-
-        if (page + PAGE_SIZE == NX_USER_STACK_TOP)
-            top_phys = phys;
     }
-
-    /* pfa_alloc() 이 0 으로 채워 주지만, 0 이라는 사실에 암묵적으로 기대지 않고 의도를 명시한다.
-     * (argc=0, argv[0]=NULL, envp[0]=NULL, auxv={AT_NULL,0}) — 나중에 argv/envp 를 지원할 때
-     * 이 블록이 채워질 자리다. */
-    memset((u8 *)(usize)phys_to_virt(top_phys) + (PAGE_SIZE - NX_USER_STACK_INIT), 0, NX_USER_STACK_INIT);
 
     return NSTATUS_OK;
 }
 
-Nstatus process_spawn(const char *path, u32 *out_pid)
+/* 아직 CR3 에 실리지 않은 주소 공간 as 의 [vaddr, vaddr+len) 에 HHDM 을 통해 쓴다 (페이지 경계 처리) */
+static Nstatus write_to_addrspace(addr_space_t *as, u64 vaddr, const void *src, usize len)
+{
+    const u8 *s = (const u8 *)src;
+
+    while (len > 0) {
+        u64 phys;
+        usize chunk = (usize)(PAGE_SIZE - (vaddr & (PAGE_SIZE - 1)));
+        Nstatus status = paging_translate(as, vaddr, &phys);
+
+        if (NSTATUS_IS_ERR(status))
+            return status;
+        if (chunk > len)
+            chunk = len;
+
+        memcpy(phys_to_virt(phys), s, chunk);
+        vaddr += chunk;
+        s += chunk;
+        len -= chunk;
+    }
+
+    return NSTATUS_OK;
+}
+
+/* args 의 형식을 검사한다: 상한 이내이고, NUL 로 끝나는 문자열이 정확히 argc+envc 개 */
+static Nstatus validate_args(const spawn_args_t *args)
+{
+    usize i;
+    u32 nuls = 0;
+
+    if ((u64)args->argc + (u64)args->envc > NX_ARGV_MAX || args->size > NX_ARG_MAX)
+        return Noverflow;
+    if (args->size == 0)
+        return (args->argc + args->envc == 0) ? NSTATUS_OK : NinvalidArg;
+    if (!args->strings || args->strings[args->size - 1] != '\0')
+        return NinvalidArg;
+
+    for (i = 0; i < args->size; i++) {
+        if (args->strings[i] == '\0')
+            nuls++;
+    }
+    return (nuls == args->argc + args->envc) ? NSTATUS_OK : NinvalidArg;
+}
+
+/*
+ * System V AMD64 초기 스택을 만든다 (낮은 주소 -> 높은 주소):
+ *   rsp -> argc | argv[0..argc-1] | NULL | envp[0..envc-1] | NULL | AT_NULL(0) 0 | (0 채움) | 문자열들 | 스택 끝
+ * rsp 는 16바이트 정렬. 문자열은 스택 맨 위에 두고 포인터는 그 문자열의 사용자 주소를 가리킨다.
+ */
+static Nstatus build_initial_stack(addr_space_t *as, const spawn_args_t *args, u64 *out_rsp)
+{
+    u32 argc = args ? args->argc : 0;
+    u32 envc = args ? args->envc : 0;
+    usize size = args ? args->size : 0;
+    u64 words = 1UL + (argc + 1UL) + (envc + 1UL) + 2UL;
+    u64 str_base = (NX_USER_STACK_TOP - size) & ~15UL;
+    u64 rsp = (str_base - words * 8UL) & ~15UL;
+    u64 *vec;
+    u64 w = 0;
+    usize off = 0;
+    u32 i;
+    Nstatus status;
+
+    /* 인자가 스택의 대부분을 차지하면 프로그램이 쓸 스택이 없다 (상한상 일어나지 않지만 명시적으로 막는다) */
+    if (rsp < NX_USER_STACK_BASE + NX_USER_STACK_SIZE / 2UL)
+        return Noverflow;
+
+    if (size > 0) {
+        status = write_to_addrspace(as, str_base, args->strings, size);
+        if (NSTATUS_IS_ERR(status))
+            return status;
+    }
+
+    vec = (u64 *)kpage_alloc();           /* 최대 (NX_ARGV_MAX + 5) * 8 = 2088 바이트 < 4KiB */
+    if (!vec)
+        return NoutOfMemory;
+
+    vec[w++] = argc;
+    for (i = 0; i < argc + envc; i++) {
+        if (i == argc)
+            vec[w++] = 0;                 /* argv 끝 */
+        vec[w++] = str_base + off;
+        while (args->strings[off] != '\0')
+            off++;
+        off++;
+    }
+    if (envc == 0)
+        vec[w++] = 0;                     /* envp 가 비어 있으면 루프 안에서 argv 끝을 못 썼다 */
+    vec[w++] = 0;                         /* envp 끝 */
+    vec[w++] = 0;                         /* auxv: AT_NULL */
+    vec[w++] = 0;
+
+    status = write_to_addrspace(as, rsp, vec, (usize)(w * 8UL));
+    kpage_free(vec);
+    if (NSTATUS_IS_ERR(status))
+        return status;
+
+    *out_rsp = rsp;
+    return NSTATUS_OK;
+}
+
+Nstatus process_spawn(const char *path, const spawn_args_t *args, process_t **out_proc)
 {
     handle_t file;
     addr_space_t as;
     u64 entry = 0;
     u64 image_end = 0;
+    u64 rsp = 0;
     Nstatus status;
 
-    if (!path || !out_pid)
+    if (!path || !out_proc)
         return NinvalidArg;
+    if (args) {
+        status = validate_args(args);
+        if (NSTATUS_IS_ERR(status))
+            return status;
+    }
 
     status = vfs_open(path, 1U, &file);         /* 1 = 읽기 */
     if (NSTATUS_IS_ERR(status))
@@ -81,7 +177,13 @@ Nstatus process_spawn(const char *path, u32 *out_pid)
         return status;
     }
 
-    status = process_create_user(as, entry, NX_USER_STACK_TOP - NX_USER_STACK_INIT, image_end, out_pid);
+    status = build_initial_stack(&as, args, &rsp);
+    if (NSTATUS_IS_ERR(status)) {
+        paging_addrspace_destroy(&as);
+        return status;
+    }
+
+    status = process_create_user(as, entry, rsp, image_end, out_proc);
     if (NSTATUS_IS_ERR(status)) {
         paging_addrspace_destroy(&as);
         return status;

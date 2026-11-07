@@ -34,14 +34,31 @@
 #define NX_SYS_DUPLICATE_HANDLE 41U
 
 /*
- * NxProcessCreate(const char *path) -> pid (실행 파일을 열 수 없거나 ELF 로 인식할 수 없으면
- * 음수 Nstatus). v1 은 인자를 경로 하나만 받는다 — argv/envp 전달은 아직 없다 (crt0 은
- * argc=0, argv=[NULL], envp=[NULL] 로 시작한다). 새 프로세스는 부모와 완전히 독립된
- * 주소 공간을 갖고, 자신만의 stdin/stdout/stderr(콘솔에 새로 연결됨, nx_handles_init)를
- * 갖는다 — 부모의 다른 핸들을 상속하지는 않는다.
+ * NxProcessCreate(const char *path, const char *const *argv, const char *const *envp) -> 프로세스 핸들
+ *   argv/envp 는 NULL 로 끝나는 문자열 포인터 배열이며 각각 NULL 이어도 된다 (빈 배열).
+ *   argv[0] 을 커널이 대신 채우지 않는다 — 관례상 호출자가 프로그램 이름을 넣는다.
+ *   문자열 합계(NUL 포함)는 NX_ARG_MAX, 개수 합계는 NX_ARGV_MAX 이하 (넘으면 Noverflow).
+ *   새 프로세스는 System V AMD64 초기 스택(argc, argv[], NULL, envp[], NULL, auxv{AT_NULL})으로 시작한다.
+ *   반환 핸들의 권한: NX_RIGHT_WAIT | NX_RIGHT_KILL | NX_RIGHT_STAT | NX_RIGHT_DUP.
+ *   pid 가 필요하면 NxProcessInfo(핸들) 로 얻는다. 새 프로세스는 부모와 완전히 독립된 주소 공간과
+ *   자신만의 stdin/stdout/stderr(콘솔)를 갖는다 — 부모의 다른 핸들을 상속하지는 않는다.
+ *   핸들을 닫아도 자식은 계속 실행된다 (종료 코드를 받을 수단만 사라진다). 부모가 끝나면 핸들도 닫힌다.
+ *
+ * NxProcessKill(handle) -> 0. NX_RIGHT_KILL 필요. 자식은 종료 코드 NX_EXIT_KILLED 로 끝난다
+ *   (이미 끝났으면 아무것도 하지 않고 0).
+ *
+ * NxProcessWait(handle, timeout_ms, int32_t *out_code) -> 0. NX_RIGHT_WAIT 필요.
+ *   프로세스가 끝날 때까지 잠든다 (CPU 를 쓰지 않는다). timeout_ms 가 NX_WAIT_INFINITE 이면 무기한,
+ *   아니면 그 시간이 지나면 Ntimeout. 성공하면 *out_code 에 종료 코드 (out_code 는 NULL 이어도 된다).
+ *   같은 핸들로 여러 번 기다려도 된다 (종료 코드는 핸들이 닫힐 때까지 남는다).
+ *
+ * NxProcessInfo(NX_PID_SELF 또는 프로세스 핸들, struct nx_procinfo *out) -> 0.
+ *   핸들이면 NX_RIGHT_STAT 필요.
  */
 #define NX_SYS_PROCESS_CREATE   64U
 #define NX_SYS_PROCESS_EXIT     65U
+#define NX_SYS_PROCESS_KILL     66U
+#define NX_SYS_PROCESS_WAIT     67U
 #define NX_SYS_PROCESS_INFO     68U
 
 /*
@@ -59,8 +76,10 @@
 
 /* ---------------- 버전 ---------------- */
 /* NxGetVersion 의 반환값: (major << 32) | (minor << 16) | patch */
-#define NX_ABI_MAJOR   1UL
-#define NX_ABI_MINOR   1UL
+/* 2.0: NxProcessCreate 가 pid 대신 프로세스 핸들을 돌려주고 argv/envp 를 받는다 (호환되지 않는 변경).
+ *      NxProcessKill/NxProcessWait 추가, NxRead(stdin) 이 콘솔 입력을 읽는다. */
+#define NX_ABI_MAJOR   2UL
+#define NX_ABI_MINOR   0UL
 #define NX_ABI_PATCH   0UL
 #define NX_ABI_VERSION ((NX_ABI_MAJOR << 32) | (NX_ABI_MINOR << 16) | NX_ABI_PATCH)
 
@@ -75,7 +94,9 @@
 #define NX_RIGHT_SEEK   0x04UL
 #define NX_RIGHT_STAT   0x08UL
 #define NX_RIGHT_DUP    0x10UL
-#define NX_RIGHT_ALL    0x1FUL
+#define NX_RIGHT_WAIT   0x20UL    /* 프로세스 핸들: NxProcessWait */
+#define NX_RIGHT_KILL   0x40UL    /* 프로세스 핸들: NxProcessKill */
+#define NX_RIGHT_ALL    0x7FUL
 
 /* ---------------- NxOpen 플래그 ---------------- */
 #define NX_O_READ   0x1UL     /* 읽기 */
@@ -103,6 +124,14 @@
 #define NX_MAX_HANDLES     32UL       /* 프로세스당 핸들 수 */
 #define NX_SLEEP_MAX_MS    3600000UL  /* NxSleep 최대 1시간 */
 #define NX_PID_SELF        0xFFFFFFFFUL
+#define NX_ARG_MAX         4096UL     /* NxProcessCreate: argv+envp 문자열 합계 (NUL 포함) */
+#define NX_ARGV_MAX        256UL      /* NxProcessCreate: argv+envp 항목 수 합계 */
+#define NX_WAIT_INFINITE   0xFFFFFFFFFFFFFFFFUL  /* NxProcessWait 시간 제한 없음 */
+#define NX_WAIT_MAX_MS     3600000UL  /* 그 외 timeout_ms 최대 1시간 */
+
+/* 커널이 정하는 종료 코드 (프로그램이 NxProcessExit 로 주는 값과 겹치지 않도록 음수) */
+#define NX_EXIT_FAULT      (-1)       /* 사용자 모드 CPU 예외로 종료됨 */
+#define NX_EXIT_KILLED     (-2)       /* NxProcessKill 로 종료됨 */
 
 /* NxVirtualAlloc 남용을 막는 상한(기초적인 DoS 방지). 물리 프레임 할당자는 유한하므로
  * 프로세스 하나가 한 번의 호출로, 또는 누적으로 전체 RAM 을 다 가져가지 못하게 한다. */
@@ -115,6 +144,7 @@
 #define NX_TYPE_FILE     1U
 #define NX_TYPE_DIR      2U
 #define NX_TYPE_CONSOLE  3U
+#define NX_TYPE_PROCESS  4U
 
 /* NxStat: 32바이트 */
 struct nx_stat {

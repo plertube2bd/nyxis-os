@@ -22,6 +22,7 @@
 #include "kernel/process/process.h"
 #include "kernel/paging/paging.h"
 #include "kernel/mm/pfa.h"
+#include "console/inputs/tty.h"
 #include "kernel/timer/pit/pit_base.h"
 #include "kernel/error_handling/panic.h"
 #include "console/outputs/printk.h"
@@ -510,6 +511,9 @@ void kernel_main(u32 boot_kind, u64 boot_info_phys)
     status = timer_init(TIMER_HZ);
     if (NSTATUS_IS_ERR(status))
         fatal(status, "Timer init failed");
+
+    /* 콘솔 입력: PS/2 키보드(IRQ1) + 시리얼 수신(IRQ4) -> 줄 편집기 -> NxRead(stdin) */
+    tty_init();
 
     /* 7. 파일시스템 */
     status = vfs_init();

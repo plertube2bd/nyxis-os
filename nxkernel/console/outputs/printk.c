@@ -325,6 +325,20 @@ static Nstatus printk_vformat(const char *format, va_list args)
     return NSTATUS_OK;
 }
 
+void printk_backspace(void)
+{
+    serial_putc('\b');
+    serial_putc(' ');
+    serial_putc('\b');
+
+    if (g_fb && g_cursor_x >= FONT_W) {
+        g_cursor_x -= FONT_W;
+        (void)draw_char_bounded(g_fb, g_stride, g_screen_width, g_screen_height,
+                                g_cursor_x, g_cursor_y, (utf8)' ',
+                                CONSOLE_FG, CONSOLE_BG);
+    }
+}
+
 void printk_write(const char *buf, usize len)
 {
     usize i;

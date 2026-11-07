@@ -21,6 +21,8 @@
 #include "kernel/process/process.h"
 #include "kernel/process/spawn.h"
 #include "kernel/process/umem.h"
+#include "kernel/mm/kheap.h"
+#include "console/inputs/tty.h"
 #include "kernel/timer/pit/pit_base.h"
 #include "console/outputs/printk.h"
 #include "drivers/filesystem/vfs.h"
@@ -199,8 +201,21 @@ static i64 sys_read(const u64 *a)
     if (len > NX_IO_MAX)
         len = NX_IO_MAX;                    /* 상한을 넘으면 잘라서 처리 (짧은 읽기는 정상) */
 
+    if (slot->type == NX_HANDLE_CONSOLE) {
+        /* 콘솔 입력: 완성된 줄이 생길 때까지 잠든다 (tty.h). 한 번에 최대 한 줄. 0 = EOF(Ctrl-D) */
+        usize got = 0;
+
+        status = tty_read((char *)chunk, (usize)(len < IO_CHUNK ? len : IO_CHUNK), &got);
+        if (NSTATUS_IS_ERR(status))
+            return (i64)status;
+        status = copy_to_user(buf, chunk, got);   /* 실패하면 이 줄은 버려진다 (사용자 버퍼가 잘못됨) */
+        if (NSTATUS_IS_ERR(status))
+            return (i64)status;
+        return (i64)got;
+    }
+
     if (slot->type != NX_HANDLE_FILE)
-        return (i64)Nunsupported;           /* 콘솔 입력(키보드)은 아직 연결되지 않았다 */
+        return (i64)Nunsupported;
 
     while (total < len) {
         usize want = (usize)((len - total) < IO_CHUNK ? (len - total) : IO_CHUNK);
@@ -347,6 +362,8 @@ static i64 sys_stat(const u64 *a)
 
     if (slot->type == NX_HANDLE_CONSOLE) {
         st.type = NX_TYPE_CONSOLE;
+    } else if (slot->type == NX_HANDLE_PROCESS) {
+        st.type = NX_TYPE_PROCESS;
     } else {
         vfs_stat_t vs;
 
@@ -385,6 +402,9 @@ static i64 sys_duplicate_handle(const u64 *a)
 
     if (slot->type == NX_HANDLE_CONSOLE) {
         dup->console_fd = slot->console_fd;
+    } else if (slot->type == NX_HANDLE_PROCESS) {
+        dup->proc = slot->proc;             /* 같은 프로세스를 가리키는 참조를 하나 더 */
+        process_retain(dup->proc);
     } else {
         /* 드라이버 내부 상태를 공유하지 않도록 파일을 새로 연다 (오프셋은 복사, 이후 독립) */
         status = vfs_reopen(&slot->file, &dup->file);
@@ -401,21 +421,173 @@ static i64 sys_duplicate_handle(const u64 *a)
 /* Process                                                             */
 /* ------------------------------------------------------------------ */
 
-/* NxProcessCreate(const char *path) -> pid */
+/*
+ * 사용자 문자열 포인터 배열(NULL 로 끝남)을 blob 에 이어 붙인다. user_vec 이 0 이면 빈 배열.
+ * blob 의 사용량(*used, 최대 NX_ARG_MAX)과 항목 수(*count, argv+envp 합계 최대 NX_ARGV_MAX)를 갱신한다.
+ */
+static Nstatus collect_user_strings(u64 user_vec, char *blob, usize *used, u32 *count)
+{
+    u64 i;
+
+    if (user_vec == 0)
+        return NSTATUS_OK;
+
+    for (i = 0; ; i++) {
+        u64 ptr = 0;
+        Nstatus status = copy_from_user(&ptr, user_vec + i * 8UL, sizeof(ptr));
+
+        if (NSTATUS_IS_ERR(status))
+            return status;
+        if (ptr == 0)
+            return NSTATUS_OK;
+        if (*count >= NX_ARGV_MAX || *used >= NX_ARG_MAX)
+            return Noverflow;
+
+        status = copy_string_from_user(blob + *used, ptr, (usize)(NX_ARG_MAX - *used));
+        if (status == NpathTooLong)
+            return Noverflow;               /* 문자열 합계가 NX_ARG_MAX 를 넘는다 */
+        if (NSTATUS_IS_ERR(status))
+            return status;
+
+        *used += strlen(blob + *used) + 1U;
+        (*count)++;
+    }
+}
+
+/* NxProcessCreate(const char *path, const char *const *argv, const char *const *envp) -> 프로세스 핸들 */
 static i64 sys_process_create(const u64 *a)
 {
     char path[NX_PATH_MAX];
-    u32 pid = 0;
-    Nstatus status = copy_string_from_user(path, a[0], sizeof(path));
+    nx_handle_table_t *table = cur_handles();
+    nx_handle_t *slot;
+    spawn_args_t args;
+    process_t *proc = nNULL;
+    char *blob;
+    usize used = 0;
+    u32 argc = 0;
+    u32 total = 0;
+    u64 handle;
+    Nstatus status;
+
+    if (!table)
+        return (i64)NnotInitialized;
+
+    status = copy_string_from_user(path, a[0], sizeof(path));
+    if (NSTATUS_IS_ERR(status))
+        return (i64)status;
+
+    blob = (char *)kpage_alloc();           /* NX_ARG_MAX(4KiB) 를 커널 스택에 두지 않는다 */
+    if (!blob)
+        return (i64)NoutOfMemory;
+
+    status = collect_user_strings(a[1], blob, &used, &total);
+    argc = total;
+    if (!NSTATUS_IS_ERR(status))
+        status = collect_user_strings(a[2], blob, &used, &total);
+    if (NSTATUS_IS_ERR(status)) {
+        kpage_free(blob);
+        return (i64)status;
+    }
+
+    /* 핸들 자리를 먼저 확보한다: 프로세스를 만든 뒤에 핸들이 모자라면 아무도 참조하지 않는 프로세스가 생긴다 */
+    status = nx_handle_alloc(table, NX_HANDLE_PROCESS,
+                             (u32)(NX_RIGHT_WAIT | NX_RIGHT_KILL | NX_RIGHT_STAT | NX_RIGHT_DUP),
+                             &handle, &slot);
+    if (NSTATUS_IS_ERR(status)) {
+        kpage_free(blob);
+        return (i64)status;
+    }
+
+    args.argc = argc;
+    args.envc = total - argc;
+    args.size = used;
+    args.strings = blob;
+
+    status = process_spawn(path, &args, &proc);
+    kpage_free(blob);
+    if (NSTATUS_IS_ERR(status)) {
+        nx_handle_discard(slot);
+        return (i64)status;
+    }
+
+    slot->proc = proc;                      /* process_spawn 이 준 참조를 핸들이 소유한다 */
+    return (i64)handle;
+}
+
+/* 프로세스 핸들을 찾아 대상 프로세스를 돌려준다 */
+static Nstatus lookup_process(u64 handle, u32 rights, process_t **out)
+{
+    nx_handle_table_t *table = cur_handles();
+    nx_handle_t *slot;
+    Nstatus status;
+
+    if (!table)
+        return NnotInitialized;
+
+    /* 종류를 먼저 본다: 프로세스 핸들이 아니면 권한과 무관하게 NinvalidArg (오류가 원인을 정확히 말하도록) */
+    status = nx_handle_lookup(table, handle, 0, &slot);
+    if (NSTATUS_IS_ERR(status))
+        return status;
+    if (slot->type != NX_HANDLE_PROCESS || !slot->proc)
+        return NinvalidArg;
+    if ((slot->rights & rights) != rights)
+        return Npermission;
+
+    *out = slot->proc;
+    return NSTATUS_OK;
+}
+
+/* NxProcessKill(handle) */
+static i64 sys_process_kill(const u64 *a)
+{
+    process_t *proc;
+    Nstatus status = lookup_process(a[0], (u32)NX_RIGHT_KILL, &proc);
 
     if (NSTATUS_IS_ERR(status))
         return (i64)status;
 
-    status = process_spawn(path, &pid);
+    return (i64)process_kill(proc, (i32)NX_EXIT_KILLED);   /* 자기 자신의 핸들은 얻을 수 없다 */
+}
+
+/* NxProcessWait(handle, timeout_ms, i32 *out_code) */
+static i64 sys_process_wait(const u64 *a)
+{
+    process_t *proc;
+    u64 timeout_ms = a[1];
+    u64 ticks = 0;
+    i32 code = 0;
+    Nstatus status = lookup_process(a[0], (u32)NX_RIGHT_WAIT, &proc);
+
     if (NSTATUS_IS_ERR(status))
         return (i64)status;
 
-    return (i64)pid;
+    if (timeout_ms == 0) {
+        /* 기다리지 않고 확인만 */
+        if (proc->state != PROCESS_TERMINATED)
+            return (i64)Ntimeout;
+        code = proc->exit_code;
+    } else {
+        if (timeout_ms != NX_WAIT_INFINITE) {
+            u32 hz = timer_get_hz();
+
+            if (timeout_ms > NX_WAIT_MAX_MS)
+                return (i64)NinvalidArg;
+            if (hz == 0)
+                return (i64)Nunsupported;
+            ticks = (timeout_ms * (u64)hz + 999UL) / 1000UL;     /* 올림, 최소 1 tick */
+        }
+
+        status = process_wait(proc, ticks, &code);   /* 핸들이 참조를 가지므로 기다리는 동안 proc 는 유효 */
+        if (NSTATUS_IS_ERR(status))
+            return (i64)status;
+    }
+
+    if (a[2] != 0) {
+        status = copy_to_user(a[2], &code, sizeof(code));
+        if (NSTATUS_IS_ERR(status))
+            return (i64)status;
+    }
+    return 0;
 }
 
 /* NxVirtualAlloc(increment) -> 새 brk (brk 방식 힙 늘리기/줄이기, 자세한 규약은 nyx_abi.h) */
@@ -440,23 +612,26 @@ static i64 sys_process_exit(const u64 *a)
     process_exit_with_code((i32)(a[0] & 0xFFFFFFFFUL));
 }
 
-/* NxProcessInfo(pid, struct nx_procinfo *out): 지금은 자기 자신만 조회할 수 있다 */
+/* NxProcessInfo(NX_PID_SELF 또는 프로세스 핸들(NX_RIGHT_STAT), struct nx_procinfo *out) */
 static i64 sys_process_info(const u64 *a)
 {
     struct nx_procinfo pi;
-    process_t *self = current_process;
+    process_t *p = current_process;
 
-    if (!self)
+    if (!p)
         return (i64)NnotInitialized;
 
-    /* 다른 프로세스의 정보는 권한 모델(capability)이 정해질 때까지 노출하지 않는다 */
-    if (a[0] != NX_PID_SELF && a[0] != (u64)self->pid)
-        return (i64)Npermission;
+    if (a[0] != NX_PID_SELF) {
+        Nstatus status = lookup_process(a[0], (u32)NX_RIGHT_STAT, &p);
+
+        if (NSTATUS_IS_ERR(status))
+            return (i64)status;
+    }
 
     memset(&pi, 0, sizeof(pi));
-    pi.pid = self->pid;
-    pi.state = self->state;
-    pi.handle_count = nx_handles_count(&self->handles);
+    pi.pid = p->pid;
+    pi.state = p->state;
+    pi.handle_count = nx_handles_count(&p->handles);
 
     return (i64)copy_to_user(a[1], &pi, sizeof(pi));
 }
@@ -510,6 +685,8 @@ static const struct syscall_entry g_syscalls[] = {
 
     { NX_SYS_PROCESS_CREATE,   sys_process_create },
     { NX_SYS_PROCESS_EXIT,     sys_process_exit },
+    { NX_SYS_PROCESS_KILL,     sys_process_kill },
+    { NX_SYS_PROCESS_WAIT,     sys_process_wait },
     { NX_SYS_PROCESS_INFO,     sys_process_info },
 
     { NX_SYS_VIRTUAL_ALLOC,    sys_virtual_alloc },
@@ -609,5 +786,5 @@ Nstatus syscall_init(void)
 void syscall_bad_return(void)
 {
     printk("syscall: invalid return address, terminating process\n");
-    process_exit_with_code(-1);
+    process_exit_with_code((i32)NX_EXIT_FAULT);
 }

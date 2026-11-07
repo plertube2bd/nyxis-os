@@ -1,5 +1,5 @@
 ; =========================================================
-; Nyxis OS Syscall ABI v1
+; Nyxis OS Syscall ABI v2 (NX_ABI_VERSION 2.0)
 ; x86_64
 ; =========================================================
 
@@ -20,17 +20,23 @@
 ;
 ;   32 NxOpen(const char *path, flags)    flags: NX_O_READ|NX_O_WRITE -> 핸들
 ;   33 NxClose(handle)
-;   34 NxRead(handle, void *buf, len)     -> 읽은 바이트 수 (0 = EOF)
+;   34 NxRead(handle, void *buf, len)     -> 읽은 바이트 수 (0 = EOF). stdin(콘솔)은 줄 단위:
+;                                          한 줄이 완성될 때까지 잠들고 최대 한 줄을 돌려준다.
+;                                          Ctrl-D = EOF (console/inputs/tty.h)
 ;   35 NxWrite(handle, const void *buf, len) -> 쓴 바이트 수
 ;   36 NxSeek(handle, offset, whence)     whence: NX_SEEK_SET/CUR/END -> 새 오프셋
 ;   37 NxStat(handle, struct nx_stat *out)
 ;   41 NxDuplicateHandle(handle, rights_mask) -> 새 핸들 (권한은 줄이기만 가능)
 ;
-;   64 NxProcessCreate(const char *path)  -> pid. ELF64 ET_EXEC 를 새 주소 공간에 적재하고
-;                                          ring3 로 실행한다. v1 은 argv/envp 없음(경로만).
+;   64 NxProcessCreate(const char *path, argv, envp) -> 프로세스 핸들 (WAIT|KILL|STAT|DUP).
+;                                          ELF64 ET_EXEC 를 새 주소 공간에 적재하고 System V
+;                                          초기 스택(argc/argv/envp/auxv)으로 ring3 실행.
 ;                                          자세한 규약은 include/nyx_abi.h 참고.
 ;   65 NxProcessExit(exit_code)           반환하지 않음
-;   68 NxProcessInfo(pid, struct nx_procinfo *out)  pid 는 지금은 NX_PID_SELF 만 허용
+;   66 NxProcessKill(handle)              NX_RIGHT_KILL. 종료 코드 NX_EXIT_KILLED(-2)
+;   67 NxProcessWait(handle, timeout_ms, int32_t *out_code)  NX_RIGHT_WAIT. 잠들어 기다림.
+;                                          NX_WAIT_INFINITE / 0 = 확인만 / 그 외 ms (Ntimeout)
+;   68 NxProcessInfo(NX_PID_SELF 또는 프로세스 핸들, struct nx_procinfo *out)
 ;
 ;   96 NxVirtualAlloc(increment)          -> 새 brk. 부호 있는 증가분(sbrk 방식): 양수=늘리기,
 ;                                          음수=줄이기, 0=조회. 97(NxVirtualFree)은 미래의
@@ -91,8 +97,8 @@
 
 64  | NxProcessCreate  ; [구현됨]
 65  | NxProcessExit  ; [구현됨]
-66  | NxProcessKill
-67  | NxProcessWait
+66  | NxProcessKill  ; [구현됨]
+67  | NxProcessWait  ; [구현됨]
 68  | NxProcessInfo  ; [구현됨]
 
 69  | NxThreadCreate

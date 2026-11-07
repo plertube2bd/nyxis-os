@@ -16,8 +16,9 @@
  *  - 스택은 항상 NX (실행 금지) + RW 다. paging_map_page 가 W^X 를 강제하므로 우연히라도
  *    RW+X 로 만들 수 없다.
  *  - 진입 시 RSP 는 16바이트 정렬이고 [rsp] 부터 System V AMD64 초기 스택 배치가 놓인다:
- *      argc(8) argv[0]=NULL(8) envp[0]=NULL(8) auxv AT_NULL(16)  -> 총 40바이트 (48 로 올림)
- *    v1 은 argc=0, argv/envp 는 빈 배열이다 (argv/envp 전달은 아직 없다).
+ *      argc | argv[0..argc-1] | NULL | envp[0..envc-1] | NULL | auxv AT_NULL(16) | 0 채움 | 문자열들
+ *    문자열은 스택 맨 위(NX_USER_STACK_TOP 바로 아래)에 놓인다. 인자가 없으면 40바이트(48 로 올림).
+ *    (구현: spawn.c 의 build_initial_stack, 상한: nyx_abi.h 의 NX_ARG_MAX/NX_ARGV_MAX)
  */
 #ifndef KERNEL_PROCESS_UMEM_H
 #define KERNEL_PROCESS_UMEM_H
@@ -29,7 +30,6 @@
 #define NX_USER_STACK_TOP    0x00007FF800000000UL
 #define NX_USER_STACK_BASE   (NX_USER_STACK_TOP - NX_USER_STACK_SIZE)
 #define NX_USER_STACK_GUARD  (NX_USER_STACK_BASE - 4096UL)
-#define NX_USER_STACK_INIT   48UL   /* 초기 argc/argv/envp/auxv 가 차지하는 바이트 (16 정렬) */
 
 /*
  * p 의 힙(brk)을 increment 바이트만큼 키우거나(양수) 줄인다(음수). 0 이면 현재 brk 만 돌려준다.

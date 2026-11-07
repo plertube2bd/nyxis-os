@@ -11,6 +11,7 @@
  *   6 : 데이터 영역 실행    -> NX 로 #PF(instruction fetch) 가 나와야 함
  *   7 : 잘못된 명령(ud2)    -> #UD
  *   8 : 커널 스레드 스택 오버플로 -> 그 스레드의 가드 페이지 #PF -> #DF 덤프 후 패닉 (옆 스택을 덮어쓰지 않음)
+ *   9 : kfree 이중 해제     -> "kfree: double free" 패닉 (조용한 힙 손상 대신)
  */
 
 #include "nyxis.h"
@@ -19,6 +20,9 @@
 #include "kernel/mm/pfa.h"
 #include "kernel/process/process.h"
 #include "kernel/process/spawn.h"
+#include "kernel/process/waitq.h"
+#include "kernel/mm/kheap.h"
+#include "console/inputs/tty.h"
 #include "kernel/syscall/syscall.h"
 #include "kernel/timer/pit/pit_base.h"
 #include "kernel/error_handling/panic.h"
@@ -98,6 +102,19 @@ extern u8 user_prog2_end[];
 #define USER_STACK_VADDR  0x402000UL
 #define USER_SENTINEL     0xDEADBEEFDEADBEEFUL
 
+/* 사용 중인 프로세스 슬롯 수 (종료됐지만 참조가 남은 슬롯 포함) */
+static int count_slots(void)
+{
+    process_t *p;
+    int n = 0;
+
+    for (p = process_list; p; p = p->next) {
+        if (p->in_use)
+            n++;
+    }
+    return n;
+}
+
 /* 살아 있는(종료되지 않은) 프로세스 수 */
 static int live_processes(void)
 {
@@ -128,7 +145,7 @@ static void run_user_program(const u8 *start, const u8 *end, volatile u64 **out_
     u64 data_phys;
     u64 stack_phys;
     u32 i;
-    u32 pid = 0;
+    process_t *proc = nNULL;
     Nstatus status;
 
     *out_data_kva = nNULL;
@@ -159,7 +176,7 @@ static void run_user_program(const u8 *start, const u8 *end, volatile u64 **out_
     check(paging_map_page(&as, (void *)(usize)stack_phys, (void *)USER_STACK_VADDR,
                           PAGE_RW | PAGE_USER | PAGE_NX) == Nok, "map user stack page (RW-)");
 
-    status = process_create_user(as, USER_CODE_VADDR, USER_STACK_VADDR + PAGE_SIZE, 0, &pid);
+    status = process_create_user(as, USER_CODE_VADDR, USER_STACK_VADDR + PAGE_SIZE, 0, &proc);
     if (status != Nok) {
         check(0, "process_create_user() for ring3 test");
         paging_addrspace_destroy(&as);
@@ -167,13 +184,9 @@ static void run_user_program(const u8 *start, const u8 *end, volatile u64 **out_
         return;
     }
 
-    /* 사용자 프로그램이 끝날 때까지 양보하며 대기 (최대 약 1초) 후 종료 코드 수거 */
-    for (i = 0; i < 200; i++) {
-        if (process_get_exit_code(pid, out_exit_code) == NSTATUS_OK)
-            break;
-        schedule();
-        sleep_ms(5);
-    }
+    /* 사용자 프로그램이 끝날 때까지 기다려(최대 약 1초, idle 은 양보하며 폴링) 종료 코드를 받고 참조를 놓는다 */
+    check(process_wait(proc, 100, out_exit_code) == Nok, "ring3 test program terminated (process_wait)");
+    process_release(proc);
 
     *out_data_kva = (volatile u64 *)(usize)phys_to_virt(data_phys);
     *out_data_phys = data_phys;
@@ -292,6 +305,9 @@ static void ring3_tests(void)
  */
 static void spawn_tests(void)
 {
+    static const char elftest_args[] = "elftest\0main\0NYX_TEST=1\0LANG=ko";
+    spawn_args_t args;
+    process_t *proc = nNULL;
     u32 pid = 0;
     i32 code = 0;
     u64 pfa_before;
@@ -299,44 +315,196 @@ static void spawn_tests(void)
     Nstatus status;
     int waited;
 
-    printk("SELFTEST: NxProcessCreate (ELF loader, address spaces, heap)\n");
+    printk("SELFTEST: NxProcessCreate (ELF loader, address spaces, heap, argv/envp, process handles, preemption, stdin)\n");
+
+    args.argc = 2;
+    args.envc = 2;
+    args.size = sizeof(elftest_args);       /* 마지막 NUL 포함 */
+    args.strings = elftest_args;
 
     process_reap_terminated();
     pfa_before = pfa_free_count();
 
-    status = process_spawn("app:/nonexistent.run", &pid);
+    status = process_spawn("app:/nonexistent.run", nNULL, &proc);
     check(NSTATUS_IS_ERR(status), "process_spawn() rejects a missing executable");
 
-    status = process_spawn("app:/hellowld.run", &pid);   /* 존재하지만 ELF 가 아닌 평문 파일 */
+    status = process_spawn("app:/hellowld.run", nNULL, &proc);   /* 존재하지만 ELF 가 아닌 평문 파일 */
     check(NSTATUS_IS_ERR(status), "process_spawn() rejects a non-ELF file");
 
     check(pfa_free_count() == pfa_before, "rejected process_spawn() attempts leaked no frames");
 
-    status = process_spawn("app:/elftest.run", &pid);
-    check(status == Nok, "process_spawn(app:/elftest.run) succeeded");
+    {
+        static const char bad1[] = "a\0b";   /* argc+envc=3 라고 했지만 문자열은 2 개 */
+        spawn_args_t bad;
+
+        bad.argc = 2;
+        bad.envc = 1;
+        bad.size = sizeof(bad1);
+        bad.strings = bad1;
+        check(process_spawn("app:/elftest.run", &bad, &proc) == NinvalidArg,
+              "process_spawn() rejects malformed argv/envp (string count mismatch)");
+        bad.argc = (u32)NX_ARGV_MAX + 1U;
+        bad.envc = 0;
+        check(process_spawn("app:/elftest.run", &bad, &proc) == Noverflow,
+              "process_spawn() rejects more than NX_ARGV_MAX arguments");
+    }
+
+    status = process_spawn("app:/elftest.run", &args, &proc);
+    check(status == Nok, "process_spawn(app:/elftest.run, argv={elftest,main}, envp={NYX_TEST=1,LANG=ko}) succeeded");
 
     if (status == Nok) {
-        /* 종료만 기다린다 (아직 수거하지 않는다) */
-        for (waited = 0; waited < 400 && live_processes() > 1; waited++) {
+        pid = proc->pid;
+
+        /* 끝날 때까지 기다린다. elftest 의 "stdin" 자식은 NxRead(stdin) 에서 잠들어 있으므로,
+         * 잠시 뒤 키 입력을 흉내 내 "ping\n" 과 Ctrl-D(EOF)를 넣어 준다 (실제 IRQ 핸들러와 같은 경로). */
+        for (waited = 0; waited < 600 && live_processes() > 1; waited++) {
+            if (waited == 20) {
+                const char *keys = "ping\n\x04";
+
+                while (*keys)
+                    tty_input_char(*keys++);
+            }
             schedule();
             sleep_ms(5);
         }
-        check(waited < 400, "elftest process finished within ~2s");
+        check(waited < 600, "elftest and all its children finished within ~3s (incl. a killed busy-looping child)");
 
-        /* 회귀: 예전에는 reap(다른 프로세스 생성/명시적 회수) 한 번에 종료 코드가 사라졌다 */
+        /* 주소 공간은 종료 즉시 회수되지만, 참조(핸들)가 남아 있는 동안 슬롯과 종료 코드는 남는다 */
         process_reap_terminated();
         check(pfa_free_count() == pfa_before,
-              "terminated process's address space was reclaimed before its exit code was collected");
-        check(process_get_exit_code(pid, &code) == Nok, "exit code survives reaping until the parent collects it");
+              "terminated processes' address spaces were reclaimed while their slots were still referenced");
+        check(process_wait(proc, 0, &code) == Nok, "exit code is readable while a reference is held");
+        printk("  elftest exit code: %d\n", code);
         check(code == 42,
-              "elftest process exited with code 42 (ELF segments, stack, heap, file I/O, syscall instr all verified inside it)");
-        check(process_get_exit_code(pid, &code) == NnotFound, "an exit code can be collected only once");
+              "elftest exited with code 42 (ELF, stack, heap, files, syscall instr, argv/envp, NxProcessCreate/Wait/Kill, preemption, stdin)");
+        check(process_wait(proc, 0, &code) == Nok && code == 42, "exit code can be read again (not consumed)");
+
+        process_release(proc);
+        check(count_slots() == 1, "releasing the last reference freed every process slot (incl. a child whose handle elftest never closed)");
+        (void)pid;
     }
 
     process_reap_terminated();
     pfa_after = pfa_free_count();
     check(pfa_after == pfa_before,
           "process teardown returned every frame to the allocator (address space + heap + stack, no leak)");
+}
+
+/* 커널 힙: 크기별 할당, 정렬, 겹침 없음, kzalloc, 빈 페이지 반환 */
+static void kheap_tests(void)
+{
+    void *p[64];
+    usize sz[64];
+    u64 pfa0 = pfa_free_count();
+    void *pg;
+    u32 i;
+    usize j;
+    bool ok = true;
+
+    printk("SELFTEST: kernel heap (kmalloc/kfree/kpage)\n");
+
+    check(kmalloc(0) == nNULL && kmalloc(KHEAP_MAX_ALLOC + 1) == nNULL, "kmalloc rejects 0 and > KHEAP_MAX_ALLOC bytes");
+
+    for (i = 0; i < 64; i++) {
+        sz[i] = ((usize)16U << (i % 8U)) - (usize)(i % 3U);
+        p[i] = kmalloc(sz[i]);
+        if (!p[i] || ((u64)(usize)p[i] & 15UL) != 0)
+            ok = false;
+        else
+            memset(p[i], (int)i, sz[i]);
+    }
+    check(ok, "kmalloc 64 objects across all size classes (16-byte aligned)");
+
+    ok = true;
+    for (i = 0; i < 64; i++) {
+        for (j = 0; p[i] && j < sz[i]; j++) {
+            if (((u8 *)p[i])[j] != (u8)i)
+                ok = false;
+        }
+    }
+    check(ok, "kmalloc objects do not overlap (every byte kept its pattern)");
+
+    for (i = 0; i < 64; i += 2)
+        kfree(p[i]);
+    ok = true;
+    for (i = 0; i < 64; i += 2) {
+        p[i] = kzalloc(sz[i]);
+        for (j = 0; p[i] && j < sz[i]; j++) {
+            if (((u8 *)p[i])[j] != 0)
+                ok = false;
+        }
+        if (!p[i])
+            ok = false;
+    }
+    check(ok, "kzalloc returns zeroed memory even when reusing freed slots");
+
+    for (i = 0; i < 64; i++)
+        kfree(p[i]);
+    check(kheap_live_objects() == 0 && kheap_slab_pages() == 0, "kfree of everything leaves no live objects and no slab pages");
+    check(pfa_free_count() == pfa0, "empty slab pages were returned to the frame allocator");
+
+    pg = kpage_alloc();
+    check(pg && ((u64)(usize)pg & 4095UL) == 0 && ((u8 *)pg)[0] == 0 && ((u8 *)pg)[4095] == 0,
+          "kpage_alloc returns a zeroed, page-aligned page");
+    kpage_free(pg);
+    check(pfa_free_count() == pfa0, "kpage_free returned the page");
+}
+
+/* 대기 큐: 깨울 때까지 잠들기, 시간 제한, idle 은 잠들 수 없음 */
+static waitq_t g_test_wq;
+static waitq_t g_test_wq_timeout;
+static volatile i32 g_wq_woken = 99;
+static volatile i32 g_wq_timed = 99;
+
+static void wq_waiter_thread(void *arg)
+{
+    u64 flags = irq_save();
+
+    (void)arg;
+    g_wq_woken = (i32)waitq_sleep_locked(&g_test_wq, 0);
+    irq_restore(flags);
+}
+
+static void wq_timeout_thread(void *arg)
+{
+    u64 flags = irq_save();
+
+    (void)arg;
+    g_wq_timed = (i32)waitq_sleep_locked(&g_test_wq_timeout, 3);
+    irq_restore(flags);
+}
+
+static void waitq_tests(void)
+{
+    u64 flags;
+    u32 i;
+
+    printk("SELFTEST: wait queues\n");
+
+    waitq_init(&g_test_wq);
+    waitq_init(&g_test_wq_timeout);
+
+    flags = irq_save();
+    check(waitq_sleep_locked(&g_test_wq, 1) == Npermission, "idle/boot thread cannot sleep on a wait queue");
+    irq_restore(flags);
+
+    check(process_create(wq_waiter_thread, nNULL) == Nok && process_create(wq_timeout_thread, nNULL) == Nok,
+          "create two waiting kernel threads");
+    for (i = 0; i < 10; i++)
+        schedule();
+    check(g_wq_woken == 99, "a waiter stays asleep until woken (no busy return)");
+
+    check(waitq_wake_all(&g_test_wq) == 1, "waitq_wake_all woke exactly the one waiter");
+    for (i = 0; i < 10; i++)
+        schedule();
+    check(g_wq_woken == (i32)Nok, "woken waiter returned Nok");
+
+    for (i = 0; i < 50 && g_wq_timed == 99; i++) {
+        schedule();
+        sleep_ms(10);
+    }
+    check(g_wq_timed == (i32)Ntimeout, "a waiter with a timeout returns Ntimeout when nobody wakes it");
+    check(waitq_wake_all(&g_test_wq_timeout) == 0, "a timed-out waiter is no longer on the queue");
 }
 
 #if NYX_SELFTEST == 4 || NYX_SELFTEST == 8
@@ -448,6 +616,8 @@ static void functional_tests(void)
         check(strstr("haystack", "st") != nNULL && strstr("ab", "abc") == nNULL, "strstr end-of-haystack safe");
     }
 
+    kheap_tests();
+    waitq_tests();
     ring3_tests();
     spawn_tests();
 
@@ -481,6 +651,16 @@ void nyx_selftest(void)
 #elif NYX_SELFTEST == 7
     printk("SELFTEST: triggering #UD\n");
     __asm__ volatile ("ud2");
+#elif NYX_SELFTEST == 9
+    {
+        void *keep = kmalloc(32);       /* 같은 slab 페이지를 살려 두어 "진짜" 이중 해제 검출 경로를 탄다 */
+        void *p = kmalloc(32);
+
+        printk("SELFTEST: double kfree (expect panic)\n");
+        kfree(p);
+        kfree(p);
+        kfree(keep);
+    }
 #elif NYX_SELFTEST == 8
     printk("SELFTEST: overflowing a kernel thread's stack (expect #DF via guard page)\n");
     (void)process_create(overflow_thread, nNULL);

@@ -18,6 +18,7 @@
 #define UART_MCR        4
 #define UART_LSR        5
 
+#define LSR_DATA_READY  0x01
 #define LSR_THR_EMPTY   0x20
 #define SERIAL_SPIN_MAX 100000UL
 
@@ -52,6 +53,26 @@ Nstatus serial_init(void)
 bool serial_available(void)
 {
     return g_serial_ready;
+}
+
+void serial_enable_rx_interrupt(void)
+{
+    if (!g_serial_ready)
+        return;
+    /* IER bit0: 수신 데이터 있음 인터럽트. MCR 의 OUT2(0x08)는 serial_init 이 이미 켰다 (PC 에서 IRQ 라인 연결) */
+    outb(COM1_BASE + UART_IER, 0x01);
+}
+
+bool serial_rx_ready(void)
+{
+    if (!g_serial_ready)
+        return false;
+    return (inb(COM1_BASE + UART_LSR) & LSR_DATA_READY) ? true : false;
+}
+
+char serial_getc_nowait(void)
+{
+    return (char)inb(COM1_BASE + UART_DATA);
 }
 
 void serial_putc(char c)

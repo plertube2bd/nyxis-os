@@ -139,4 +139,10 @@ bool paging_kernel_page_mapped(const void *virt);
  */
 bool paging_is_user_range(const addr_space_t *as, const void *virt, usize len, bool write);
 
+/*
+ * as 의 사용자 영역에서 virt 가 가리키는 물리 주소(페이지 내 오프셋 포함)를 구한다. 테이블을 바꾸지 않는다.
+ * 매핑이 없으면 NnotFound. (CR3 에 실려 있지 않은 다른 프로세스의 메모리를 커널이 HHDM 으로 채울 때 쓴다)
+ */
+Nstatus paging_translate(const addr_space_t *as, u64 virt, u64 *out_phys);
+
 #endif /* KERNEL_PAGING_H */

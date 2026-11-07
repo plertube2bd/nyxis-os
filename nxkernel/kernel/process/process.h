@@ -1,5 +1,5 @@
 /*
- * process.h - 프로세스/커널 스레드 관리 (협력형 스케줄링)
+ * process.h - 프로세스/커널 스레드 관리 (라운드 로빈, 사용자 모드 선점 — schedule.h)
  *
  * [기존 코드의 문제]
  *  - process_create() 가 process_list 포인터 + sizeof(process_t) * pid 라는 "임의의
@@ -26,20 +26,22 @@
  *  - 종료(TERMINATED)된 프로세스의 "자원"(주소 공간, 핸들)은 CPU 가 그 프로세스에서 벗어나는 즉시
  *    회수한다 (schedule()/생성/종료 경로의 process_reap). 메모리가 다음 프로세스 생성 때까지
  *    묶여 있지 않는다.
- *  - "슬롯"(pid + 종료 코드)은 수거할 주체가 있을 때만 남긴다(zombie):
- *      * 사용자 프로세스(process_create_user)는 부모(생성한 프로세스)가 process_get_exit_code() 로
- *        수거할 때까지 슬롯이 남는다. 예전에는 다른 프로세스 하나만 생성돼도 종료 코드가 사라졌다.
- *      * 커널 스레드(process_create)는 수거 API 가 없으므로 종료 즉시 슬롯도 회수된다(detached).
- *      * 부모가 먼저 종료되면 자식은 고아(detached)가 되어 종료 즉시 회수된다. 이미 zombie 인
- *        자식은 그 자리에서 회수된다 (아무도 수거하지 않아 슬롯이 새는 일이 없다).
+ *  - "슬롯"(pid + 종료 코드)은 참조 카운트(refs)로 관리한다. 참조하는 쪽이 있는 동안에는 종료 후에도
+ *    남아 종료 코드를 읽을 수 있고, 마지막 참조가 사라지면(process_release) 회수된다.
+ *      * 사용자 프로세스(process_create_user)는 만든 쪽이 참조 1 개를 받는다. 시스템 콜 경로에서는 그 참조가
+ *        "프로세스 핸들"(NX_HANDLE_PROCESS)이 된다 — 핸들을 닫거나, 핸들을 가진 프로세스가 끝나면 해제된다.
+ *        그래서 부모가 먼저 끝나도 자식 슬롯이 새지 않는다 (부모의 핸들이 닫히면서 참조가 풀린다).
+ *      * 커널 스레드(process_create)는 참조 0 으로 시작하므로 종료 즉시 슬롯도 회수된다.
+ *      * process_wait() 는 대기 큐(waitq.h)로 종료를 기다린다 (폴링하지 않는다).
  *  - pid 는 단조 증가하며, 한 바퀴 돌면 0(idle)과 사용 중인 pid 를 건너뛴다.
  *
  * [커널 스택 가드]
  *  - 각 커널 스택 바로 아래 4KiB 는 매핑하지 않는다 (process_init 이 해제). 커널 스택이 넘치면
  *    옆 프로세스의 커널 스택을 조용히 덮어쓰는 대신 즉시 #PF -> #DF(IST 스택) -> 패닉 메시지가 난다.
  *
- * 현재 지원: 커널 스레드/사용자 프로세스 생성·종료·양보(협력형 라운드 로빈), 프로세스별 주소 공간.
- * 미지원(추후): 타이머 기반 선점, 프로세스 간 fork/exec, 자식 프로세스 wait.
+ * 현재 지원: 커널 스레드/사용자 프로세스 생성·종료·양보, 사용자 모드 타이머 선점(커널 코드는 비선점),
+ *            프로세스별 주소 공간, 참조 카운트 기반 수명(프로세스 핸들), wait/kill, 대기 큐.
+ * 미지원(추후): 커널 선점, 스레드, SMP.
  */
 #ifndef KERNEL_PROCESS_H
 #define KERNEL_PROCESS_H
@@ -48,6 +50,7 @@
 #include "kernel/process/schedule.h"   /* schedule(): 다음 READY 프로세스로 양보 */
 #include "kernel/syscall/handles.h"      /* 프로세스별 핸들 테이블 */
 #include "kernel/paging/paging.h"        /* addr_space_t */
+#include "kernel/process/waitq.h"        /* waitq_t */
 
 #define PROCESS_MAX          16U
 #define PROCESS_KSTACK_SIZE  16384U
@@ -90,8 +93,13 @@ typedef struct process {
     u64   wake_tick;      /* BLOCKED(sleep) 상태일 때 깨어날 tick. 0 이면 타이머 대기 아님 */
     i32   exit_code;      /* 종료 코드 (NxProcessExit 인자, 예외로 죽으면 -1) */
 
-    u32   parent_pid;     /* 생성한 프로세스의 pid (idle/부트 스레드가 만들었으면 0) */
-    bool  waitable;       /* true: 종료 후 부모가 수거할 때까지 슬롯 유지 (zombie). false: 즉시 회수 */
+    u32   parent_pid;     /* 생성한 프로세스의 pid (idle/부트 스레드가 만들었으면 0). 정보용 */
+    u32   refs;           /* 이 슬롯을 참조하는 수 (프로세스 핸들 등). 0 이고 종료되었으면 슬롯 회수 */
+    u32   slice_ticks;    /* 남은 타임슬라이스 (사용자 모드 선점, schedule.h) */
+
+    waitq_t exit_waiters;      /* 이 프로세스의 종료를 기다리는 프로세스들 */
+    waitq_t *wq;               /* 지금 기다리고 있는 대기 큐 (없으면 NULL) */
+    struct process *wq_next;   /* 그 대기 큐 안의 다음 대기자 */
 
     nx_handle_table_t handles;   /* 이 프로세스의 핸들 테이블 (stdin/stdout/stderr + 열린 파일) */
 
@@ -117,21 +125,35 @@ Nstatus process_create(process_entry_t entry_point, void *stack);
  *   entry_vaddr    : ring3 에서 실행을 시작할 가상 주소 (ELF e_entry)
  *   stack_top_vaddr: ring3 진입 시 RSP (스택 최상단, 이미 as 안에 매핑되어 있어야 함)
  *   heap_start_vaddr : 힙(brk) 시작 가상 주소 (보통 ELF 로드 이미지 끝, 페이지 정렬)
- *   out_pid        : 성공하면 새 프로세스의 pid
+ *   out_proc       : 성공하면 새 프로세스. 호출자는 참조 1 개를 가지며 다 쓰면 process_release() 해야 한다
  */
 Nstatus process_create_user(
     addr_space_t as,
     u64 entry_vaddr,
     u64 stack_top_vaddr,
     u64 heap_start_vaddr,
-    u32 *out_pid
+    process_t **out_proc
 );
 
 /* proc 으로 문맥 전환한다. (proc 은 READY 상태여야 함) */
 Nstatus process_switch(process_t *proc);
 
-/* pid 프로세스를 종료한다. 자기 자신이면 반환하지 않는다. pid 0 은 종료할 수 없다. */
+/* pid 프로세스를 종료한다 (종료 코드 NX_EXIT_KILLED). 자기 자신이면 반환하지 않는다. pid 0 은 종료할 수 없다. */
 Nstatus process_terminate(u32 pid);
+
+/* proc 를 종료 코드 code 로 종료한다 (이미 끝났으면 아무것도 하지 않고 성공). 자기 자신이면 반환하지 않는다. */
+Nstatus process_kill(process_t *proc, i32 code);
+
+/* 참조 카운트. 참조를 가진 동안 proc 포인터는 유효하다(슬롯이 재사용되지 않는다). */
+void process_retain(process_t *proc);
+void process_release(process_t *proc);
+
+/*
+ * proc 가 종료될 때까지 기다려 종료 코드를 돌려준다. 호출자는 proc 의 참조를 가지고 있어야 한다.
+ *   timeout_ticks: 0 이면 무기한. 시간이 다 되면 Ntimeout (프로세스는 계속 실행 중).
+ *   자기 자신을 기다리면 Ndeadlock. idle/부트 스레드가 부르면 잠들 수 없으므로 양보하며 폴링한다.
+ */
+Nstatus process_wait(process_t *proc, u64 timeout_ticks, i32 *out_code);
 
 /* 현재 프로세스 종료 (반환하지 않음). 스레드 함수가 return 하면 자동 호출된다. */
 void process_exit(void) __attribute__((noreturn));
@@ -157,15 +179,6 @@ u32 process_count(void);
  * 자체 점검이나 메모리 압박 시 명시적으로 부를 수 있다. 수거 대기 중인(zombie) 슬롯은 남는다.
  */
 void process_reap_terminated(void);
-
-/*
- * 종료된 자식 프로세스의 종료 코드를 "수거"한다. 성공하면 그 프로세스의 슬롯이 해제되므로
- * 같은 pid 로 다시 부르면 NnotFound 다 (한 번만 수거할 수 있다).
- *   - 호출자(current_process)가 그 프로세스의 부모가 아니면 Npermission
- *   - 아직 살아 있으면 Nbusy, 그런 pid 가 없으면(이미 수거되었거나 잘못된 pid) NnotFound
- * (NxProcessWait 의 기반이 된다)
- */
-Nstatus process_get_exit_code(u32 pid, i32 *out_code);
 
 /* asm 에서 호출: 스레드 함수가 반환했을 때의 종료 처리 */
 void process_thread_exit(void) __attribute__((noreturn));

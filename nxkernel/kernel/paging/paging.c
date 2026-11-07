@@ -712,6 +712,35 @@ static bool user_page_ok(const addr_space_t *as, u64 v, bool write)
     return true;
 }
 
+Nstatus paging_translate(const addr_space_t *as, u64 virt, u64 *out_phys)
+{
+    u64 *t;
+    u64 e = 0;
+    u32 level;
+
+    if (!as || !as->pml4 || !out_phys)
+        return NinvalidArg;
+    if (!is_canonical(virt) || virt >= USER_SPACE_END)
+        return NinvalidArg;
+
+    t = as->pml4;
+    for (level = 0; level < 4; level++) {
+        u32 shift = 39U - 9U * level;
+
+        e = t[(virt >> shift) & 0x1FFU];
+        if (!(e & PAGE_PRESENT))
+            return NnotFound;
+        if (level < 3) {
+            if (e & PAGE_HUGE)
+                return Nunsupported;   /* 사용자 영역에는 큰 페이지를 만들지 않는다 */
+            t = table_of_dyn(e);
+        }
+    }
+
+    *out_phys = (e & ENTRY_ADDR_MASK) | (virt & (PAGE_SIZE - 1));
+    return NSTATUS_OK;
+}
+
 bool paging_is_user_range(const addr_space_t *as, const void *virt, usize len, bool write)
 {
     u64 start = (u64)(usize)virt;

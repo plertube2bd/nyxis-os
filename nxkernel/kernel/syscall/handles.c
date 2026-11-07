@@ -4,6 +4,7 @@
 
 #include "kernel/syscall/handles.h"
 #include "memory.h"
+#include "kernel/process/process.h"
 
 /* 핸들 값 = (세대 << 32) | 슬롯 번호 */
 static u64 make_handle(u32 generation, u32 index)
@@ -96,6 +97,8 @@ Nstatus nx_handle_close(nx_handle_table_t *table, u64 handle)
 
     if (slot->type == NX_HANDLE_FILE)
         (void)vfs_close(&slot->file);
+    else if (slot->type == NX_HANDLE_PROCESS && slot->proc)
+        process_release(slot->proc);      /* 마지막 참조였고 이미 끝났으면 슬롯이 여기서 회수된다 */
 
     {
         u32 gen = slot->generation + 1U;      /* 이 슬롯의 오래된 핸들 값을 무효화 */

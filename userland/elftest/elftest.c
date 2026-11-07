@@ -4,11 +4,24 @@
  * 커널 자체 점검(selftest)이 이 프로그램을 app:/elftest.run 으로 실행하고 종료 코드가 42 인지
  * 확인한다. 실패하면 실패한 검사 번호를 종료 코드로 돌려준다 (1..99). 표준 라이브러리 없이
  * 시스템 콜 래퍼(nyxstd.h)만 쓴다.
+ *
+ * argv[1] 로 역할을 정한다 (자기 자신을 자식 프로세스로 다시 실행해 프로세스 API 를 검사하기 위해):
+ *   "main"  : 전체 검사 (커널 selftest 가 envp = {"NYX_TEST=1", "LANG=ko"} 로 실행)
+ *   "child" : 인자를 확인하고 종료 코드 7 로 끝남
+ *   "stdin" : NxRead(stdin) 으로 "ping\n" 한 줄, 이어서 EOF(0 바이트)를 읽으면 종료 코드 11
+ *             (입력은 커널 selftest 가 키 입력을 흉내 내 넣어 준다 — 그 전까지 이 프로세스는 잠든다)
+ *   "spin"  : 사용자 모드에서 영원히 돈다 (선점과 NxProcessKill 검사용)
  */
 #include <nyxstd.h>
 #include <nyx_abi.h>
 
 #define PASS_CODE 42
+
+/* 커널 Nstatus 오류 값 (include/types.h: NSTATUS_ERR_FLAG | code, i32 를 부호 확장) */
+#define ST_ERR(code)    ((long)(int)(0x80000000U | (unsigned int)(code)))
+#define Npermission     ST_ERR(4)
+#define Ntimeout        ST_ERR(5)
+#define NinvalidArg     ST_ERR(2)
 
 static long sc(unsigned long nr, unsigned long a0, unsigned long a1, unsigned long a2)
 {
@@ -63,6 +76,116 @@ static int stack_test(void)
     return 1;
 }
 
+static int seq(const char *a, const char *b)
+{
+    while (*a && *a == *b) {
+        a++;
+        b++;
+    }
+    return *a == *b;
+}
+
+static long create(const char *mode)
+{
+    const char *args[3];
+
+    args[0] = "elftest";
+    args[1] = mode;
+    args[2] = 0;
+    return (long)syscall_wrapper(NX_SYS_PROCESS_CREATE, (unsigned long)"app:/elftest.run",
+                                 (unsigned long)args, 0, 0, 0, 0);
+}
+
+static long pwait(long h, unsigned long timeout_ms, int *code)
+{
+    return sc(NX_SYS_PROCESS_WAIT, (unsigned long)h, timeout_ms, (unsigned long)code);
+}
+
+/* "stdin" 역할: 한 줄을 읽고, 이어서 EOF 를 읽는다 */
+static int stdin_child(void)
+{
+    char buf[64];
+    long r;
+
+    r = sc(NX_SYS_READ, NX_HANDLE_STDIN, (unsigned long)buf, sizeof(buf));
+    if (r != 5 || buf[0] != 'p' || buf[3] != 'g' || buf[4] != '\n')
+        return 12;
+    r = sc(NX_SYS_READ, NX_HANDLE_STDIN, (unsigned long)buf, sizeof(buf));
+    if (r != 0)
+        return 13;
+    return 11;
+}
+
+/* 프로세스 API 검사 (main 역할에서만). 실패하면 50번대 코드 */
+static int process_tests(void)
+{
+    long h;
+    long hd;
+    int code = 0;
+    struct nx_procinfo self;
+    struct nx_procinfo pi;
+
+    if (sc(NX_SYS_PROCESS_INFO, NX_PID_SELF, (unsigned long)&self, 0) != 0)
+        return 50;
+
+    /* 자식이 인자를 받고 종료 코드를 돌려준다. 기다리는 동안 이 프로세스는 잠든다 */
+    h = create("child");
+    if (h < 0)
+        return 51;
+    if (pwait(h, NX_WAIT_INFINITE, &code) != 0 || code != 7)
+        return 52;
+    if (pwait(h, 0, &code) != 0 || code != 7)
+        return 53;                      /* 핸들을 닫기 전까지 종료 코드는 다시 읽을 수 있다 */
+    if (sc(NX_SYS_PROCESS_INFO, (unsigned long)h, (unsigned long)&pi, 0) != 0 ||
+        pi.pid == self.pid || pi.state != 3)
+        return 54;
+    if (sc(NX_SYS_CLOSE, (unsigned long)h, 0, 0) != 0)
+        return 55;
+
+    /* 콘솔 입력: 자식은 입력이 올 때까지 NxRead 에서 잠들어 있다가 깨어난다 */
+    h = create("stdin");
+    if (h < 0)
+        return 56;
+    if (pwait(h, NX_WAIT_INFINITE, &code) != 0 || code != 11)
+        return 57;
+    (void)sc(NX_SYS_CLOSE, (unsigned long)h, 0, 0);
+
+    /* 선점 + 강제 종료: 자식은 사용자 모드에서 영원히 돈다. 선점이 없으면 아래 NxSleep 이 돌아오지 않는다 */
+    h = create("spin");
+    if (h < 0)
+        return 58;
+    if (sc(NX_SYS_SLEEP, 30, 0, 0) != 0)
+        return 59;
+    if (pwait(h, 20, &code) != (long)Ntimeout)
+        return 60;                      /* 아직 돌고 있다 */
+    hd = sc(NX_SYS_DUPLICATE_HANDLE, (unsigned long)h, NX_RIGHT_WAIT | NX_RIGHT_STAT, 0);
+    if (hd < 0)
+        return 61;
+    if (sc(NX_SYS_PROCESS_KILL, (unsigned long)hd, 0, 0) != (long)Npermission)
+        return 62;                      /* KILL 권한 없는 복제 핸들로는 죽일 수 없다 */
+    if (sc(NX_SYS_PROCESS_KILL, (unsigned long)h, 0, 0) != 0)
+        return 63;
+    if (pwait(h, NX_WAIT_INFINITE, &code) != 0 || code != NX_EXIT_KILLED)
+        return 64;
+    if (pwait(hd, 0, &code) != 0 || code != NX_EXIT_KILLED)
+        return 65;                      /* 복제 핸들도 같은 프로세스를 가리킨다 */
+    (void)sc(NX_SYS_CLOSE, (unsigned long)h, 0, 0);
+    (void)sc(NX_SYS_CLOSE, (unsigned long)hd, 0, 0);
+
+    /* 잘못된 사용 */
+    if (pwait((long)NX_HANDLE_STDOUT, 0, &code) != (long)NinvalidArg)
+        return 66;                      /* 프로세스 핸들이 아니다 */
+    if (sc(NX_SYS_PROCESS_CREATE, (unsigned long)"app:/nonexistent.run", 0, 0) >= 0)
+        return 67;
+
+    /* 일부러 닫지 않는 핸들: 이 프로세스가 끝나면 커널이 닫고 자식 슬롯을 회수해야 한다
+     * (커널 selftest 가 "프레임/슬롯 누수 없음" 으로 확인한다) */
+    if (create("child") < 0)
+        return 68;
+
+    return 0;
+}
+
 int elftest_main(long argc, char **argv);
 
 int elftest_main(long argc, char **argv)
@@ -75,12 +198,29 @@ int elftest_main(long argc, char **argv)
     long fd;
     char hello[8];
     long r;
+    char **envp;
 
-    /* 1. 초기 스택 규약: argc=0, argv[0]=NULL */
-    if (argc != 0)
+    /* 1. 초기 스택 규약: argc, argv[], NULL, envp[], NULL */
+    if (argc != 2 || !argv[0] || !argv[1] || argv[2] != 0)
         return 1;
-    if (argv[0] != 0)
+    if (!seq(argv[0], "elftest"))
         return 2;
+    envp = argv + argc + 1;
+
+    if (seq(argv[1], "child"))
+        return (envp[0] == 0) ? 7 : 8;  /* 자식에게는 환경을 넘기지 않았다 */
+    if (seq(argv[1], "stdin"))
+        return stdin_child();
+    if (seq(argv[1], "spin")) {
+        for (;;)
+            g_data++;                   /* volatile 전역: 컴파일러가 루프를 없애지 못한다 */
+    }
+    if (!seq(argv[1], "main"))
+        return 26;
+    if (!envp[0] || !seq(envp[0], "NYX_TEST=1") || !envp[1] || !seq(envp[1], "LANG=ko") || envp[2] != 0)
+        return 27;
+    if (envp[3] != 0 || envp[4] != 0)
+        return 28;                      /* auxv: AT_NULL(0, 0) */
 
     /* 2. .data 초기값, .bss 0 초기화, 둘 다 쓰기 가능 */
     if (g_data != 0x1234)
@@ -163,6 +303,11 @@ int elftest_main(long argc, char **argv)
         return 24;
     if (sc(NX_SYS_GET_VERSION, 0, 0, 0) != (long)NX_ABI_VERSION)
         return 25;                      /* int 0x80 경로와 섞어 써도 된다 */
+
+    /* 9. 프로세스 핸들 / Wait / Kill / 선점 / 콘솔 입력 */
+    r = process_tests();
+    if (r != 0)
+        return (int)r;
 
     say("elftest: ALL PASS\n");
     return PASS_CODE;

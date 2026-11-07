@@ -155,6 +155,8 @@ KERNEL_C_SRCS = \
 	kernel/process/umem.c \
 	kernel/process/spawn.c \
 	kernel/mm/pfa.c \
+	kernel/mm/kheap.c \
+	kernel/process/waitq.c \
 	kernel/process/schedule.c \
 	kernel/syscall/syscall.c \
 	kernel/syscall/uaccess.c \
@@ -166,6 +168,7 @@ KERNEL_C_SRCS = \
 	console/outputs/outputs_base.c \
 	console/outputs/serial.c \
 	console/inputs/inputs_base.c \
+	console/inputs/tty.c \
 	graphics/graphics_base.c \
 	$(ROOT)/drivers/ahci/ahci.c \
 	$(ROOT)/drivers/ata/ata.c \

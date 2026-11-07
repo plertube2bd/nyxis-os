@@ -470,3 +470,76 @@ gdb 로 진입 시점을 보면 0x100000~ 커널 영역 전체가 0 이었다 (C
   (부트로더 변경과 무관한 경로).
 - 고아 프로세스 처리(부모가 먼저 종료되는 경우)는 코드 리뷰로만 확인했다 (사용자 프로세스가 자식을 만든 뒤
   먼저 끝나는 점검은 아직 없다).
+
+## 11. 사용자 모드 선점 / 대기 큐 / 프로세스 핸들(Wait·Kill·argv) / 커널 힙 / 콘솔 입력 (6차 작업)
+
+10절 끝에서 정한 다음 단계 1~4 를 구현했다. 가장 큰 동기는 "사용자 프로그램 하나가 `for(;;);` 를 돌면
+OS 전체가 멈춘다" 는 것이었다 (타이머 IRQ 가 tick 만 올리고 스케줄러를 부르지 않았다).
+
+### 11.1 사용자 모드 선점 (`schedule.h/.c`, `interrupt.c`, `pit_base.c`)
+
+- 타이머 IRQ 마다 현재 프로세스의 타임슬라이스(`SCHED_SLICE_TICKS` = 5 tick = 50ms)를 줄이고, 다 쓰면
+  `need_resched` 를 표시한다. 대기 큐에서 누가 깨어날 때도 표시한다.
+- 실제 전환은 IRQ 가 **ring3 로 돌아가기 직전, EOI 를 보낸 뒤** `sched_preempt_point()` 에서만 일어난다.
+  EOI 전에 전환하면 다른 프로세스가 도는 동안 그 IRQ 라인이 막힌다. 커널 코드는 여전히 비선점이므로
+  VFS/드라이버 락 규칙은 바뀌지 않는다 (시스템 콜은 IF=0, 커널 스레드는 ring0 이라 선점 지점이 없다).
+- 프로세스마다 커널 스택이 따로 있어서 IRQ 프레임 위에서 그대로 `cpu_switch_context` 할 수 있다.
+
+### 11.2 대기 큐 (`kernel/process/waitq.h/.c`)
+
+`waitq_sleep_locked(q, timeout)` / `waitq_wake_all/one(q)`. 깨움 신호를 놓치지 않도록 "조건 검사 + 잠들기"를
+IRQ 를 끈 채로 하는 규칙을 헤더에 적었다. 프로세스는 `process_t.wq/wq_next` 로 큐에 직접 매달리므로
+할당이 필요 없다. 타임아웃은 기존 sleep 의 `wake_tick` 을 재사용한다 (깨어났는데 아직 큐에 있으면 시간 초과).
+종료되는 프로세스는 큐에서 빠진다 — 그래서 잠든 동안 자원을 쥐고 있으면 안 된다는 제약도 헤더에 적었다.
+idle/부트 스레드는 잠들 수 없다 (`Npermission`; 그 스레드는 폴링).
+
+### 11.3 프로세스 핸들, NxProcessWait(67)/NxProcessKill(66), argv/envp — ABI 2.0
+
+- 10.4 의 parent_pid/waitable 방식을 **참조 카운트**로 대체했다. `process_create_user()` 는 참조 1 개와 함께
+  `process_t *` 를 돌려주고, 시스템 콜 경로에서는 그 참조를 `NX_HANDLE_PROCESS` 핸들이 소유한다.
+  핸들을 닫거나 핸들을 가진 프로세스가 끝나면 참조가 풀리므로, 부모가 먼저 끝나도 자식 슬롯이 새지 않는다.
+  권한은 핸들이 가진다 (`NX_RIGHT_WAIT`, `NX_RIGHT_KILL` 신설 — 복제 시 줄일 수만 있다).
+- `NxProcessCreate(path, argv, envp)` 가 pid 대신 핸들을 돌려준다 (호환되지 않는 변경 → `NX_ABI_MAJOR` 2).
+  argv/envp 는 커널 페이지 하나(`kpage_alloc`)로 복사한 뒤(합계 `NX_ARG_MAX` 4KiB, `NX_ARGV_MAX` 256 개),
+  새 주소 공간의 스택 맨 위에 System V 배치(argc, argv[], NULL, envp[], NULL, auxv AT_NULL)로 써 넣는다
+  (`paging_translate()` 신설 — CR3 에 실리지 않은 주소 공간을 HHDM 으로 채운다).
+- `NxProcessWait(handle, timeout_ms, &code)`: 자식의 `exit_waiters` 대기 큐에서 잠든다 (폴링 없음).
+  종료 코드는 핸들이 닫힐 때까지 여러 번 읽을 수 있다. `NxProcessKill(handle)`: 종료 코드 `NX_EXIT_KILLED`(-2).
+  사용자 모드 예외로 죽은 경우는 `NX_EXIT_FAULT`(-1). `NxProcessInfo` 는 `NX_PID_SELF` 또는 프로세스 핸들.
+- 프로세스 핸들에 대한 잘못된 시스템 콜은 종류를 먼저 검사한다 (stdout 에 Wait 하면 `Npermission` 이 아니라 `NinvalidArg`).
+
+### 11.4 커널 힙 (`kernel/mm/kheap.h/.c`)
+
+PFA + HHDM 위의 크기별 slab: 16~2048 바이트 8 클래스, 페이지 머리 64 바이트 헤더(매직, 클래스, 사용 수,
+256 비트 사용 비트맵). 빈 페이지는 즉시 PFA 로 돌려주므로 "프레임 누수 없음" 점검이 힙 사용 후에도 성립한다.
+`kfree` 는 매직/칸 경계/사용 비트를 검사해 이중 해제나 힙이 아닌 포인터를 즉시 패닉시키고, 해제한 칸은 0xDE 로
+채운다. 4KiB 는 `kpage_alloc/kpage_free`. 여러 페이지 연속 할당(vmalloc)은 아직 없다.
+지금은 argv 버퍼 등에 쓰고, 정적 테이블(프로세스 16, 핸들 32 등)을 동적으로 바꾸는 것은 다음 작업이다.
+
+### 11.5 콘솔 입력: NxRead(stdin) (`console/inputs/tty.h/.c`, `inputs_base.c`, `serial.c`)
+
+- 폴링 전용이고 아무도 부르지 않던 PS/2 코드를 IRQ1 드라이버로 바꿨다 (i8042 설정 바이트로 IRQ 허용,
+  컨트롤러가 없으면 건너뜀, Ctrl 조합 지원). COM1 수신 인터럽트(IRQ4)도 켰다. 둘 다 같은 줄 편집기로 들어간다.
+- 줄 편집기: 에코, Backspace(`printk_backspace()` 신설), Ctrl-U, Ctrl-D(EOF). Enter 로 완성된 줄만 읽힌다.
+- `NxRead(stdin)` 은 완성된 줄이 생길 때까지 대기 큐에서 잠들고, 한 번에 최대 한 줄을 돌려준다. EOF 는 0.
+
+### 11.6 검증
+
+- `SELFTEST=1`: 105 개 점검 전부 통과. 새 점검: 커널 힙(클래스별 할당/정렬/겹침 없음/kzalloc/빈 페이지 반환/
+  kpage), 대기 큐(깨울 때까지 잠듦, 깨움, 시간 초과, idle 은 잠들 수 없음), 잘못된 argv 거부, 참조가 남아 있는 동안
+  주소 공간은 회수되고 종료 코드는 남음, 마지막 참조 해제 시 모든 슬롯 회수(elftest 가 일부러 닫지 않은 자식 핸들 포함).
+- elftest(사용자 프로그램)가 자기 자신을 자식으로 다시 실행해 검사한다: argv/envp/auxv 배치, 자식 종료 코드(Wait),
+  stdin 자식이 NxRead 에서 잠들었다가 입력으로 깨어남, **바쁘게 도는 자식을 둔 채 부모의 NxSleep 이 돌아옴(선점)**,
+  Wait 시간 초과, KILL 권한 없는 복제 핸들로는 Kill 불가, Kill 후 종료 코드 -2.
+- 회귀 확인: 선점 지점을 막으면 바쁘게 도는 자식이 CPU 를 독점해 시스템이 멈춘다 (selftest 가 끝나지 않음).
+- 실제 입력 IRQ 경로: selftest 의 입력 흉내를 끄고 QEMU 모니터 `sendkey`(PS/2 IRQ1)와 시리얼 소켓(IRQ4)으로
+  "ping⏎" + Ctrl-D 를 보냈을 때 둘 다 elftest 가 통과했다.
+- `SELFTEST=9`(신설): 이중 kfree -> "kfree: double free" 패닉. `SELFTEST=8`, `make check`, `make test-host`,
+  SELFTEST 없는 일반 빌드 부팅도 재확인.
+
+### 검증하지 못한 것 / 남은 문제
+
+- 실제 하드웨어(PS/2 가 없는 USB 키보드 전용 PC 에서는 키보드 입력이 없다 — USB HID 드라이버가 필요).
+- 커널 코드 선점, SMP. 시스템 콜 실행 중에는 여전히 인터럽트가 꺼져 있다 (긴 디스크 I/O 동안 IRQ 지연).
+- IRQ 안의 에코는 다른 커널 출력과 섞일 수 있다 (printk 에 락이 없음; 단일 코어라 손상은 없고 글자 순서만 섞임).
+- Makefile 은 컴파일 플래그 변경을 추적하지 않는다: `SELFTEST=` 값을 바꿔 빌드할 때는 `make clean` 이 필요하다.

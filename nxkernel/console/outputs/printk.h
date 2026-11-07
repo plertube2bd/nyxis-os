@@ -23,6 +23,9 @@ Nstatus printk(const char *format, ...);
  */
 void printk_write(const char *buf, usize len);
 
+/* 마지막으로 출력한 글자 하나를 지운다 (콘솔 입력 에코의 백스페이스용: 시리얼 "\b \b", 프레임버퍼 커서 후퇴) */
+void printk_backspace(void);
+
 /*
  * 프레임버퍼 콘솔 초기화. 프레임버퍼가 없거나 값이 이상하면 NinvalidArg 를 반환하며,
  * 이 경우에도 printk 는 시리얼로는 계속 출력한다.

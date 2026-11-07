@@ -11,6 +11,7 @@
 #include "memory.h"
 #include "phys.h"
 #include "kernel/timer/pit/pit_base.h"
+#include "kernel/process/waitq.h"
 
 /* Process list */
 process_t *process_list = nNULL;
@@ -50,7 +51,8 @@ static void free_slot_locked(process_t *p, process_t *prev)
 /*
  * 종료된 프로세스들을 정리한다 (인터럽트가 꺼진 상태에서 호출).
  *  - 자원(전용 주소 공간)은 항상 즉시 회수한다.
- *  - 슬롯은 수거할 주체가 없을 때(!waitable)만 회수한다. 부모가 수거할 zombie 는 남긴다.
+ *  - 슬롯은 아무도 참조하지 않을 때(refs == 0)만 회수한다. 프로세스 핸들 등이 참조하는 동안은
+ *    종료 코드를 읽을 수 있도록 남긴다.
  * 현재 실행 중인 프로세스는 제외한다: 아직 그 커널 스택과 CR3 위에서 실행 중일 수 있다.
  */
 static void process_reap(void)
@@ -67,7 +69,7 @@ static void process_reap(void)
             if (p->addrspace.pml4)
                 paging_addrspace_destroy(&p->addrspace);
 
-            if (!p->waitable) {
+            if (p->refs == 0) {
                 free_slot_locked(p, prev);
                 p = next;
                 continue;           /* prev 는 그대로 */
@@ -76,17 +78,6 @@ static void process_reap(void)
 
         prev = p;
         p = next;
-    }
-}
-
-/* 종료하는 프로세스 pid 의 자식들을 고아(detached)로 만든다. 이미 zombie 인 자식은 다음 reap 에서 회수된다. */
-static void detach_children_locked(u32 pid)
-{
-    process_t *p;
-
-    for (p = process_list; p; p = p->next) {
-        if (p->in_use && p->pid != pid && p->parent_pid == pid)
-            p->waitable = false;
     }
 }
 
@@ -183,7 +174,9 @@ static process_t *alloc_process_locked(process_entry_t entry, void *arg)
     proc->state = PROCESS_READY;
     proc->entry_point = entry;
     proc->kernel_stack = kstack_bottom(slot);
+    proc->slice_ticks = SCHED_SLICE_TICKS;
     proc->in_use = true;
+    waitq_init(&proc->exit_waiters);
     nx_handles_init(&proc->handles);
 
     sp = (u64 *)(usize)((u64)(usize)kstack_bottom(slot) + PROCESS_KSTACK_SIZE);
@@ -221,8 +214,7 @@ Nstatus process_create(process_entry_t entry_point, void *stack)
         irq_restore(flags);
         return NprocessFailed;
     }
-    proc->stack = stack;
-    proc->waitable = false;        /* 커널 스레드: 수거 API 가 없으므로 종료 즉시 회수 */
+    proc->stack = stack;           /* refs = 0: 커널 스레드는 아무도 참조하지 않으므로 종료 즉시 회수 */
 
     irq_restore(flags);
     return NSTATUS_OK;
@@ -248,12 +240,12 @@ Nstatus process_create_user(
     u64 entry_vaddr,
     u64 stack_top_vaddr,
     u64 heap_start_vaddr,
-    u32 *out_pid
+    process_t **out_proc
 ) {
     process_t *proc;
     u64 flags;
 
-    if (!as.pml4 || !out_pid)
+    if (!as.pml4 || !out_proc)
         return NinvalidArg;
     if (!process_list)
         return NnotInitialized;
@@ -270,9 +262,9 @@ Nstatus process_create_user(
     proc->user_stack_top = stack_top_vaddr;
     proc->heap_start = heap_start_vaddr;
     proc->heap_brk = heap_start_vaddr;
-    proc->waitable = true;         /* 부모가 process_get_exit_code() 로 수거할 때까지 슬롯 유지 */
+    proc->refs = 1;                /* 호출자의 참조. 호출자가 process_release() 할 때까지 슬롯 유지 */
 
-    *out_pid = proc->pid;
+    *out_proc = proc;
 
     irq_restore(flags);
     return NSTATUS_OK;
@@ -307,6 +299,7 @@ Nstatus process_switch(process_t *proc)
 
     current_process = proc;
     proc->state = PROCESS_RUNNING;
+    proc->slice_ticks = SCHED_SLICE_TICKS;
 
     cpu_switch_context(&old->kernel_rsp, proc->kernel_rsp);
 
@@ -315,9 +308,42 @@ Nstatus process_switch(process_t *proc)
     return NSTATUS_OK;
 }
 
+/*
+ * proc 를 종료 코드 code 로 종료한다 (인터럽트가 꺼진 상태에서 호출). 현재 프로세스면 반환하지 않는다.
+ * 잠든 프로세스(대기 큐/수면)도 종료할 수 있다: 대기 큐에서 빼고 커널 스택은 버린다 (waitq.h 의 제약 참고).
+ */
+static Nstatus terminate_locked(process_t *proc, i32 code)
+{
+    if (proc->state == PROCESS_TERMINATED)
+        return NSTATUS_OK;                     /* 이미 끝났다: 할 일 없음 (종료 코드는 처음 것을 유지) */
+
+    proc->exit_code = code;
+    g_last_exit_code = code;
+    waitq_remove_locked(proc);
+    proc->wake_tick = 0;
+    proc->state = PROCESS_TERMINATED;
+
+    /* 프로세스가 가진 모든 핸들(열린 파일, 자식 프로세스 핸들 포함)을 닫는다. 자식 핸들이 닫히면
+     * 아무도 참조하지 않게 된 종료된 자식은 바로 회수되고, 살아 있는 자식은 끝나는 즉시 회수된다. */
+    nx_handles_close_all(&proc->handles);
+
+    /* 이 프로세스를 기다리던 모두를 깨운다 (NxProcessWait) */
+    (void)waitq_wake_all(&proc->exit_waiters);
+
+    if (proc == current_process) {
+        /* 자기 자신을 종료: 다른 프로세스로 전환하며 반환하지 않는다 */
+        schedule();
+        kernel_panic_simple("process_terminate: no runnable process", NprocessFailed);
+    }
+
+    process_reap();
+    return NSTATUS_OK;
+}
+
 Nstatus process_terminate(u32 pid)
 {
     process_t *proc;
+    Nstatus status;
     u64 flags;
 
     if (pid == 0)
@@ -335,20 +361,25 @@ Nstatus process_terminate(u32 pid)
         return NnotFound;
     }
 
-    /* 프로세스가 가진 모든 핸들(열린 파일 포함)을 닫는다. 그러지 않으면 드라이버 자원이 새어 나간다 */
-    nx_handles_close_all(&proc->handles);
-    proc->state = PROCESS_TERMINATED;
-    detach_children_locked(proc->pid);   /* 이 프로세스가 수거할 예정이던 자식은 이제 아무도 수거하지 않는다 */
-
-    if (proc == current_process) {
-        /* 자기 자신을 종료: 다른 프로세스로 전환하며 이 함수는 반환하지 않는다 */
-        schedule();
-        kernel_panic_simple("process_terminate: no runnable process", NprocessFailed);
-    }
-
-    process_reap();
+    status = terminate_locked(proc, (i32)NX_EXIT_KILLED);
     irq_restore(flags);
-    return NSTATUS_OK;
+    return status;
+}
+
+Nstatus process_kill(process_t *proc, i32 code)
+{
+    Nstatus status;
+    u64 flags;
+
+    if (!proc || !proc->in_use)
+        return NinvalidArg;
+    if (proc->pid == 0)
+        return Npermission;
+
+    flags = irq_save();
+    status = terminate_locked(proc, code);
+    irq_restore(flags);
+    return status;
 }
 
 void process_exit_with_code(i32 code)
@@ -356,9 +387,8 @@ void process_exit_with_code(i32 code)
     if (!current_process || current_process->pid == 0)
         kernel_panic_simple("process_exit called on idle/boot thread", NinvalidState);
 
-    current_process->exit_code = code;
-    g_last_exit_code = code;
-    (void)process_terminate(current_process->pid);
+    (void)irq_save();
+    (void)terminate_locked(current_process, code);
     kernel_panic_simple("process_exit: unreachable", NkernelFault);
 }
 
@@ -408,45 +438,71 @@ void process_reap_terminated(void)
     irq_restore(flags);
 }
 
-Nstatus process_get_exit_code(u32 pid, i32 *out_code)
+void process_retain(process_t *proc)
 {
-    process_t *p;
-    process_t *prev = nNULL;
+    u64 flags = irq_save();
+
+    proc->refs++;
+    irq_restore(flags);
+}
+
+void process_release(process_t *proc)
+{
+    u64 flags = irq_save();
+
+    if (proc->refs == 0)
+        kernel_panic_simple("process_release: reference count underflow", NinvalidState);
+    proc->refs--;
+    if (proc->refs == 0)
+        process_reap();            /* 이미 종료되었다면 슬롯까지 지금 회수 */
+
+    irq_restore(flags);
+}
+
+Nstatus process_wait(process_t *proc, u64 timeout_ticks, i32 *out_code)
+{
+    Nstatus status = NSTATUS_OK;
+    u64 deadline;
     u64 flags;
 
-    if (!out_code)
+    if (!proc || !out_code || !proc->in_use)
         return NinvalidArg;
-    if (pid == 0)
-        return Npermission;            /* idle 은 종료하지 않는다 */
+    if (proc == current_process)
+        return Ndeadlock;          /* 자기 자신의 종료를 기다리면 영원히 끝나지 않는다 */
 
     flags = irq_save();
+    deadline = timeout_ticks ? timer_get_tick() + timeout_ticks : 0;
 
-    for (p = process_list; p; prev = p, p = p->next) {
-        if (!p->in_use || p->pid != pid)
+    while (proc->state != PROCESS_TERMINATED) {
+        u64 now = timer_get_tick();
+
+        if (deadline && now >= deadline) {
+            status = Ntimeout;
+            break;
+        }
+
+        if (!current_process || current_process->pid == 0) {
+            /* idle/부트 스레드는 잠들 수 없다: 양보하고, 그래도 아니면 다음 인터럽트까지 쉰다 */
+            schedule();
+            if (proc->state != PROCESS_TERMINATED)
+                __asm__ volatile ("sti\n\thlt\n\tcli" : : : "memory");
             continue;
-
-        if (current_process && p->parent_pid != current_process->pid) {
-            irq_restore(flags);
-            return Npermission;        /* 부모만 수거할 수 있다 */
-        }
-        if (p->state != PROCESS_TERMINATED) {
-            irq_restore(flags);
-            return Nbusy;
         }
 
-        *out_code = p->exit_code;
+        status = waitq_sleep_locked(&proc->exit_waiters, deadline ? deadline - now : 0);
+        if (status == Ntimeout)
+            continue;              /* 루프 위에서 다시 판정 (그 사이에 끝났을 수 있다) */
+        if (NSTATUS_IS_ERR(status))
+            break;
+    }
 
-        /* 수거: 자원이 아직 남아 있으면(reap 전) 지금 회수하고 슬롯을 비운다 */
-        if (p->addrspace.pml4)
-            paging_addrspace_destroy(&p->addrspace);
-        free_slot_locked(p, prev);
-
-        irq_restore(flags);
-        return NSTATUS_OK;
+    if (proc->state == PROCESS_TERMINATED) {
+        *out_code = proc->exit_code;
+        status = NSTATUS_OK;
     }
 
     irq_restore(flags);
-    return NnotFound;
+    return status;
 }
 
 u32 process_count(void)

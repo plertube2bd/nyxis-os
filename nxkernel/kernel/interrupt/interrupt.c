@@ -184,7 +184,7 @@ static void exception_default(struct trap_frame *f)
         /* 유저 모드 프로세스의 오류: 커널은 살리고 해당 프로세스만 종료한다 */
         printk("\nUser-mode fault, terminating process:\n");
         dump_frame(f);
-        process_exit_with_code(-1);
+        process_exit_with_code((i32)NX_EXIT_FAULT);
         /* 반환하지 않는다 */
     }
 
@@ -223,6 +223,11 @@ void interrupt_dispatch(struct trap_frame *frame)
             handler(frame);
 
         pic_send_eoi(irq);
+
+        /* 선점 지점: 사용자 모드로 돌아가는 IRQ 에서만 (EOI 이후여야 한다 — 다른 프로세스로 전환한 동안
+         * 이 IRQ 가 미완료로 남으면 그 라인의 다음 인터럽트가 막힌다). 커널 코드는 선점하지 않는다. */
+        if ((frame->cs & 3UL) == 3UL)
+            sched_preempt_point();
         return;
     }
 

@@ -208,8 +208,10 @@ user_prog1_start:
     syscall
     movq %rax, 0xD0(%rbx)
 
-    movl $NX_SYS_PROCESS_CREATE, %eax  /* [0xD8] NxProcessCreate(존재하지 않는 경로) -> 음수 */
+    movl $NX_SYS_PROCESS_CREATE, %eax  /* [0xD8] NxProcessCreate(존재하지 않는 경로, NULL, NULL) -> 음수 */
     leaq path_bad(%rip), %rdi
+    xorl %esi, %esi
+    xorl %edx, %edx
     syscall
     movq %rax, 0xD8(%rbx)
 
