@@ -138,13 +138,36 @@ static void fb_putc(char c)
     g_cursor_x += FONT_W;
 }
 
+/* 출력 싱크 사용 여부: 사용자 프로세스가 장치(dev:/fb0, dev:/com1)를 배타적으로 가져가면 꺼진다 */
+static volatile bool g_out_fb = true;
+static volatile bool g_out_serial = true;
+
+void printk_set_fb_enabled(bool on)
+{
+    g_out_fb = on;
+}
+
+void printk_set_serial_enabled(bool on)
+{
+    g_out_serial = on;
+}
+
+void printk_force_all_outputs(void)
+{
+    g_out_fb = true;
+    g_out_serial = true;
+}
+
 /* 모든 출력 싱크로 한 글자 보내기 */
 static void printk_putc(char c)
 {
-    if (c == '\n')
-        serial_putc('\r');   /* 터미널에서 줄 맨 앞으로 */
-    serial_putc(c);
-    fb_putc(c);
+    if (g_out_serial) {
+        if (c == '\n')
+            serial_putc('\r');   /* 터미널에서 줄 맨 앞으로 */
+        serial_putc(c);
+    }
+    if (g_out_fb)
+        fb_putc(c);
 }
 
 /* 문자열 출력. width 가 문자열 길이보다 크면 왼쪽을 공백으로 채운다. */
@@ -327,11 +350,13 @@ static Nstatus printk_vformat(const char *format, va_list args)
 
 void printk_backspace(void)
 {
-    serial_putc('\b');
-    serial_putc(' ');
-    serial_putc('\b');
+    if (g_out_serial) {
+        serial_putc('\b');
+        serial_putc(' ');
+        serial_putc('\b');
+    }
 
-    if (g_fb && g_cursor_x >= FONT_W) {
+    if (g_out_fb && g_fb && g_cursor_x >= FONT_W) {
         g_cursor_x -= FONT_W;
         (void)draw_char_bounded(g_fb, g_stride, g_screen_width, g_screen_height,
                                 g_cursor_x, g_cursor_y, (utf8)' ',

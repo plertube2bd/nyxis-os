@@ -23,6 +23,9 @@
 #include "kernel/process/waitq.h"
 #include "kernel/mm/kheap.h"
 #include "console/inputs/tty.h"
+#include "kernel/crypto/sha256.h"
+#include "kernel/syscall/nspath.h"
+#include "kernel/security/auth.h"
 #include "kernel/syscall/syscall.h"
 #include "kernel/timer/pit/pit_base.h"
 #include "kernel/error_handling/panic.h"
@@ -325,10 +328,10 @@ static void spawn_tests(void)
     process_reap_terminated();
     pfa_before = pfa_free_count();
 
-    status = process_spawn("app:/nonexistent.run", nNULL, &proc);
+    status = process_spawn("fs:/usr/nonexistent.run", nNULL, &proc);
     check(NSTATUS_IS_ERR(status), "process_spawn() rejects a missing executable");
 
-    status = process_spawn("app:/hellowld.run", nNULL, &proc);   /* 존재하지만 ELF 가 아닌 평문 파일 */
+    status = process_spawn("fs:/usr/hellowld.run", nNULL, &proc);   /* 존재하지만 ELF 가 아닌 평문 파일 */
     check(NSTATUS_IS_ERR(status), "process_spawn() rejects a non-ELF file");
 
     check(pfa_free_count() == pfa_before, "rejected process_spawn() attempts leaked no frames");
@@ -341,15 +344,15 @@ static void spawn_tests(void)
         bad.envc = 1;
         bad.size = sizeof(bad1);
         bad.strings = bad1;
-        check(process_spawn("app:/elftest.run", &bad, &proc) == NinvalidArg,
+        check(process_spawn("fs:/usr/elftest.run", &bad, &proc) == NinvalidArg,
               "process_spawn() rejects malformed argv/envp (string count mismatch)");
         bad.argc = (u32)NX_ARGV_MAX + 1U;
         bad.envc = 0;
-        check(process_spawn("app:/elftest.run", &bad, &proc) == Noverflow,
+        check(process_spawn("fs:/usr/elftest.run", &bad, &proc) == Noverflow,
               "process_spawn() rejects more than NX_ARGV_MAX arguments");
     }
 
-    status = process_spawn("app:/elftest.run", &args, &proc);
+    status = process_spawn("fs:/usr/elftest.run", &args, &proc);
     check(status == Nok, "process_spawn(app:/elftest.run, argv={elftest,main}, envp={NYX_TEST=1,LANG=ko}) succeeded");
 
     if (status == Nok) {
@@ -357,7 +360,7 @@ static void spawn_tests(void)
 
         /* 끝날 때까지 기다린다. elftest 의 "stdin" 자식은 NxRead(stdin) 에서 잠들어 있으므로,
          * 잠시 뒤 키 입력을 흉내 내 "ping\n" 과 Ctrl-D(EOF)를 넣어 준다 (실제 IRQ 핸들러와 같은 경로). */
-        for (waited = 0; waited < 600 && live_processes() > 1; waited++) {
+        for (waited = 0; waited < 4000 && live_processes() > 1; waited++) {
             if (waited == 20) {
                 const char *keys = "ping\n\x04";
 
@@ -367,7 +370,7 @@ static void spawn_tests(void)
             schedule();
             sleep_ms(5);
         }
-        check(waited < 600, "elftest and all its children finished within ~3s (incl. a killed busy-looping child)");
+        check(waited < 4000, "elftest and all its children finished within ~20s (incl. a killed busy-looping child, 2 delayed auth failures)");
 
         /* 주소 공간은 종료 즉시 회수되지만, 참조(핸들)가 남아 있는 동안 슬롯과 종료 코드는 남는다 */
         process_reap_terminated();
@@ -388,6 +391,99 @@ static void spawn_tests(void)
     pfa_after = pfa_free_count();
     check(pfa_after == pfa_before,
           "process teardown returned every frame to the allocator (address space + heap + stack, no leak)");
+}
+
+/* 16진 문자열 비교용 */
+static bool digest_is(const u8 *d, const char *hex)
+{
+    u32 i;
+
+    for (i = 0; i < 32; i++) {
+        u32 hi = (u32)(hex[i * 2] <= '9' ? hex[i * 2] - '0' : hex[i * 2] - 'a' + 10);
+        u32 lo = (u32)(hex[i * 2 + 1] <= '9' ? hex[i * 2 + 1] - '0' : hex[i * 2 + 1] - 'a' + 10);
+
+        if (d[i] != (u8)((hi << 4) | lo))
+            return false;
+    }
+    return true;
+}
+
+/* 인증이 쓰는 암호 프리미티브: 표준 테스트 벡터 (FIPS 180-2, RFC 4231, RFC 7914 의 PBKDF2-SHA256 벡터) */
+static void crypto_tests(void)
+{
+    u8 d[32];
+
+    printk("SELFTEST: crypto (SHA-256, HMAC, PBKDF2)\n");
+    sha256("abc", 3, d);
+    check(digest_is(d, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"), "SHA-256(\"abc\")");
+    sha256("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq", 56, d);
+    check(digest_is(d, "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"), "SHA-256 (two-block message)");
+    hmac_sha256("Jefe", 4, "what do ya want for nothing?", 28, d);
+    check(digest_is(d, "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"), "HMAC-SHA256 (RFC 4231 #2)");
+    pbkdf2_hmac_sha256("password", 8, "salt", 4, 1, d, 32);
+    check(digest_is(d, "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b"), "PBKDF2-HMAC-SHA256 c=1");
+    pbkdf2_hmac_sha256("password", 8, "salt", 4, 2, d, 32);
+    check(digest_is(d, "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43"), "PBKDF2-HMAC-SHA256 c=2");
+    check(crypto_equal_ct("abc", "abc", 3) && !crypto_equal_ct("abc", "abd", 3), "constant-time compare");
+}
+
+/* 이름공간 해석 규칙 (nspath.h) - idle 의 신원을 잠시 바꿔 일반 사용자 쪽도 본다 */
+static bool ns_is(const char *in, u32 kind, const char *out)
+{
+    char buf[NSP_PATH_MAX];
+    u32 k = 0;
+
+    return nsp_translate(in, buf, sizeof(buf), &k) == Nok && k == kind && strcmp(buf, out) == 0;
+}
+
+static bool ns_err(const char *in, Nstatus expect)
+{
+    char buf[NSP_PATH_MAX];
+    u32 k = 0;
+
+    return nsp_translate(in, buf, sizeof(buf), &k) == expect;
+}
+
+static void namespace_tests(void)
+{
+    process_t *self = current_process;
+    char saved_name[NX_USER_NAME_MAX];
+    u32 su = self->uid;
+    u32 sg = self->gid;
+    auth_identity_t id;
+
+    printk("SELFTEST: namespaces (fs:/ app:/ face:/ roi:/ tmp:/ dev:/ svc:/)\n");
+    check(ns_is("app:/init.run", NSP_KIND_VFS, "fs:/usr/init.run"), "app:/x -> fs:/usr/x");
+    check(ns_is("face:/a/./b/../c", NSP_KIND_VFS, "fs:/home/root/a/c"), "face:/ resolves to the caller's home and normalizes . and ..");
+    check(ns_err("face:/..", Npermission) && ns_err("app:/../roi/users", Npermission), ".. above an alias root is refused");
+    check(ns_is("fs:", NSP_KIND_VFS, "fs:/") && ns_is("tmp://x//", NSP_KIND_VFS, "tmp:/x"), "fs: root and empty components");
+    check(ns_is("roi:/users", NSP_KIND_VFS, "fs:/roi/users"), "roi:/ -> fs:/roi/ (root)");
+    check(ns_is("dev:/fb0", NSP_KIND_DEV, "fb0") && ns_is("svc:/sys/init", NSP_KIND_SVC, "sys/init"), "dev:/ and svc:/ names");
+    check(ns_err("zz:/a", NnotFound) && ns_err("/abs", NnotFound) && ns_err("app:/a:b", NinvalidArg), "unknown prefix / no prefix / ':' in a component");
+    check(nsp_check_protected("fs:/roi/users", NSP_OP_OPEN) == Npermission, "roi:/users is kernel-only (open)");
+    check(nsp_check_protected("fs:/roi", NSP_OP_MODIFY) == Npermission && nsp_check_protected("fs:/", NSP_OP_MODIFY) == Npermission,
+          "moving/removing an ancestor of roi:/users is refused");
+    check(nsp_check_protected("fs:/roi", NSP_OP_OPEN) == Nok && nsp_check_protected("fs:/roiX", NSP_OP_MODIFY) == Nok,
+          "listing roi:/ and unrelated paths are allowed");
+
+    memcpy(saved_name, self->user_name, sizeof(saved_name));
+    self->uid = 1000;
+    self->gid = 1000;
+    memset(self->user_name, 0, sizeof(self->user_name));
+    memcpy(self->user_name, "test", 5);
+    check(ns_is("face:/x", NSP_KIND_VFS, "fs:/home/test/x"), "face:/ is per-user (test -> fs:/home/test)");
+    check(ns_err("fs:/usr", Npermission) && ns_err("roi:/users", Npermission) && ns_err("dev:/fb0", Npermission),
+          "non-root cannot use fs:/, roi:/ or dev:/");
+    check(ns_is("app:/nysh.run", NSP_KIND_VFS, "fs:/usr/nysh.run") && ns_is("tmp:/a", NSP_KIND_VFS, "tmp:/a"),
+          "non-root can use app:/ and tmp:/");
+    self->uid = su;
+    self->gid = sg;
+    memcpy(self->user_name, saved_name, sizeof(saved_name));
+
+    check(auth_lookup("root", &id) == Nok && id.uid == 0 && auth_lookup("test", &id) == Nok && id.uid == 1000,
+          "roi:/users loaded at boot (root uid 0, test uid 1000)");
+    check(auth_verify("test", "definitely-not-the-password", &id) == Nauthentication &&
+          auth_verify("no-such-user", "x", &id) == Nauthentication, "wrong password / unknown user are rejected alike");
 }
 
 /* 커널 힙: 크기별 할당, 정렬, 겹침 없음, kzalloc, 빈 페이지 반환 */
@@ -618,6 +714,8 @@ static void functional_tests(void)
 
     kheap_tests();
     waitq_tests();
+    crypto_tests();
+    namespace_tests();
     ring3_tests();
     spawn_tests();
 

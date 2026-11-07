@@ -212,6 +212,7 @@ user_prog1_start:
     leaq path_bad(%rip), %rdi
     xorl %esi, %esi
     xorl %edx, %edx
+    xorl %r10d, %r10d               /* 토큰 없음 (NX_NO_TOKEN) */
     syscall
     movq %rax, 0xD8(%rbx)
 

@@ -946,18 +946,22 @@ static Nstatus nyfs_check_access(nyfs_volume_t *vol, const nyfs_inode_t *inode,
         /* ACL 이 전혀 없으면 순수 UNIX 모드로만 판단한다 */
         u16 mode = inode->unix_mode;
         u32 bits;
+        /* UNIX 의미: 디렉터리의 쓰기 권한은 그 안의 항목을 지우거나 옮길 권한(DELETE_CHILD)을 포함한다.
+         * (예전에는 빠져 있어서 root 가 아니면 자기 홈에서도 파일을 지울 수 없었다) */
+        u32 wbits = NYFS_ACE_WRITE_DATA | NYFS_ACE_APPEND_DATA
+                  | ((inode->type == NYFS_INO_TYPE_DIR) ? NYFS_ACE_DELETE_CHILD : 0U);
 
         if (cred->uid == inode->uid) {
             bits = (u32)((mode & NYFS_MODE_IRUSR) ? NYFS_ACE_READ_DATA : 0U)
-                 | (u32)((mode & NYFS_MODE_IWUSR) ? (NYFS_ACE_WRITE_DATA | NYFS_ACE_APPEND_DATA) : 0U)
+                 | (u32)((mode & NYFS_MODE_IWUSR) ? wbits : 0U)
                  | (u32)((mode & NYFS_MODE_IXUSR) ? NYFS_ACE_EXECUTE : 0U);
         } else if (cred->gid == inode->gid) {
             bits = (u32)((mode & NYFS_MODE_IRGRP) ? NYFS_ACE_READ_DATA : 0U)
-                 | (u32)((mode & NYFS_MODE_IWGRP) ? (NYFS_ACE_WRITE_DATA | NYFS_ACE_APPEND_DATA) : 0U)
+                 | (u32)((mode & NYFS_MODE_IWGRP) ? wbits : 0U)
                  | (u32)((mode & NYFS_MODE_IXGRP) ? NYFS_ACE_EXECUTE : 0U);
         } else {
             bits = (u32)((mode & NYFS_MODE_IROTH) ? NYFS_ACE_READ_DATA : 0U)
-                 | (u32)((mode & NYFS_MODE_IWOTH) ? (NYFS_ACE_WRITE_DATA | NYFS_ACE_APPEND_DATA) : 0U)
+                 | (u32)((mode & NYFS_MODE_IWOTH) ? wbits : 0U)
                  | (u32)((mode & NYFS_MODE_IXOTH) ? NYFS_ACE_EXECUTE : 0U);
         }
 
@@ -2458,7 +2462,8 @@ Nstatus nyfs_format(u32 diskno, void *userdata)
     memset(&root_inode, 0, sizeof(root_inode));
     root_inode.ino = NYFS_ROOT_INO;
     root_inode.type = NYFS_INO_TYPE_DIR;
-    root_inode.unix_mode = (u16)(NYFS_MODE_IRUSR | NYFS_MODE_IWUSR | NYFS_MODE_IXUSR
+    root_inode.unix_mode = params->root_mode ? (u16)(params->root_mode & 0x0FFFU)
+                         : (u16)(NYFS_MODE_IRUSR | NYFS_MODE_IWUSR | NYFS_MODE_IXUSR
                                 | NYFS_MODE_IRGRP | NYFS_MODE_IXGRP
                                 | NYFS_MODE_IROTH | NYFS_MODE_IXOTH);
     root_inode.uid = 0;

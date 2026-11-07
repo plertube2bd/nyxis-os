@@ -144,6 +144,9 @@ void gdt_init(void);
 /* ring3 -> ring0 전환 시 CPU 가 사용할 커널 스택 최상단을 지정한다. */
 void gdt_set_kernel_stack(u64 rsp0);
 
+/* ring3 에서 직접 in/out 할 수 있는 포트 범위를 [base, base+count) 하나로 정한다 (count 0 = 없음, 1024 이상 포트는 항상 거부) */
+void gdt_set_io_permission(u16 base, u16 count);
+
 /* 256개 벡터 전체를 채운 IDT 를 만들어 로드한다. (인터럽트는 켜지지 않는다) */
 void interrupt_init(void);
 

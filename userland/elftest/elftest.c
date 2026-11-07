@@ -187,6 +187,9 @@ static int process_tests(void)
 }
 
 int elftest_main(long argc, char **argv);
+int elftest_system_tests(void);
+int elftest_user_mode(void);
+int elftest_ioport_mode(void);
 
 int elftest_main(long argc, char **argv)
 {
@@ -211,6 +214,10 @@ int elftest_main(long argc, char **argv)
         return (envp[0] == 0) ? 7 : 8;  /* 자식에게는 환경을 넘기지 않았다 */
     if (seq(argv[1], "stdin"))
         return stdin_child();
+    if (seq(argv[1], "user"))
+        return elftest_user_mode();     /* 토큰으로 test(uid 1000) 신원을 받아 실행된다 (systest.c) */
+    if (seq(argv[1], "ioport"))
+        return elftest_ioport_mode();
     if (seq(argv[1], "spin")) {
         for (;;)
             g_data++;                   /* volatile 전역: 컴파일러가 루프를 없애지 못한다 */
@@ -306,6 +313,11 @@ int elftest_main(long argc, char **argv)
 
     /* 9. 프로세스 핸들 / Wait / Kill / 선점 / 콘솔 입력 */
     r = process_tests();
+    if (r != 0)
+        return (int)r;
+
+    /* 10. 파일/이름공간, 장치, 채널/NxPoll, 인증/토큰/신원 (systest.c) */
+    r = elftest_system_tests();
     if (r != 0)
         return (int)r;
 

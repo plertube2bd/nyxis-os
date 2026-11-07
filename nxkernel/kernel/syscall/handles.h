@@ -20,8 +20,14 @@
 #define NX_HANDLE_CONSOLE  1U   /* stdin/stdout/stderr */
 #define NX_HANDLE_FILE     2U   /* VFS 파일 */
 #define NX_HANDLE_PROCESS  3U   /* 자식 프로세스 (NxProcessCreate). 프로세스 참조 1 개를 가진다 */
+#define NX_HANDLE_TOKEN    4U   /* 신원 토큰 (NxAuthenticate). 일회용, 복제 불가 */
+#define NX_HANDLE_CHANNEL  5U   /* svc:/ 채널 (수신 또는 송신) */
+#define NX_HANDLE_DEVICE   6U   /* dev:/ 장치. 복제 불가 (소유권) */
 
 struct process;
+struct auth_identity;
+struct channel;
+struct nx_device;
 
 #define NX_HANDLE_INVALID  0xFFFFFFFFFFFFFFFFUL
 
@@ -32,6 +38,12 @@ typedef struct nx_handle {
     u32 console_fd;         /* 콘솔 핸들일 때: 0=in 1=out 2=err */
     handle_t file;          /* 파일 핸들일 때 VFS 핸들 (사본) */
     struct process *proc;   /* 프로세스 핸들일 때 대상 (이 핸들이 참조 1 개를 소유: 닫을 때 process_release) */
+    struct auth_identity *token;   /* 토큰 핸들: 커널 힙의 신원 (닫으면 지우고 해제) */
+    struct channel *chan;          /* 채널 핸들: 채널 참조 1 개 */
+    bool chan_receiver;            /* true = 수신(만든 쪽), false = 송신 */
+    struct nx_device *dev;         /* 장치 핸들 */
+    bool dev_write;                /* 쓰기로 열었는지 (블록 장치의 독점 여부) */
+    u64  dev_offset;               /* 블록 장치 오프셋 */
 } nx_handle_t;
 
 typedef struct nx_handle_table {

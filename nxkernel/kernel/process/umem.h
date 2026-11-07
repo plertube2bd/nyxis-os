@@ -31,6 +31,11 @@
 #define NX_USER_STACK_BASE   (NX_USER_STACK_TOP - NX_USER_STACK_SIZE)
 #define NX_USER_STACK_GUARD  (NX_USER_STACK_BASE - 4096UL)
 
+/* 장치 MMIO 매핑 자리 (NxDeviceMapMMIO). ELF 상한(0x7000_0000_0000) 위, 스택 아래. 힙은 누적 512MiB 상한이라
+ * 여기까지 올라오지 않는다. */
+#define NX_USER_MMIO_BASE    0x0000780000000000UL
+#define NX_USER_MMIO_SIZE    (256UL * 1024UL * 1024UL)
+
 /*
  * p 의 힙(brk)을 increment 바이트만큼 키우거나(양수) 줄인다(음수). 0 이면 현재 brk 만 돌려준다.
  * 성공하면 *out_brk 에 새 brk. 실패하면 brk 는 그대로이고 이미 할당한 프레임도 모두 되돌려 둔다.

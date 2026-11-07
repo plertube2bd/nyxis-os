@@ -38,7 +38,19 @@
 #define GDT_USER_DATA      0x00CFF2000000FFFFUL
 
 static u64 g_gdt[GDT_ENTRIES] __attribute__((aligned(16)));
-static struct tss64 g_tss __attribute__((aligned(16)));
+/*
+ * TSS + I/O 권한 비트맵. 비트맵은 포트 0~1023 (128바이트)만 담고, 그 뒤에 규격이 요구하는 0xFF 한 바이트를 둔다.
+ * TSS limit 을 그 바이트까지로 잡으므로 1024 이상의 포트는 항상 거부된다. 비트가 1 이면 거부, 0 이면 허용.
+ * 프로세스를 전환할 때마다 그 프로세스에 허가된 범위로 다시 채운다 (gdt_set_io_permission, process_switch).
+ */
+#define IO_BITMAP_BYTES 128U
+
+static struct {
+    struct tss64 tss;
+    u8 iomap[IO_BITMAP_BYTES + 1U];
+} pack g_tss_io __attribute__((aligned(16)));
+
+#define g_tss (g_tss_io.tss)
 
 static u8 g_ist_df_stack[IST_STACK_SIZE]  __attribute__((aligned(16)));
 static u8 g_ist_nmi_stack[IST_STACK_SIZE] __attribute__((aligned(16)));
@@ -65,6 +77,16 @@ void gdt_set_kernel_stack(u64 rsp0)
     g_cpu_local.kernel_rsp = rsp0;      /* syscall 명령으로 진입할 때 (syscall_entry.s) */
 }
 
+void gdt_set_io_permission(u16 base, u16 count)
+{
+    u32 port;
+
+    for (port = 0; port <= IO_BITMAP_BYTES; port++)
+        g_tss_io.iomap[port] = 0xFF;
+    for (port = base; port < (u32)base + count && port < IO_BITMAP_BYTES * 8U; port++)
+        g_tss_io.iomap[port >> 3] &= (u8)~(1U << (port & 7U));
+}
+
 void gdt_init(void)
 {
     struct idtr gdtr;   /* GDTR 과 IDTR 은 형식이 같다 (limit 16비트 + base 64비트) */
@@ -83,8 +105,9 @@ void gdt_init(void)
     g_tss.ist7 = 0;
     g_tss.res3 = 0;
     g_tss.res4 = 0;
-    /* I/O 비트맵 없음: iomap_base 를 TSS 크기로 두면 ring3 의 포트 접근은 모두 #GP */
-    g_tss.iomap_base = (u16)sizeof(g_tss);
+    /* I/O 비트맵: 처음에는 전부 거부 (ring3 의 in/out 은 #GP) */
+    g_tss.iomap_base = (u16)sizeof(struct tss64);
+    gdt_set_io_permission(0, 0);
 
     g_gdt[0] = 0;
     g_gdt[1] = GDT_KERNEL_CODE64;
@@ -92,7 +115,7 @@ void gdt_init(void)
     g_gdt[3] = GDT_USER_CODE32;
     g_gdt[4] = GDT_USER_DATA;
     g_gdt[5] = GDT_USER_CODE64;
-    gdt_set_tss(6, (u64)(usize)&g_tss, (u32)(sizeof(g_tss) - 1));
+    gdt_set_tss(6, (u64)(usize)&g_tss_io, (u32)(sizeof(g_tss_io) - 1));
 
     gdtr.limit = (u16)(sizeof(g_gdt) - 1);
     gdtr.base  = (u64)(usize)g_gdt;

@@ -543,3 +543,81 @@ PFA + HHDM 위의 크기별 slab: 16~2048 바이트 8 클래스, 페이지 머�
 - 커널 코드 선점, SMP. 시스템 콜 실행 중에는 여전히 인터럽트가 꺼져 있다 (긴 디스크 I/O 동안 IRQ 지연).
 - IRQ 안의 에코는 다른 커널 출력과 섞일 수 있다 (printk 에 락이 없음; 단일 코어라 손상은 없고 글자 순서만 섞임).
 - Makefile 은 컴파일 플래그 변경을 추적하지 않는다: `SELFTEST=` 값을 바꿔 빌드할 때는 `make clean` 이 필요하다.
+
+## 12. 실제 시스템 콜: 신원/인증, 이름공간, 파일 노드, 장치, 채널/NxPoll, init·login·nysh·poweroff (7차 작업)
+
+구현 전에 설계 질의응답으로 정한 결정 (사용자 결정):
+
+| 주제 | 결정 |
+|---|---|
+| 하드웨어 접근 | 혼합: DMA 없는 장치(프레임버퍼 MMIO, COM1 포트)만 ring3 직접 접근, 블록 장치는 커널 경유, PIC/PIT/PCI 설정/DMA 레지스터는 비노출 |
+| 권한 근거 | 신원(uid) 기반. 첫 프로세스 init 과 그 자식은 uid 0, 다른 신원은 **커널이 발급한 토큰**으로만 |
+| 인증 | 커널이 검증 (`NxAuthenticate`, PBKDF2-HMAC-SHA256). uid 0 도 비밀번호 없이 토큰을 만들 수 없다 |
+| 토큰 | 일회용: `NxProcessCreate` 에 쓰면 소모. 셸이 끝나면 다시 로그인 |
+| 사용자 DB | `roi:/users` (initrd 이미지 안). 실행 중에는 커널 전용 (uid 0 도 열기/삭제/이동 불가) |
+| 이름공간 | `fs:/` 는 전체 트리(uid 0 만), `app:/`=`fs:/usr/`, `face:/`=`fs:/home/<사용자>/`(프로세스별), `roi:/`=`fs:/roi/`, `tmp:/`, `dev:/`, `svc:/` |
+| 루트 FS | initrd 를 nyfs 이미지로 바꿔 RAM 에서 `fs:/` 로 마운트 (FAT16 은 호스트 테스트 전용으로만 남김) |
+| 장치 API | `NxOpen("dev:/...")` (Everything is Object), 독점 소유, 고유 기능은 `NxDeviceMapMMIO`/`NxDeviceCommand` |
+| 블록 raw 쓰기 | 마운트 안 된 장치만. AHCI 쓰기는 이번 범위 밖 |
+| 전원 | poweroff 는 init 에 "요청" (`svc:/sys/init` 채널), init(uid 0)이 `NxPowerOff` (ACPI S5) |
+| IPC | `svc:/` 채널. `sys/` 는 uid 0 만, `<사용자>/` 는 본인만 등록. 메시지에 커널이 보낸 쪽 pid/uid/gid 를 붙임 |
+| 다중 대기 | `NxPoll` (대기 큐를 "한 프로세스가 여러 큐에 매달리는" 구조로 재설계) |
+| 계정 생성 | `make users` 가 터미널에서 묻는다 (해시만 `config/users.db`, git 미추적). 테스트 이미지는 무작위 비밀번호 test 계정 |
+
+### 12.1 커널
+
+- **대기 큐 재설계** (`waitq.h`): 큐에 프로세스 대신 대기 항목을 매단다. 한 프로세스가 최대 16 개 큐에 동시에 매달릴 수
+  있고, 어느 큐에서 깨워지든 모든 항목이 한꺼번에 떨어진다. 항목은 잠든 함수의 커널 스택에 있고, 종료 경로가 모두 떼어 낸다.
+- **암호** (`kernel/crypto/sha256.c`): SHA-256, HMAC-SHA256, PBKDF2-HMAC-SHA256, 상수 시간 비교, 비밀 지우기.
+- **인증/토큰** (`kernel/security/auth.c`): 부팅 때 `fs:/roi/users` 를 한 번 읽는다. 없는 사용자도 같은 PBKDF2 계산을 해서
+  존재 여부가 시간으로 새지 않는다. 실패 시 시스템 콜 계층이 1초 재운다. PBKDF2 동안에는 인터럽트를 켠다(타이머/키 입력 유실 방지).
+- **이름공간** (`kernel/syscall/nspath.c`): 사용자 경로를 정규화(`.` 무시, 별칭 뿌리 위 `..` 거부, 구성요소의 `:` 거부)하고
+  호출자 신원으로 해석한다. 커널 전용 경로(`fs:/roi/users`)와 그 조상의 삭제/이동을 막는다.
+- **파일 노드**: `NxCreateNode/RemoveNode/RenameNode/ReadDir` (set-uid 류 모드 비트 거부).
+- **장치** (`kernel/dev/device.c`): `dev:/fb0`(MMIO 매핑, 커널과 같은 WB 속성, PAGE_NOFREE), `dev:/com1`(스트림 + TSS I/O 비트맵으로
+  포트 0x3F8–0x3FF 허가), `dev:/rd0`(1 MiB RAM 블록, 섹터 단위), `dev:/rootdisk`(마운트됨: 읽기만). 독점 소유 중에는
+  printk/stdin 이 비켜 주고, 핸들이 닫히면(프로세스가 죽어도) 매핑 해제·포트 회수·출력 재개. 커널 패닉은 모든 출력을 강제로 켠다.
+  TSS 에 128 바이트 I/O 비트맵(포트 0–1023)을 붙이고 프로세스 전환마다 그 프로세스의 범위로 다시 채운다.
+- **채널** (`kernel/ipc/channel.c`): 메시지 256B, 큐 16개, 블로킹 수신(시간 제한), 가득 차면 `Nbusy`, 수신자가 사라지면
+  `Ndisconnected`/`NX_POLL_HUP`. 이름은 수신 핸들이 닫히면 즉시 해제.
+- **`NxPoll`**: 채널(IN/OUT/HUP), 프로세스(EXIT), stdin(IN). 레벨 트리거.
+- **ACPI 전원 끄기** (`kernel/acpi/acpi.c`): RSDP→RSDT/XSDT→FADT→DSDT 의 `\_S5`, 필요하면 ACPI 모드 진입. 실패하면 QEMU/Bochs 포트.
+- **부팅**: `fs:/`(initrd nyfs) 마운트 → `tmp:/`(2 MiB RAM nyfs, 0777) → 장치 등록 → 사용자 DB → (selftest) → `app:/init.run` 을
+  root 로 실행. init 이 죽으면 커널은 멈춘다.
+- **콘솔**: 비밀번호 입력용 에코 끄기(`NX_DEVCMD_TTY_ECHO`), stdin 의 NxPoll 지원.
+- **발견해서 고친 기존 버그**
+  - nyfs: UNIX 모드만 있는 디렉터리에서 쓰기 권한이 `DELETE_CHILD` 를 포함하지 않아, root 가 아니면 **자기 홈에서도 파일을 지울 수
+    없었다** (모두 root 로 돌던 동안 드러나지 않음). 커널과 호스트 라이브러리 양쪽 수정.
+  - ELF 로더: 크기 0 인 `PT_LOAD`(.data 가 없는 프로그램의 RW 세그먼트)를 거부해 init 이 실행되지 않았다. 규격대로 건너뛴다.
+
+### 12.2 유저랜드와 빌드
+
+- 공용 런타임 `userland/lib` (crt0 + 시스템 콜 래퍼 + 문자열/콘솔). 프로그램: `init`, `login`, `nysh`(exit/whoami/help, 그 외는
+  `app:/<명령>.run` 실행), `poweroff`.
+- `tools/nyfs-utils` 에 `nyfs-pack`(매니페스트로 이미지 생성, FUSE 불필요), `tools/mkrootfs.py`(루트 트리 매니페스트),
+  `tools/mkusers.py`(`make users`, PBKDF2 100000회), `tools/e2e_login_test.py`(`make test-e2e`).
+- 일반 이미지 빌드는 `config/users.db` 가 필요하다 (없으면 안내 후 실패). SELFTEST 이미지는 빌드마다 무작위 비밀번호의
+  root/test 계정과 `roi:/test_password` 를 넣는다 (테스트 이미지 전용).
+
+### 12.3 검증
+
+- `SELFTEST=1`: 126 개 점검 전부 통과. 새 커널 측 점검: 암호 표준 벡터(SHA-256 2개, RFC 4231, PBKDF2 c=1/c=2), 이름공간 규칙
+  (root/일반 사용자), 커널 전용 경로, 부팅 때 사용자 DB 로드, 틀린 비밀번호/없는 사용자 거부.
+- elftest(root)가 파일/이름공간(100번대), 장치(200번대: rd0 raw I/O·섹터 규칙·독점, rootdisk 쓰기 거부, fb0 매핑 후 픽셀 쓰기,
+  COM1 포트 허가 후 ring3 `inb`, 허가 없는 `inb` 는 그 프로세스만 #GP), 채널/NxPoll(300번대), 인증/토큰(400번대)을 검사하고,
+  test 토큰으로 자기 자신을 실행해 일반 사용자 쪽 경계(fs:/·roi:/·dev:/ 거부, 남의 홈 탈출 거부, app:/ 쓰기 거부, svc:/sys 사칭 거부,
+  NxPowerOff 거부, 보낸 쪽 uid 가 1000 으로 찍힘)를 확인한다.
+- `make test-e2e`: 부팅 → login → 틀린 비밀번호 거부 → 로그인(비밀번호 에코 없음) → whoami → 없는 명령 → poweroff →
+  init 이 uid 1000 의 요청 확인 → ACPI S5 로 QEMU 종료. **시리얼(IRQ4)과 PS/2 키보드(QEMU sendkey, IRQ1) 두 경로 모두 통과.**
+- 일반 이미지(PBKDF2 20000회 DB)로 tamier 로그인 → whoami → poweroff 확인. `make check`, `make test-host`, nyfs-utils `make test`,
+  `SELFTEST=9` 재확인.
+
+### 알려진 한계 / 남은 문제
+
+- 영속 저장소 없음: `fs:/` 는 RAM (재부팅 시 이미지로 돌아감), 비밀번호 변경·사용자 추가는 이미지 재생성. `rd:/`, `d:/`·`e:/`, `info:/` 미구현.
+- VFS dentry 캐시가 한 번 찾은 경로의 디렉터리 순회 권한(EXECUTE) 검사를 다시 하지 않는다. 일반 사용자는 `fs:/` 를 못 써서 지금은
+  `face:/`·`tmp:/`·`app:/` 안에서만 의미가 있지만, 디렉터리 권한을 세밀하게 쓰기 전에 고쳐야 한다.
+- `tmp:/` 에 sticky 비트 의미가 없다 (다른 사용자의 파일도 지울 수 있다). 실행 권한은 읽기 권한으로 대신한다(실행 비트 미검사).
+- 로그인 시도 제한은 실패당 1초 지연뿐이다 (잠금 없음). 프롬프트 전에 미리 친 글자(type-ahead)는 에코된다.
+- 프레임버퍼를 돌려받아도 화면을 다시 그리지 않는다 (이후 출력부터 보임). 채널 수신 중 사용자 버퍼 복사가 실패하면 그 메시지는 버려진다.
+- GRUB 경로와 gnu-efi 3.x 빌드, 실기는 이번에도 확인하지 못했다 (이 머신에 grub-mkrescue 없음).

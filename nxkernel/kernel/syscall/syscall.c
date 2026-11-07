@@ -23,6 +23,12 @@
 #include "kernel/process/umem.h"
 #include "kernel/mm/kheap.h"
 #include "console/inputs/tty.h"
+#include "kernel/syscall/nspath.h"
+#include "kernel/security/auth.h"
+#include "kernel/ipc/channel.h"
+#include "kernel/dev/device.h"
+#include "kernel/acpi/acpi.h"
+#include "kernel/crypto/sha256.h"
 #include "kernel/timer/pit/pit_base.h"
 #include "console/outputs/printk.h"
 #include "drivers/filesystem/vfs.h"
@@ -37,6 +43,11 @@
 NX_STATIC_ASSERT(nx_stat_size, sizeof(struct nx_stat) == 32);
 NX_STATIC_ASSERT(nx_sysinfo_size, sizeof(struct nx_sysinfo) == 48);
 NX_STATIC_ASSERT(nx_procinfo_size, sizeof(struct nx_procinfo) == 32);
+NX_STATIC_ASSERT(nx_identity_size, sizeof(struct nx_identity) == 64);
+NX_STATIC_ASSERT(nx_pollfd_size, sizeof(struct nx_pollfd) == 16);
+NX_STATIC_ASSERT(nx_msginfo_size, sizeof(struct nx_msginfo) == 16);
+NX_STATIC_ASSERT(nx_dirent_size, sizeof(struct nx_dirent) == 256);
+NX_STATIC_ASSERT(nx_devinfo_size, sizeof(struct nx_devinfo) == 40);
 
 /* 한 번에 커널 버퍼로 옮기는 크기 (커널 스택 사용량을 작게 유지) */
 #define IO_CHUNK 512U
@@ -112,16 +123,95 @@ static i64 sys_sysinfo(const u64 *a)
 /* Object / Handle                                                     */
 /* ------------------------------------------------------------------ */
 
+/* 사용자 경로를 복사해 이름공간 규칙으로 해석한다 (nspath.h) */
+static Nstatus user_path(u64 uptr, char *kpath, usize kmax, u32 *kind)
+{
+    char upath[NX_PATH_MAX];
+    Nstatus status = copy_string_from_user(upath, uptr, sizeof(upath));
+
+    if (NSTATUS_IS_ERR(status))
+        return status;
+    return nsp_translate(upath, kpath, kmax, kind);
+}
+
+/* 사용자 경로 -> VFS 경로 (장치/서비스 경로는 거부) + 커널 전용 경로 검사 */
+static Nstatus user_vfs_path(u64 uptr, char *kpath, usize kmax, u32 op)
+{
+    u32 kind = 0;
+    Nstatus status = user_path(uptr, kpath, kmax, &kind);
+
+    if (NSTATUS_IS_ERR(status))
+        return status;
+    if (kind != NSP_KIND_VFS)
+        return Nunsupported;
+    return nsp_check_protected(kpath, op);
+}
+
+static i64 open_device(const char *name, u64 flags, nx_handle_table_t *table)
+{
+    nx_device_t *dev = nNULL;
+    nx_handle_t *slot;
+    u64 handle;
+    u32 rights = (u32)(NX_RIGHT_SEEK | NX_RIGHT_STAT | NX_RIGHT_DEVICE);
+    bool write = (flags & NX_O_WRITE) ? true : false;
+    Nstatus status;
+
+    if (flags & NX_O_READ)
+        rights |= (u32)NX_RIGHT_READ;
+    if (write)
+        rights |= (u32)NX_RIGHT_WRITE;
+
+    status = device_open(name, write, &dev);
+    if (NSTATUS_IS_ERR(status))
+        return (i64)status;
+
+    status = nx_handle_alloc(table, NX_HANDLE_DEVICE, rights, &handle, &slot);
+    if (NSTATUS_IS_ERR(status)) {
+        device_close(dev, dev->owner, write);
+        return (i64)status;
+    }
+    slot->dev = dev;
+    slot->dev_write = write;
+    slot->dev_offset = 0;
+    return (i64)handle;
+}
+
+static i64 open_service(const char *name, u64 flags, nx_handle_table_t *table)
+{
+    channel_t *c = nNULL;
+    nx_handle_t *slot;
+    u64 handle;
+    Nstatus status;
+
+    if (flags != NX_O_WRITE)
+        return (i64)NinvalidArg;            /* 서비스는 보내기 전용으로 연다 (받는 쪽은 NxChannelCreate) */
+
+    status = channel_connect(name, &c);
+    if (NSTATUS_IS_ERR(status))
+        return (i64)status;
+
+    status = nx_handle_alloc(table, NX_HANDLE_CHANNEL, (u32)(NX_RIGHT_SEND | NX_RIGHT_STAT | NX_RIGHT_DUP),
+                             &handle, &slot);
+    if (NSTATUS_IS_ERR(status)) {
+        channel_release(c, false);
+        return (i64)status;
+    }
+    slot->chan = c;
+    slot->chan_receiver = false;
+    return (i64)handle;
+}
+
 /* NxOpen(const char *path, flags) -> 핸들 */
 static i64 sys_open(const u64 *a)
 {
-    char path[NX_PATH_MAX];
+    char kpath[NSP_PATH_MAX];
     nx_handle_table_t *table = cur_handles();
     handle_t file;
     nx_handle_t *slot;
     u64 handle;
     u64 flags = a[1];
     u32 rights;
+    u32 kind = 0;
     Nstatus status;
 
     if (!table)
@@ -129,11 +219,19 @@ static i64 sys_open(const u64 *a)
     if ((flags & ~NX_O_MASK) != 0 || flags == 0)
         return (i64)NinvalidArg;
 
-    status = copy_string_from_user(path, a[0], sizeof(path));
+    status = user_path(a[0], kpath, sizeof(kpath), &kind);
+    if (NSTATUS_IS_ERR(status))
+        return (i64)status;
+    if (kind == NSP_KIND_DEV)
+        return open_device(kpath, flags, table);
+    if (kind == NSP_KIND_SVC)
+        return open_service(kpath, flags, table);
+
+    status = nsp_check_protected(kpath, NSP_OP_OPEN);
     if (NSTATUS_IS_ERR(status))
         return (i64)status;
 
-    status = vfs_open(path, (u32)flags, &file);
+    status = vfs_open(kpath, (u32)flags, &file);
     if (NSTATUS_IS_ERR(status))
         return (i64)status;
 
@@ -214,6 +312,28 @@ static i64 sys_read(const u64 *a)
         return (i64)got;
     }
 
+    if (slot->type == NX_HANDLE_DEVICE) {
+        if (slot->dev->kind == NX_DEV_BLOCK && (len % NX_BLOCK_SECTOR) != 0)
+            return (i64)NinvalidArg;        /* 블록 장치는 섹터 단위 */
+        while (total < len) {
+            usize want = (usize)((len - total) < IO_CHUNK ? (len - total) : IO_CHUNK);
+            usize got = 0;
+
+            status = device_read(slot->dev, &slot->dev_offset, chunk, want, &got);
+            if (NSTATUS_IS_ERR(status))
+                return total ? (i64)total : (i64)status;
+            if (got == 0)
+                break;
+            status = copy_to_user(buf + total, chunk, got);
+            if (NSTATUS_IS_ERR(status))
+                return total ? (i64)total : (i64)status;
+            total += got;
+            if (got < want || slot->dev->kind != NX_DEV_BLOCK)
+                break;                      /* 스트림은 지금 있는 만큼만 */
+        }
+        return (i64)total;
+    }
+
     if (slot->type != NX_HANDLE_FILE)
         return (i64)Nunsupported;
 
@@ -263,6 +383,8 @@ static i64 sys_write(const u64 *a)
         return 0;
     if (len > NX_IO_MAX)
         len = NX_IO_MAX;
+    if (slot->type == NX_HANDLE_DEVICE && slot->dev->kind == NX_DEV_BLOCK && (len % NX_BLOCK_SECTOR) != 0)
+        return (i64)NinvalidArg;
 
     while (total < len) {
         usize n = (usize)((len - total) < IO_CHUNK ? (len - total) : IO_CHUNK);
@@ -273,7 +395,17 @@ static i64 sys_write(const u64 *a)
 
         if (slot->type == NX_HANDLE_CONSOLE) {
             printk_write((const char *)chunk, n);
-        } else {
+        } else if (slot->type == NX_HANDLE_DEVICE) {
+            usize done = 0;
+
+            status = device_write(slot->dev, current_process, slot->dev_write, &slot->dev_offset, chunk, n, &done);
+            if (NSTATUS_IS_ERR(status))
+                return total ? (i64)total : (i64)status;
+            if (done < n) {
+                total += done;
+                break;
+            }
+        } else if (slot->type == NX_HANDLE_FILE) {
             usize written = 0;
 
             status = vfs_write(&slot->file, chunk, n, &written);
@@ -283,6 +415,8 @@ static i64 sys_write(const u64 *a)
                 total += written;
                 break;
             }
+        } else {
+            return (i64)Nunsupported;
         }
 
         total += n;
@@ -300,6 +434,7 @@ static i64 sys_seek(const u64 *a)
     i64 offset = (i64)a[1];
     i64 base;
     i64 target;
+    u64 *pos;
     Nstatus status;
 
     if (!table)
@@ -308,7 +443,11 @@ static i64 sys_seek(const u64 *a)
     status = nx_handle_lookup(table, a[0], (u32)NX_RIGHT_SEEK, &slot);
     if (NSTATUS_IS_ERR(status))
         return (i64)status;
-    if (slot->type != NX_HANDLE_FILE)
+    if (slot->type == NX_HANDLE_FILE)
+        pos = &slot->file.offset;
+    else if (slot->type == NX_HANDLE_DEVICE && slot->dev->kind == NX_DEV_BLOCK)
+        pos = &slot->dev_offset;
+    else
         return (i64)Nunsupported;
 
     switch (a[2]) {
@@ -316,13 +455,17 @@ static i64 sys_seek(const u64 *a)
         base = 0;
         break;
     case NX_SEEK_CUR:
-        base = (i64)slot->file.offset;
+        base = (i64)*pos;
         break;
     case NX_SEEK_END:
-        status = vfs_fstat(&slot->file, &st);
-        if (NSTATUS_IS_ERR(status))
-            return (i64)status;
-        base = (i64)st.size;
+        if (slot->type == NX_HANDLE_DEVICE) {
+            base = (i64)slot->dev->size;
+        } else {
+            status = vfs_fstat(&slot->file, &st);
+            if (NSTATUS_IS_ERR(status))
+                return (i64)status;
+            base = (i64)st.size;
+        }
         break;
     default:
         return (i64)NinvalidArg;
@@ -338,7 +481,7 @@ static i64 sys_seek(const u64 *a)
     if (target < 0)
         return (i64)NinvalidArg;
 
-    slot->file.offset = (u64)target;
+    *pos = (u64)target;
     return target;
 }
 
@@ -364,6 +507,14 @@ static i64 sys_stat(const u64 *a)
         st.type = NX_TYPE_CONSOLE;
     } else if (slot->type == NX_HANDLE_PROCESS) {
         st.type = NX_TYPE_PROCESS;
+    } else if (slot->type == NX_HANDLE_TOKEN) {
+        st.type = NX_TYPE_TOKEN;
+    } else if (slot->type == NX_HANDLE_CHANNEL) {
+        st.type = NX_TYPE_CHANNEL;
+        st.size = slot->chan->count;
+    } else if (slot->type == NX_HANDLE_DEVICE) {
+        st.type = NX_TYPE_DEVICE;
+        st.size = slot->dev->size;
     } else {
         vfs_stat_t vs;
 
@@ -396,6 +547,11 @@ static i64 sys_duplicate_handle(const u64 *a)
     if (NSTATUS_IS_ERR(status))
         return (i64)status;
 
+    /* 토큰(일회용), 장치(독점 소유), 채널 수신 핸들(받는 쪽은 하나)은 복제할 수 없다 */
+    if (slot->type == NX_HANDLE_TOKEN || slot->type == NX_HANDLE_DEVICE ||
+        (slot->type == NX_HANDLE_CHANNEL && slot->chan_receiver))
+        return (i64)Nunsupported;
+
     status = nx_handle_alloc(table, slot->type, slot->rights & (u32)mask, &handle, &dup);
     if (NSTATUS_IS_ERR(status))
         return (i64)status;
@@ -405,6 +561,10 @@ static i64 sys_duplicate_handle(const u64 *a)
     } else if (slot->type == NX_HANDLE_PROCESS) {
         dup->proc = slot->proc;             /* 같은 프로세스를 가리키는 참조를 하나 더 */
         process_retain(dup->proc);
+    } else if (slot->type == NX_HANDLE_CHANNEL) {
+        dup->chan = slot->chan;
+        dup->chan_receiver = false;
+        channel_retain(dup->chan);
     } else {
         /* 드라이버 내부 상태를 공유하지 않도록 파일을 새로 연다 (오프셋은 복사, 이후 독립) */
         status = vfs_reopen(&slot->file, &dup->file);
@@ -454,12 +614,16 @@ static Nstatus collect_user_strings(u64 user_vec, char *blob, usize *used, u32 *
     }
 }
 
-/* NxProcessCreate(const char *path, const char *const *argv, const char *const *envp) -> 프로세스 핸들 */
+/*
+ * NxProcessCreate(const char *path, const char *const *argv, const char *const *envp, token) -> 프로세스 핸들
+ *   token 이 NX_NO_TOKEN 이 아니면 그 토큰(NX_RIGHT_SPAWN)의 신원으로 시작하고, 성공하면 토큰은 소모된다.
+ */
 static i64 sys_process_create(const u64 *a)
 {
-    char path[NX_PATH_MAX];
+    char path[NSP_PATH_MAX];
     nx_handle_table_t *table = cur_handles();
     nx_handle_t *slot;
+    nx_handle_t *token_slot = nNULL;
     spawn_args_t args;
     process_t *proc = nNULL;
     char *blob;
@@ -472,9 +636,19 @@ static i64 sys_process_create(const u64 *a)
     if (!table)
         return (i64)NnotInitialized;
 
-    status = copy_string_from_user(path, a[0], sizeof(path));
+    status = user_vfs_path(a[0], path, sizeof(path), NSP_OP_OPEN);
     if (NSTATUS_IS_ERR(status))
         return (i64)status;
+
+    if (a[3] != NX_NO_TOKEN) {
+        status = nx_handle_lookup(table, a[3], 0, &token_slot);
+        if (NSTATUS_IS_ERR(status))
+            return (i64)status;
+        if (token_slot->type != NX_HANDLE_TOKEN || !token_slot->token)
+            return (i64)NinvalidArg;
+        if (!(token_slot->rights & (u32)NX_RIGHT_SPAWN))
+            return (i64)Npermission;
+    }
 
     blob = (char *)kpage_alloc();           /* NX_ARG_MAX(4KiB) 를 커널 스택에 두지 않는다 */
     if (!blob)
@@ -508,6 +682,15 @@ static i64 sys_process_create(const u64 *a)
     if (NSTATUS_IS_ERR(status)) {
         nx_handle_discard(slot);
         return (i64)status;
+    }
+
+    if (token_slot) {
+        /* 아직 한 번도 실행되지 않은(READY) 새 프로세스에 토큰의 신원을 입힌다. 시스템 콜 안은 인터럽트가
+         * 꺼져 있고 커널은 비선점이므로 그 사이에 자식이 실행될 수 없다. 그리고 토큰을 소모한다 (일회용). */
+        proc->uid = token_slot->token->uid;
+        proc->gid = token_slot->token->gid;
+        memcpy(proc->user_name, token_slot->token->name, sizeof(proc->user_name));
+        (void)nx_handle_close(table, a[3]);
     }
 
     slot->proc = proc;                      /* process_spawn 이 준 참조를 핸들이 소유한다 */
@@ -637,6 +820,454 @@ static i64 sys_process_info(const u64 *a)
 }
 
 /* ------------------------------------------------------------------ */
+/* 신원 / 인증 / 전원                                                   */
+/* ------------------------------------------------------------------ */
+
+/* NxGetIdentity(struct nx_identity *out) */
+static i64 sys_get_identity(const u64 *a)
+{
+    struct nx_identity id;
+    process_t *self = current_process;
+
+    if (!self)
+        return (i64)NnotInitialized;
+    memset(&id, 0, sizeof(id));
+    id.uid = self->uid;
+    id.gid = self->gid;
+    memcpy(id.name, self->user_name, sizeof(self->user_name) < sizeof(id.name) ? sizeof(self->user_name) : sizeof(id.name));
+    id.name[sizeof(id.name) - 1] = '\0';
+    return (i64)copy_to_user(a[0], &id, sizeof(id));
+}
+
+/* NxPowerOff() - uid 0 만. 정책(누가 끄게 할지)은 init 이 정한다 */
+static i64 sys_power_off(const u64 *a)
+{
+    const NTBLI *info = get_kernel_info();
+
+    (void)a;
+    if (!current_process || current_process->uid != 0)
+        return (i64)Npermission;
+    printk("\nSystem power off.\n");
+    return (i64)acpi_power_off(info ? info->Rsdp : nNULL);
+}
+
+/* NxAuthenticate(const char *name, const char *password) -> 토큰 핸들 */
+static i64 sys_authenticate(const u64 *a)
+{
+    char name[NX_USER_NAME_MAX];
+    char password[AUTH_PASSWORD_MAX + 1U];
+    nx_handle_table_t *table = cur_handles();
+    auth_identity_t id;
+    auth_identity_t *tok;
+    nx_handle_t *slot;
+    u64 handle;
+    u64 flags;
+    Nstatus status;
+
+    if (!table)
+        return (i64)NnotInitialized;
+    status = copy_string_from_user(name, a[0], sizeof(name));
+    if (NSTATUS_IS_ERR(status))
+        return (i64)(status == NpathTooLong ? Nauthentication : status);
+    status = copy_string_from_user(password, a[1], sizeof(password));
+    if (NSTATUS_IS_ERR(status)) {
+        crypto_wipe(password, sizeof(password));
+        return (i64)(status == NpathTooLong ? NinvalidArg : status);
+    }
+
+    /* PBKDF2 는 수십 ms 걸린다: 그동안 인터럽트(타이머/키보드)를 막지 않는다. 커널 코드는 비선점이고
+     * 이 계산은 부팅 후 바뀌지 않는 사용자 표만 읽으므로 IRQ 가 끼어들어도 안전하다. */
+    flags = irq_save();
+    sti();
+    status = auth_verify(name, password, &id);
+    irq_restore(flags);
+    crypto_wipe(password, sizeof(password));
+
+    if (NSTATUS_IS_ERR(status)) {
+        u32 hz = timer_get_hz();
+
+        if (status == Nauthentication && hz)
+            (void)process_sleep_ticks(((u64)NX_AUTH_FAIL_DELAY_MS * hz + 999UL) / 1000UL);
+        return (i64)status;
+    }
+
+    tok = (auth_identity_t *)kmalloc(sizeof(*tok));
+    if (!tok) {
+        crypto_wipe(&id, sizeof(id));
+        return (i64)NoutOfMemory;
+    }
+    *tok = id;
+    crypto_wipe(&id, sizeof(id));
+
+    status = nx_handle_alloc(table, NX_HANDLE_TOKEN, (u32)(NX_RIGHT_SPAWN | NX_RIGHT_STAT), &handle, &slot);
+    if (NSTATUS_IS_ERR(status)) {
+        crypto_wipe(tok, sizeof(*tok));
+        kfree(tok);
+        return (i64)status;
+    }
+    slot->token = tok;
+    return (i64)handle;
+}
+
+/* ------------------------------------------------------------------ */
+/* NxPoll / 채널                                                        */
+/* ------------------------------------------------------------------ */
+
+/* timeout_ms -> tick (0 = 확인만, NX_WAIT_INFINITE = 무기한). 잘못된 값이면 NinvalidArg */
+static Nstatus timeout_to_ticks(u64 ms, bool *infinite, u64 *ticks)
+{
+    u32 hz = timer_get_hz();
+
+    *infinite = false;
+    *ticks = 0;
+    if (ms == NX_WAIT_INFINITE) {
+        *infinite = true;
+        return NSTATUS_OK;
+    }
+    if (ms == 0)
+        return NSTATUS_OK;
+    if (ms > NX_WAIT_MAX_MS)
+        return NinvalidArg;
+    if (hz == 0)
+        return Nunsupported;
+    *ticks = (ms * (u64)hz + 999UL) / 1000UL;
+    return NSTATUS_OK;
+}
+
+/* NxPoll(struct nx_pollfd *fds, n, timeout_ms) -> 준비된 항목 수 */
+static i64 sys_poll(const u64 *a)
+{
+    struct nx_pollfd fds[NX_POLL_MAX];
+    nx_handle_table_t *table = cur_handles();
+    u64 n = a[1];
+    u64 deadline = 0;
+    u64 ticks;
+    bool infinite;
+    u64 flags;
+    u32 ready = 0;
+    u32 i;
+    Nstatus status;
+
+    if (!table)
+        return (i64)NnotInitialized;
+    if (n == 0 || n > NX_POLL_MAX)
+        return (i64)NinvalidArg;
+    status = timeout_to_ticks(a[2], &infinite, &ticks);
+    if (NSTATUS_IS_ERR(status))
+        return (i64)status;
+    status = copy_from_user(fds, a[0], (usize)(n * sizeof(fds[0])));
+    if (NSTATUS_IS_ERR(status))
+        return (i64)status;
+    if (ticks)
+        deadline = timer_get_tick() + ticks;
+
+    flags = irq_save();
+    for (;;) {
+        waitq_t *qs[NX_POLL_MAX];
+        u32 nq = 0;
+        u64 now;
+
+        ready = 0;
+        for (i = 0; i < n; i++) {
+            nx_handle_t *slot;
+            u32 bits = 0;
+
+            fds[i].revents = 0;
+            status = nx_handle_lookup(table, fds[i].handle, 0, &slot);
+            if (NSTATUS_IS_ERR(status)) {
+                irq_restore(flags);
+                return (i64)status;
+            }
+
+            if (slot->type == NX_HANDLE_PROCESS) {
+                if (slot->proc->state == PROCESS_TERMINATED)
+                    bits = NX_POLL_EXIT;
+                qs[nq++] = &slot->proc->exit_waiters;
+            } else if (slot->type == NX_HANDLE_CHANNEL) {
+                bits = channel_poll_bits(slot->chan, slot->chan_receiver);
+                qs[nq++] = slot->chan_receiver ? &slot->chan->recv_q : &slot->chan->send_q;
+            } else if (slot->type == NX_HANDLE_CONSOLE && slot->console_fd == 0) {
+                if (tty_input_ready())
+                    bits = NX_POLL_IN;
+                qs[nq++] = tty_waitq();
+            } else {
+                irq_restore(flags);
+                return (i64)Nunsupported;   /* 기다릴 수 없는 종류 */
+            }
+
+            fds[i].revents = bits & (fds[i].events | NX_POLL_HUP);
+            if (fds[i].revents)
+                ready++;
+        }
+
+        now = timer_get_tick();
+        if (ready || (!infinite && (ticks == 0 || now >= deadline)))
+            break;
+
+        status = waitq_sleep_multi_locked(qs, nq, infinite ? 0 : deadline - now);
+        if (NSTATUS_IS_ERR(status) && status != Ntimeout) {
+            irq_restore(flags);
+            return (i64)status;
+        }
+    }
+    irq_restore(flags);
+
+    status = copy_to_user(a[0], fds, (usize)(n * sizeof(fds[0])));
+    if (NSTATUS_IS_ERR(status))
+        return (i64)status;
+    return (i64)ready;
+}
+
+/* NxChannelCreate(const char *path, flags) -> 수신 핸들 */
+static i64 sys_channel_create(const u64 *a)
+{
+    char kpath[NSP_PATH_MAX];
+    nx_handle_table_t *table = cur_handles();
+    channel_t *c = nNULL;
+    nx_handle_t *slot;
+    u64 handle;
+    u32 kind = 0;
+    Nstatus status;
+
+    if (!table)
+        return (i64)NnotInitialized;
+    status = user_path(a[0], kpath, sizeof(kpath), &kind);
+    if (NSTATUS_IS_ERR(status))
+        return (i64)status;
+    if (kind != NSP_KIND_SVC)
+        return (i64)NinvalidArg;
+
+    status = nx_handle_alloc(table, NX_HANDLE_CHANNEL, (u32)(NX_RIGHT_RECV | NX_RIGHT_STAT), &handle, &slot);
+    if (NSTATUS_IS_ERR(status))
+        return (i64)status;
+    status = channel_create(kpath, (u32)a[1], &c);
+    if (NSTATUS_IS_ERR(status)) {
+        nx_handle_discard(slot);
+        return (i64)status;
+    }
+    slot->chan = c;
+    slot->chan_receiver = true;
+    return (i64)handle;
+}
+
+static Nstatus lookup_channel(u64 handle, u32 rights, nx_handle_t **out)
+{
+    nx_handle_table_t *table = cur_handles();
+    nx_handle_t *slot;
+    Nstatus status;
+
+    if (!table)
+        return NnotInitialized;
+    status = nx_handle_lookup(table, handle, 0, &slot);
+    if (NSTATUS_IS_ERR(status))
+        return status;
+    if (slot->type != NX_HANDLE_CHANNEL || !slot->chan)
+        return NinvalidArg;
+    if ((slot->rights & rights) != rights)
+        return Npermission;
+    *out = slot;
+    return NSTATUS_OK;
+}
+
+/* NxChannelSend(h, const void *buf, len) */
+static i64 sys_channel_send(const u64 *a)
+{
+    u8 buf[NX_CHAN_MSG_MAX];
+    nx_handle_t *slot;
+    Nstatus status = lookup_channel(a[0], (u32)NX_RIGHT_SEND, &slot);
+
+    if (NSTATUS_IS_ERR(status))
+        return (i64)status;
+    if (a[2] > NX_CHAN_MSG_MAX)
+        return (i64)NinvalidArg;
+    status = copy_from_user(buf, a[1], (usize)a[2]);
+    if (NSTATUS_IS_ERR(status))
+        return (i64)status;
+    return (i64)channel_send(slot->chan, buf, (usize)a[2]);
+}
+
+/* NxChannelReceive(h, void *buf, len, struct nx_msginfo *info, timeout_ms) -> 메시지 바이트 수 */
+static i64 sys_channel_receive(const u64 *a)
+{
+    u8 buf[NX_CHAN_MSG_MAX];
+    struct nx_msginfo info;
+    nx_handle_t *slot;
+    usize len = (usize)(a[2] < NX_CHAN_MSG_MAX ? a[2] : NX_CHAN_MSG_MAX);
+    u64 ticks;
+    u64 deadline;
+    bool infinite;
+    u64 flags;
+    Nstatus status = lookup_channel(a[0], (u32)NX_RIGHT_RECV, &slot);
+
+    if (NSTATUS_IS_ERR(status))
+        return (i64)status;
+    status = timeout_to_ticks(a[4], &infinite, &ticks);
+    if (NSTATUS_IS_ERR(status))
+        return (i64)status;
+    deadline = timer_get_tick() + ticks;
+    memset(&info, 0, sizeof(info));
+
+    flags = irq_save();
+    for (;;) {
+        u64 now;
+
+        status = channel_take_locked(slot->chan, buf, len, &info);
+        if (status != Ntimeout)
+            break;                          /* 받았거나 버퍼가 작다 */
+        now = timer_get_tick();
+        if (!infinite && (ticks == 0 || now >= deadline))
+            break;                          /* Ntimeout */
+        status = waitq_sleep_locked(&slot->chan->recv_q, infinite ? 0 : deadline - now);
+        if (NSTATUS_IS_ERR(status) && status != Ntimeout)
+            break;
+    }
+    irq_restore(flags);
+
+    if (a[3] != 0) {
+        Nstatus st2 = copy_to_user(a[3], &info, sizeof(info));
+
+        if (NSTATUS_IS_ERR(st2))
+            return (i64)st2;
+    }
+    if (NSTATUS_IS_ERR(status))
+        return (i64)status;
+    status = copy_to_user(a[1], buf, info.length);   /* 이미 큐에서 꺼냈다: 실패하면 그 메시지는 버려진다 */
+    if (NSTATUS_IS_ERR(status))
+        return (i64)status;
+    return (i64)info.length;
+}
+
+/* ------------------------------------------------------------------ */
+/* 파일시스템 노드                                                      */
+/* ------------------------------------------------------------------ */
+
+/* NxCreateNode(path, type, mode) */
+static i64 sys_create_node(const u64 *a)
+{
+    char kpath[NSP_PATH_MAX];
+    Nstatus status;
+
+    if (a[2] & ~0777UL)
+        return (i64)NinvalidArg;            /* set-uid 류 비트는 허용하지 않는다 */
+    status = user_vfs_path(a[0], kpath, sizeof(kpath), NSP_OP_MODIFY);
+    if (NSTATUS_IS_ERR(status))
+        return (i64)status;
+    if (a[1] == NX_NODE_FILE)
+        return (i64)vfs_create(kpath, (u32)a[2]);
+    if (a[1] == NX_NODE_DIR)
+        return (i64)vfs_mkdir(kpath, (u32)a[2]);
+    return (i64)NinvalidArg;
+}
+
+/* NxRemoveNode(path) */
+static i64 sys_remove_node(const u64 *a)
+{
+    char kpath[NSP_PATH_MAX];
+    Nstatus status = user_vfs_path(a[0], kpath, sizeof(kpath), NSP_OP_MODIFY);
+
+    if (NSTATUS_IS_ERR(status))
+        return (i64)status;
+    return (i64)vfs_unlink(kpath);
+}
+
+/* NxRenameNode(old_path, new_path) */
+static i64 sys_rename_node(const u64 *a)
+{
+    char from[NSP_PATH_MAX];
+    char to[NSP_PATH_MAX];
+    Nstatus status = user_vfs_path(a[0], from, sizeof(from), NSP_OP_MODIFY);
+
+    if (NSTATUS_IS_ERR(status))
+        return (i64)status;
+    status = user_vfs_path(a[1], to, sizeof(to), NSP_OP_MODIFY);
+    if (NSTATUS_IS_ERR(status))
+        return (i64)status;
+    return (i64)vfs_rename(from, to);
+}
+
+/* NxReadDir(path, index, struct nx_dirent *out) */
+static i64 sys_read_dir(const u64 *a)
+{
+    char kpath[NSP_PATH_MAX];
+    struct nx_dirent de;
+    u32 type = 0;
+    /* OPEN 규칙: 커널 전용 경로 자체만 막는다 (조상 디렉터리의 목록은 볼 수 있다 - 이름만 보인다) */
+    Nstatus status = user_vfs_path(a[0], kpath, sizeof(kpath), NSP_OP_OPEN);
+
+    if (NSTATUS_IS_ERR(status))
+        return (i64)status;
+
+    memset(&de, 0, sizeof(de));
+    status = vfs_readdir(kpath, a[1], de.name, sizeof(de.name), &type);
+    if (NSTATUS_IS_ERR(status))
+        return (i64)status;
+    de.type = (type == 2U) ? NX_TYPE_DIR : NX_TYPE_FILE;
+    return (i64)copy_to_user(a[2], &de, sizeof(de));
+}
+
+/* ------------------------------------------------------------------ */
+/* 장치                                                                 */
+/* ------------------------------------------------------------------ */
+
+/* NxDeviceCommand(h, cmd, arg) */
+static i64 sys_device_command(const u64 *a)
+{
+    nx_handle_table_t *table = cur_handles();
+    nx_handle_t *slot;
+    Nstatus status;
+
+    if (!table)
+        return (i64)NnotInitialized;
+    status = nx_handle_lookup(table, a[0], 0, &slot);
+    if (NSTATUS_IS_ERR(status))
+        return (i64)status;
+
+    if (slot->type == NX_HANDLE_CONSOLE) {
+        /* 콘솔(stdin)은 에코 설정만 */
+        if (a[1] != NX_DEVCMD_TTY_ECHO || slot->console_fd != 0)
+            return (i64)Nunsupported;
+        tty_set_echo(a[2] ? true : false);
+        return 0;
+    }
+
+    if (slot->type != NX_HANDLE_DEVICE)
+        return (i64)NinvalidArg;
+    if (!(slot->rights & (u32)NX_RIGHT_DEVICE))
+        return (i64)Npermission;
+
+    if (a[1] == NX_DEVCMD_INFO) {
+        struct nx_devinfo info;
+
+        device_info(slot->dev, &info);
+        return (i64)copy_to_user(a[2], &info, sizeof(info));
+    }
+    if (a[1] == NX_DEVCMD_IOPERM)
+        return (i64)device_ioperm(slot->dev, current_process, a[2] ? true : false);
+    return (i64)Nunsupported;
+}
+
+/* NxDeviceMapMMIO(h, u64 *out_addr) */
+static i64 sys_device_map_mmio(const u64 *a)
+{
+    nx_handle_table_t *table = cur_handles();
+    nx_handle_t *slot;
+    u64 va = 0;
+    Nstatus status;
+
+    if (!table)
+        return (i64)NnotInitialized;
+    status = nx_handle_lookup(table, a[0], (u32)NX_RIGHT_DEVICE, &slot);
+    if (NSTATUS_IS_ERR(status))
+        return (i64)status;
+    if (slot->type != NX_HANDLE_DEVICE)
+        return (i64)NinvalidArg;
+    status = device_map_mmio(slot->dev, current_process, &va);
+    if (NSTATUS_IS_ERR(status))
+        return (i64)status;
+    return (i64)copy_to_user(a[1], &va, sizeof(va));
+}
+
+/* ------------------------------------------------------------------ */
 /* Debug                                                               */
 /* ------------------------------------------------------------------ */
 
@@ -674,6 +1305,9 @@ static const struct syscall_entry g_syscalls[] = {
     { NX_SYS_SLEEP,            sys_sleep },
     { NX_SYS_YIELD,            sys_yield },
     { NX_SYS_SYSINFO,          sys_sysinfo },
+    { NX_SYS_GET_IDENTITY,     sys_get_identity },
+    { NX_SYS_POWER_OFF,        sys_power_off },
+    { NX_SYS_AUTHENTICATE,     sys_authenticate },
 
     { NX_SYS_OPEN,             sys_open },
     { NX_SYS_CLOSE,            sys_close },
@@ -682,6 +1316,19 @@ static const struct syscall_entry g_syscalls[] = {
     { NX_SYS_SEEK,             sys_seek },
     { NX_SYS_STAT,             sys_stat },
     { NX_SYS_DUPLICATE_HANDLE, sys_duplicate_handle },
+    { NX_SYS_POLL,             sys_poll },
+
+    { NX_SYS_CHANNEL_CREATE,   sys_channel_create },
+    { NX_SYS_CHANNEL_SEND,     sys_channel_send },
+    { NX_SYS_CHANNEL_RECEIVE,  sys_channel_receive },
+
+    { NX_SYS_CREATE_NODE,      sys_create_node },
+    { NX_SYS_REMOVE_NODE,      sys_remove_node },
+    { NX_SYS_RENAME_NODE,      sys_rename_node },
+    { NX_SYS_READ_DIR,         sys_read_dir },
+
+    { NX_SYS_DEVICE_COMMAND,   sys_device_command },
+    { NX_SYS_DEVICE_MAP_MMIO,  sys_device_map_mmio },
 
     { NX_SYS_PROCESS_CREATE,   sys_process_create },
     { NX_SYS_PROCESS_EXIT,     sys_process_exit },

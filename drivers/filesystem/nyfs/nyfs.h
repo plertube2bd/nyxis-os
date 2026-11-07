@@ -37,6 +37,7 @@ typedef struct {
     u64 total_blocks;           /* format() 전용 */
     u64 inode_count;            /* format() 전용. 0 = 자동 */
     u8  block_size_shift;       /* format() 전용. NYFS_BLOCK_SIZE_SHIFT_MIN..MAX */
+    u16 root_mode;              /* format() 전용. 루트 디렉터리 권한 비트 (0 = 기본 0755, tmp:/ 는 0777) */
 } nyfs_mount_params_t;
 
 /*

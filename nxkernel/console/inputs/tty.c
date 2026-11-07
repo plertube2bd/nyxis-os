@@ -22,6 +22,34 @@ static u32 g_ready_count = 0;
 static u32 g_eof_pending = 0;              /* 아직 소비되지 않은 Ctrl-D(EOF) 수 */
 
 static waitq_t g_readers;
+static volatile bool g_echo = true;        /* NX_DEVCMD_TTY_ECHO 로 끈다 (비밀번호 입력) */
+static volatile bool g_serial_rx = true;   /* dev:/com1 을 사용자 프로세스가 가져가면 끈다 */
+
+void tty_set_echo(bool on)
+{
+    g_echo = on;
+}
+
+void tty_set_serial_rx(bool on)
+{
+    g_serial_rx = on;
+    if (serial_available()) {
+        if (on)
+            serial_enable_rx_interrupt();
+        else
+            serial_disable_rx_interrupt();
+    }
+}
+
+bool tty_input_ready(void)
+{
+    return (g_ready_count > 0 || g_eof_pending > 0) ? true : false;
+}
+
+waitq_t *tty_waitq(void)
+{
+    return &g_readers;
+}
 
 /* 줄을 읽을 수 있는 버퍼로 옮긴다. 공간이 모자라면 줄 전체를 버린다 (줄이 쪼개져 섞이지 않도록) */
 static void commit_line(void)
@@ -50,17 +78,19 @@ void tty_input_char(char c)
 
     if (c == '\n') {
         g_line[g_line_len++] = '\n';       /* g_line_len <= TTY_LINE_MAX-1 이 항상 유지되므로 자리 있음 */
-        printk_write("\n", 1);
+        printk_write("\n", 1);            /* 에코를 꺼도 줄바꿈은 보여 준다 (비밀번호 입력 후 다음 줄로) */
         commit_line();
     } else if (c == '\b' || c == 0x7F) {
         if (g_line_len > 0) {
             g_line_len--;
-            printk_backspace();
+            if (g_echo)
+                printk_backspace();
         }
     } else if (c == 0x15) {                /* Ctrl-U */
         while (g_line_len > 0) {
             g_line_len--;
-            printk_backspace();
+            if (g_echo)
+                printk_backspace();
         }
     } else if (c == 0x04) {                /* Ctrl-D */
         if (g_line_len == 0) {
@@ -72,7 +102,8 @@ void tty_input_char(char c)
     } else if (c == '\t' || ((u8)c >= 0x20 && (u8)c < 0x7F)) {
         if (g_line_len < TTY_LINE_MAX - 1U) {
             g_line[g_line_len++] = c;
-            printk_write(&c, 1);
+            if (g_echo)
+                printk_write(&c, 1);
         }
     }
 
@@ -126,6 +157,8 @@ static void serial_irq_handler(struct trap_frame *frame)
     u32 guard = 0;
 
     (void)frame;
+    if (!g_serial_rx)
+        return;                            /* COM1 은 지금 사용자 프로세스 소유 */
     while (serial_rx_ready() && guard++ < 64U)
         tty_input_char(serial_getc_nowait());
 }

@@ -26,6 +26,12 @@ void printk_write(const char *buf, usize len);
 /* 마지막으로 출력한 글자 하나를 지운다 (콘솔 입력 에코의 백스페이스용: 시리얼 "\b \b", 프레임버퍼 커서 후퇴) */
 void printk_backspace(void);
 
+/* 출력 싱크 켜기/끄기 (장치를 사용자 프로세스에 배타적으로 넘길 때, kernel/dev/device.c).
+ * 커널 패닉은 printk_force_all_outputs() 로 소유권과 무관하게 모든 싱크를 다시 켠다. */
+void printk_set_fb_enabled(bool on);
+void printk_set_serial_enabled(bool on);
+void printk_force_all_outputs(void);
+
 /*
  * 프레임버퍼 콘솔 초기화. 프레임버퍼가 없거나 값이 이상하면 NinvalidArg 를 반환하며,
  * 이 경우에도 printk 는 시리얼로는 계속 출력한다.

@@ -24,6 +24,15 @@
 #define NX_SYS_SLEEP            4U
 #define NX_SYS_YIELD            5U
 #define NX_SYS_SYSINFO          7U
+#define NX_SYS_GET_IDENTITY     8U    /* NxGetIdentity(struct nx_identity *out) */
+#define NX_SYS_POWER_OFF        9U    /* NxPowerOff() - uid 0 만. 성공하면 돌아오지 않는다 */
+/*
+ * NxAuthenticate(const char *name, const char *password) -> 토큰 핸들 (NX_RIGHT_SPAWN)
+ *   커널이 roi:/users 의 PBKDF2-HMAC-SHA256 해시와 비교한다. 실패하면 NX_AUTH_FAIL_DELAY_MS 만큼
+ *   잠든 뒤 Nauthentication (사용자 없음/비밀번호 틀림을 구분하지 않는다).
+ *   토큰은 일회용이다: NxProcessCreate 의 token 인자로 쓰는 순간 소모되고 핸들도 닫힌다.
+ */
+#define NX_SYS_AUTHENTICATE     10U
 
 #define NX_SYS_OPEN             32U
 #define NX_SYS_CLOSE            33U
@@ -32,6 +41,14 @@
 #define NX_SYS_SEEK             36U
 #define NX_SYS_STAT             37U
 #define NX_SYS_DUPLICATE_HANDLE 41U
+/*
+ * NxPoll(struct nx_pollfd *fds, n, timeout_ms) -> 준비된 항목 수 (0 = 시간 초과)
+ *   n <= NX_POLL_MAX. 레벨 트리거: 조건이 참이면 즉시 돌아온다. timeout_ms: 0 = 확인만,
+ *   NX_WAIT_INFINITE = 무기한. 준비 조건: 채널 수신 핸들 NX_POLL_IN(메시지 있음),
+ *   채널 송신 핸들 NX_POLL_OUT(큐에 자리 있음), 상대가 사라지면 NX_POLL_HUP,
+ *   프로세스 핸들 NX_POLL_EXIT(종료됨), stdin NX_POLL_IN(완성된 줄 또는 EOF).
+ */
+#define NX_SYS_POLL             42U
 
 /*
  * NxProcessCreate(const char *path, const char *const *argv, const char *const *envp) -> 프로세스 핸들
@@ -71,15 +88,59 @@
  */
 #define NX_SYS_VIRTUAL_ALLOC    96U
 
+/*
+ * 채널 (svc:/ 이름공간의 IPC). 메시지마다 커널이 보낸 쪽 pid/uid/gid 를 붙여 준다.
+ *   NxChannelCreate(const char *path, flags) -> 수신 핸들 (NX_RIGHT_RECV)
+ *     path: "svc:/sys/<이름>" (uid 0 만) 또는 "svc:/<자기 사용자 이름>/<이름>". 이미 있으면 NalreadyExists.
+ *     flags: NX_CHAN_PUBLIC 이면 누구나 보낼 수 있고, 아니면 같은 uid(와 root)만.
+ *     수신 핸들을 닫으면 이름이 사라지고 보내는 쪽은 Ndisconnected 를 받는다.
+ *   NxOpen("svc:/...", NX_O_WRITE) -> 송신 핸들 (NX_RIGHT_SEND)
+ *   NxChannelSend(h, const void *buf, len) -> 0. 큐가 가득 차면 Nbusy (NxPoll 의 NX_POLL_OUT 로 기다림).
+ *   NxChannelReceive(h, void *buf, len, struct nx_msginfo *info, timeout_ms) -> 메시지 바이트 수
+ *     메시지가 없으면 잠든다(timeout_ms 규칙은 NxPoll 과 같다). buf 가 작으면 NbufferOverflow 이고
+ *     메시지는 큐에 남는다 (info->length 로 필요한 크기를 알려준다).
+ */
+#define NX_SYS_CHANNEL_CREATE   129U
+#define NX_SYS_CHANNEL_SEND     130U
+#define NX_SYS_CHANNEL_RECEIVE  131U
+
+/*
+ * 파일시스템 노드 (경로 규칙은 아래 "이름공간" 참고)
+ *   NxCreateNode(path, type, mode)   type: NX_NODE_FILE / NX_NODE_DIR, mode: 권한 비트(0777 이하)
+ *   NxRemoveNode(path)               파일 또는 빈 디렉터리
+ *   NxRenameNode(old_path, new_path) 같은 볼륨 안에서만. 대상이 있으면 NalreadyExists
+ *   NxReadDir(path, index, struct nx_dirent *out)  index 번째 항목. 범위를 넘으면 NnotFound
+ */
+#define NX_SYS_CREATE_NODE      162U
+#define NX_SYS_REMOVE_NODE      163U
+#define NX_SYS_RENAME_NODE      164U
+#define NX_SYS_READ_DIR         165U
+
+/*
+ * 장치 (NxOpen("dev:/...") 으로 연다. uid 0 만. 장치는 배타적으로 소유된다 - 다른 프로세스가 쓰는 중이면 Nbusy.
+ * 핸들을 닫거나 프로세스가 끝나면 커널로 돌아간다)
+ *   dev:/fb0      프레임버퍼. NxDeviceMapMMIO 로 자기 주소 공간에 매핑. 소유 중에는 커널 콘솔이 그리지 않는다
+ *   dev:/com1     COM1 시리얼. NxRead/NxWrite(바이트, 읽기는 블로킹 안 함), NX_DEVCMD_IOPERM 으로 포트 직접 접근.
+ *                 소유 중에는 커널 로그/stdin 이 COM1 을 쓰지 않는다
+ *   dev:/rd0      비어 있는 RAM 블록 장치 (마운트되지 않음). NxRead/NxWrite/NxSeek, 512바이트 단위
+ *   dev:/rootdisk fs:/ 가 올라간 RAM 디스크. 마운트되어 있으므로 읽기만 된다 (쓰기 열기는 Nbusy)
+ *   NxDeviceCommand(h, cmd, arg)     NX_DEVCMD_*
+ *   NxDeviceMapMMIO(h, u64 *out_addr) 장치 메모리를 매핑하고 사용자 가상 주소를 돌려준다
+ */
+#define NX_SYS_DEVICE_COMMAND   193U
+#define NX_SYS_DEVICE_MAP_MMIO  194U
+
 #define NX_SYS_KERNEL_PRINT     771U
 #define NX_SYS_DEBUG_NOP        777U
 
 /* ---------------- 버전 ---------------- */
 /* NxGetVersion 의 반환값: (major << 32) | (minor << 16) | patch */
 /* 2.0: NxProcessCreate 가 pid 대신 프로세스 핸들을 돌려주고 argv/envp 를 받는다 (호환되지 않는 변경).
- *      NxProcessKill/NxProcessWait 추가, NxRead(stdin) 이 콘솔 입력을 읽는다. */
+ *      NxProcessKill/NxProcessWait 추가, NxRead(stdin) 이 콘솔 입력을 읽는다.
+ * 2.1: 신원/인증(NxGetIdentity, NxAuthenticate, NxProcessCreate 의 token 인자), 이름공간(fs:/ app:/ face:/
+ *      roi:/ tmp:/ dev:/ svc:/), 파일 노드 호출, 장치, 채널, NxPoll, NxPowerOff. */
 #define NX_ABI_MAJOR   2UL
-#define NX_ABI_MINOR   0UL
+#define NX_ABI_MINOR   1UL
 #define NX_ABI_PATCH   0UL
 #define NX_ABI_VERSION ((NX_ABI_MAJOR << 32) | (NX_ABI_MINOR << 16) | NX_ABI_PATCH)
 
@@ -96,7 +157,11 @@
 #define NX_RIGHT_DUP    0x10UL
 #define NX_RIGHT_WAIT   0x20UL    /* 프로세스 핸들: NxProcessWait */
 #define NX_RIGHT_KILL   0x40UL    /* 프로세스 핸들: NxProcessKill */
-#define NX_RIGHT_ALL    0x7FUL
+#define NX_RIGHT_SPAWN  0x80UL    /* 토큰 핸들: NxProcessCreate 의 신원으로 쓰기 */
+#define NX_RIGHT_SEND   0x100UL   /* 채널 송신 */
+#define NX_RIGHT_RECV   0x200UL   /* 채널 수신 */
+#define NX_RIGHT_DEVICE 0x400UL   /* 장치: NxDeviceCommand / NxDeviceMapMMIO */
+#define NX_RIGHT_ALL    0x7FFUL
 
 /* ---------------- NxOpen 플래그 ---------------- */
 #define NX_O_READ   0x1UL     /* 읽기 */
@@ -133,6 +198,45 @@
 #define NX_EXIT_FAULT      (-1)       /* 사용자 모드 CPU 예외로 종료됨 */
 #define NX_EXIT_KILLED     (-2)       /* NxProcessKill 로 종료됨 */
 
+#define NX_NO_TOKEN        0UL        /* NxProcessCreate: 토큰 없음 (부모 신원 상속). 0 은 stdin 이라 토큰일 수 없다 */
+#define NX_AUTH_FAIL_DELAY_MS 1000UL  /* 인증 실패 시 지연 (무차별 대입을 느리게) */
+#define NX_POLL_MAX        16UL
+#define NX_CHAN_MSG_MAX    256UL      /* 채널 메시지 최대 바이트 */
+#define NX_CHAN_QUEUE_MAX  16UL       /* 채널 큐 최대 메시지 수 */
+#define NX_CHAN_PUBLIC     0x1UL      /* NxChannelCreate: 누구나 보낼 수 있음 */
+#define NX_BLOCK_SECTOR    512UL      /* 블록 장치 읽기/쓰기 단위 (오프셋/길이 모두 배수여야 함) */
+
+/* NxPoll 이벤트 */
+#define NX_POLL_IN         0x1U
+#define NX_POLL_OUT        0x2U
+#define NX_POLL_EXIT       0x4U
+#define NX_POLL_HUP        0x8U
+
+/* NxCreateNode 종류 */
+#define NX_NODE_FILE       1UL
+#define NX_NODE_DIR        2UL
+
+/* NxDeviceCommand */
+#define NX_DEVCMD_INFO     1UL        /* arg = struct nx_devinfo * */
+#define NX_DEVCMD_IOPERM   2UL        /* arg = 1 허용 / 0 회수 : 이 장치의 I/O 포트를 ring3 에서 직접 in/out */
+#define NX_DEVCMD_TTY_ECHO 3UL        /* 콘솔(stdin) 핸들에: arg = 1 에코 켬 / 0 끔 (비밀번호 입력) */
+
+/* 장치 종류 (nx_devinfo.kind) */
+#define NX_DEV_STREAM      1U
+#define NX_DEV_BLOCK       2U
+#define NX_DEV_FRAMEBUFFER 3U
+
+/*
+ * 이름공간 (NxOpen / NxCreateNode / NxRemoveNode / NxRenameNode / NxReadDir / NxProcessCreate 의 경로)
+ *   fs:/    전체 파일 트리. uid 0 만 직접 쓸 수 있다
+ *   app:/   = fs:/usr/          실행 파일
+ *   face:/  = fs:/home/<사용자>/  호출한 프로세스의 사용자 홈 (프로세스마다 다르다)
+ *   roi:/   = fs:/roi/          운영체제 구동용 레지스트리. uid 0 만. roi:/users 는 커널 전용(아무도 열 수 없음)
+ *   tmp:/   재부팅하면 사라지는 RAM 파일시스템 (누구나)
+ *   dev:/   장치 (위 참고), svc:/ 채널 (위 참고)
+ *   "." 는 무시하고, 별칭의 뿌리 위로 올라가는 ".." 는 Npermission. 접두어가 없거나 모르는 접두어는 NnotFound.
+ */
+
 /* NxVirtualAlloc 남용을 막는 상한(기초적인 DoS 방지). 물리 프레임 할당자는 유한하므로
  * 프로세스 하나가 한 번의 호출로, 또는 누적으로 전체 RAM 을 다 가져가지 못하게 한다. */
 #define NX_HEAP_GROW_MAX_PER_CALL (256UL * 1024UL * 1024UL)  /* 한 번의 NxVirtualAlloc 상한: 256MiB */
@@ -145,6 +249,9 @@
 #define NX_TYPE_DIR      2U
 #define NX_TYPE_CONSOLE  3U
 #define NX_TYPE_PROCESS  4U
+#define NX_TYPE_TOKEN    5U
+#define NX_TYPE_CHANNEL  6U
+#define NX_TYPE_DEVICE   7U
 
 /* NxStat: 32바이트 */
 struct nx_stat {
@@ -174,6 +281,49 @@ struct nx_procinfo {
     uint32_t handle_count;    /* 열려 있는 핸들 수 */
     uint32_t reserved0;
     uint64_t reserved[2];
+};
+
+/* NxGetIdentity: 64바이트 */
+struct nx_identity {
+    uint32_t uid;
+    uint32_t gid;
+    char     name[56];        /* NUL 종료 */
+};
+
+/* NxPoll 항목: 16바이트 */
+struct nx_pollfd {
+    uint64_t handle;
+    uint32_t events;          /* 기다릴 NX_POLL_* */
+    uint32_t revents;         /* 커널이 채움 */
+};
+
+/* NxChannelReceive 메시지 정보: 16바이트 */
+struct nx_msginfo {
+    uint32_t sender_pid;
+    uint32_t sender_uid;
+    uint32_t sender_gid;
+    uint32_t length;          /* 메시지 길이 (버퍼가 작아 실패했을 때도 채워진다) */
+};
+
+/* NxReadDir: 256바이트 */
+struct nx_dirent {
+    uint32_t type;            /* NX_TYPE_FILE / NX_TYPE_DIR */
+    uint32_t reserved;
+    char     name[248];       /* NUL 종료 */
+};
+
+/* NX_DEVCMD_INFO: 40바이트 */
+struct nx_devinfo {
+    uint32_t kind;            /* NX_DEV_* */
+    uint32_t reserved0;
+    uint64_t size;            /* 블록 장치/프레임버퍼 바이트 수 */
+    uint32_t width;           /* 프레임버퍼 */
+    uint32_t height;
+    uint32_t pitch;           /* 한 줄의 바이트 수 */
+    uint32_t bpp;
+    uint16_t io_base;         /* 스트림 장치의 I/O 포트 범위 (NX_DEVCMD_IOPERM 대상) */
+    uint16_t io_count;
+    uint32_t reserved1;
 };
 
 #endif /* NYX_ABI_H */

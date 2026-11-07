@@ -125,6 +125,9 @@ Nstatus process_init(void)
 
     /* 부트 스레드 = idle 프로세스. 스택은 start.s 의 부트 스택을 계속 사용한다. */
     idle->pid = 0;
+    idle->uid = 0;
+    idle->gid = 0;
+    memcpy(idle->user_name, "root", 5);
     idle->state = PROCESS_RUNNING;
     idle->in_use = true;
     idle->kernel_stack = nNULL;
@@ -171,6 +174,13 @@ static process_t *alloc_process_locked(process_entry_t entry, void *arg)
 
     proc->pid = alloc_pid_locked();
     proc->parent_pid = current_process ? current_process->pid : 0;
+
+    /* 신원 상속 (토큰으로 바꾸는 것은 process_spawn 이 생성 직후, 실행 전에 한다) */
+    if (current_process) {
+        proc->uid = current_process->uid;
+        proc->gid = current_process->gid;
+        memcpy(proc->user_name, current_process->user_name, sizeof(proc->user_name));
+    }
     proc->state = PROCESS_READY;
     proc->entry_point = entry;
     proc->kernel_stack = kstack_bottom(slot);
@@ -293,6 +303,9 @@ Nstatus process_switch(process_t *proc)
      * 다르면 소프트웨어 검사와 하드웨어 접근이 서로 다른 주소 공간을 보는 사고가 난다) */
     write_cr3(proc->addrspace.pml4 ? virt_to_phys(proc->addrspace.pml4) : paging_kernel_cr3());
 
+    /* 포트 권한은 프로세스마다 다르다 (상속하지 않는다: alloc 시 0) */
+    gdt_set_io_permission(proc->io_base, proc->io_count);
+
     /* 이 프로세스에서 ring3 -> ring0 진입 시 사용할 커널 스택 */
     if (proc->kernel_stack)
         gdt_set_kernel_stack((u64)(usize)proc->kernel_stack + PROCESS_KSTACK_SIZE);
@@ -319,7 +332,7 @@ static Nstatus terminate_locked(process_t *proc, i32 code)
 
     proc->exit_code = code;
     g_last_exit_code = code;
-    waitq_remove_locked(proc);
+    waitq_cancel_locked(proc);
     proc->wake_tick = 0;
     proc->state = PROCESS_TERMINATED;
 

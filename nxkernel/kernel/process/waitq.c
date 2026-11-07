@@ -1,10 +1,9 @@
 /*
  * waitq.c - 대기 큐 구현 (설계와 사용 규칙은 waitq.h 참고)
  *
- * 프로세스는 동시에 최대 하나의 큐에서만 기다린다 (process_t.wq / wq_next 로 큐에 직접 매달린다 —
- * 메모리 할당이 필요 없다). 타임아웃은 기존 sleep 과 같은 wake_tick 메커니즘을 쓴다: 스케줄러가
- * 시간이 된 BLOCKED 프로세스를 READY 로 돌리면, 깨어난 쪽은 자신이 아직 큐에 남아 있는 것을 보고
- * "누가 깨운 게 아니라 시간이 다 됐다" 고 판단한다.
+ * 타임아웃은 기존 sleep 과 같은 wake_tick 메커니즘을 쓴다: 스케줄러가 시간이 된 BLOCKED 프로세스를
+ * READY 로 돌리면, 깨어난 쪽은 wait_woken 이 꺼져 있는 것을 보고 "누가 깨운 게 아니라 시간이 다 됐다"
+ * 고 판단한다.
  */
 
 #include "kernel/process/waitq.h"
@@ -18,52 +17,79 @@ void waitq_init(waitq_t *q)
     q->tail = nNULL;
 }
 
-static void enqueue(waitq_t *q, process_t *p)
+static void unlink_entry(waitq_entry_t *e)
 {
-    p->wq = q;
-    p->wq_next = nNULL;
-    if (q->tail)
-        q->tail->wq_next = p;
-    else
-        q->head = p;
-    q->tail = p;
-}
+    waitq_t *q = e->q;
+    waitq_entry_t *cur;
+    waitq_entry_t *prev = nNULL;
 
-void waitq_remove_locked(process_t *p)
-{
-    waitq_t *q = p->wq;
-    process_t *cur;
-    process_t *prev = nNULL;
-
-    if (!q)
-        return;
-
-    for (cur = q->head; cur; prev = cur, cur = cur->wq_next) {
-        if (cur != p)
+    for (cur = q->head; cur; prev = cur, cur = cur->next_in_q) {
+        if (cur != e)
             continue;
         if (prev)
-            prev->wq_next = p->wq_next;
+            prev->next_in_q = e->next_in_q;
         else
-            q->head = p->wq_next;
-        if (q->tail == p)
+            q->head = e->next_in_q;
+        if (q->tail == e)
             q->tail = prev;
         break;
     }
-
-    p->wq = nNULL;
-    p->wq_next = nNULL;
+    e->next_in_q = nNULL;
 }
 
-Nstatus waitq_sleep_locked(waitq_t *q, u64 timeout_ticks)
+void waitq_cancel_locked(process_t *p)
 {
-    process_t *self = current_process;
+    waitq_entry_t *e = p->wait_entries;
 
-    if (!q)
+    while (e) {
+        waitq_entry_t *next = e->next_of_proc;
+
+        unlink_entry(e);
+        e->next_of_proc = nNULL;
+        e = next;
+    }
+    p->wait_entries = nNULL;
+}
+
+Nstatus waitq_sleep_multi_locked(waitq_t **qs, u32 n, u64 timeout_ticks)
+{
+    waitq_entry_t entries[WAITQ_MAX_MULTI];
+    process_t *self = current_process;
+    u32 i;
+    u32 used = 0;
+
+    if (!qs || n == 0 || n > WAITQ_MAX_MULTI)
         return NinvalidArg;
     if (!self || self->pid == 0)
         return Npermission;
 
-    enqueue(q, self);
+    for (i = 0; i < n; i++) {
+        u32 j;
+        bool dup = false;
+
+        if (!qs[i])
+            return NinvalidArg;
+        for (j = 0; j < i; j++) {
+            if (qs[j] == qs[i])
+                dup = true;
+        }
+        if (dup)
+            continue;
+
+        entries[used].proc = self;
+        entries[used].q = qs[i];
+        entries[used].next_in_q = nNULL;
+        entries[used].next_of_proc = self->wait_entries;
+        self->wait_entries = &entries[used];
+        if (qs[i]->tail)
+            qs[i]->tail->next_in_q = &entries[used];
+        else
+            qs[i]->head = &entries[used];
+        qs[i]->tail = &entries[used];
+        used++;
+    }
+
+    self->wait_woken = false;
     self->state = PROCESS_BLOCKED;
     self->wake_tick = timeout_ticks ? timer_get_tick() + timeout_ticks : 0;
 
@@ -71,24 +97,32 @@ Nstatus waitq_sleep_locked(waitq_t *q, u64 timeout_ticks)
 
     if (self->state == PROCESS_BLOCKED) {
         /* 전환이 일어나지 않았다 (idle 이 항상 있으므로 정상이라면 도달하지 않음) */
-        waitq_remove_locked(self);
+        waitq_cancel_locked(self);
         self->state = PROCESS_RUNNING;
         self->wake_tick = 0;
         return Ninterrupted;
     }
 
-    if (self->wq) {
-        /* 아직 큐에 있다 = 아무도 깨우지 않았고 wake_tick 이 지나 스케줄러가 깨웠다 */
-        waitq_remove_locked(self);
+    if (!self->wait_woken) {
+        /* 아무도 깨우지 않았고 wake_tick 이 지나 스케줄러가 깨웠다 */
+        waitq_cancel_locked(self);
         return Ntimeout;
     }
 
-    return NSTATUS_OK;
+    return NSTATUS_OK;               /* 깨운 쪽이 이미 모든 항목을 떼어 냈다 */
 }
 
-static void wake_locked(process_t *p)
+Nstatus waitq_sleep_locked(waitq_t *q, u64 timeout_ticks)
 {
-    waitq_remove_locked(p);
+    return waitq_sleep_multi_locked(&q, 1, timeout_ticks);
+}
+
+static void wake_locked(waitq_entry_t *e)
+{
+    process_t *p = e->proc;
+
+    waitq_cancel_locked(p);         /* 이 프로세스의 모든 항목을 모든 큐에서 뗀다 (e 포함) */
+    p->wait_woken = true;
     p->wake_tick = 0;
     if (p->state == PROCESS_BLOCKED)
         p->state = PROCESS_READY;

@@ -10,6 +10,8 @@
 #   make run-usb    usb-storage 부팅 디스크 + std VGA 로 실행 (예전 virtio-gpu 는 BltOnly GOP 라 프레임버퍼가 없어 제거)
 #   make check      C89 엄격 컴파일(-O0/-O2) 검사
 #   make test-host  FAT16/VFS/램디스크 호스트 테스트 (회귀 + ASan/UBSan 변이 퍼징)
+#   make test-e2e   종단 간 검사 (SELFTEST 이미지 필요: 부팅 -> 로그인 -> 셸 -> 전원 끄기)
+#   make users      로그인 계정 만들기 (config/users.db, 비밀번호는 터미널에서 묻는다). 일반 이미지 빌드에 필요
 #   make clean
 #
 #   옵션:  DEBUG=1     부트로더 프레임버퍼 테스트 패턴 활성화 (-DNYTB_DEBUG)
@@ -156,6 +158,12 @@ KERNEL_C_SRCS = \
 	kernel/process/spawn.c \
 	kernel/mm/pfa.c \
 	kernel/mm/kheap.c \
+	kernel/crypto/sha256.c \
+	kernel/security/auth.c \
+	kernel/syscall/nspath.c \
+	kernel/ipc/channel.c \
+	kernel/dev/device.c \
+	kernel/acpi/acpi.c \
 	kernel/process/waitq.c \
 	kernel/process/schedule.c \
 	kernel/syscall/syscall.c \
@@ -275,20 +283,91 @@ USER_CFLAGS = \
 	-I$(INCLUDE_DIR) -I$(ROOT)/userland/nlibc/library
 
 ELFTEST_DIR = $(ROOT)/userland/elftest
-ELFTEST_ELF = $(BUILD)/elftest.run
+ULIB_DIR    = $(ROOT)/userland/lib
+USER_LDS    = $(ELFTEST_DIR)/linker.lds
+USR_DIR     = $(BUILD)/usr
+ELFTEST_ELF = $(USR_DIR)/elftest.run
+USER_LD     = $(LD) -m elf_x86_64 -nostdlib -z max-page-size=0x1000 -z noexecstack --no-warn-rwx-segments -T $(USER_LDS)
 
-$(ELFTEST_ELF): $(ELFTEST_DIR)/elftest.c $(ELFTEST_DIR)/start.s $(ELFTEST_DIR)/linker.lds
-	@mkdir -p $(BUILD)/obj/elftest
-	$(CC) $(USER_CFLAGS) -c $(ELFTEST_DIR)/elftest.c -o $(BUILD)/obj/elftest/elftest.o
+# 공용 런타임 (crt0 + 시스템 콜 래퍼/문자열/콘솔)
+ULIB_OBJS = $(BUILD)/obj/ulib/crt0.o $(BUILD)/obj/ulib/nyx.o
+
+$(BUILD)/obj/ulib/nyx.o: $(ULIB_DIR)/nyx.c $(ULIB_DIR)/nyx.h $(INCLUDE_DIR)/nyx_abi.h
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -I$(ULIB_DIR) -c $< -o $@
+
+$(BUILD)/obj/ulib/crt0.o: $(ULIB_DIR)/crt0.s
+	@mkdir -p $(dir $@)
+	$(AS) $(ASFLAGS) $< -o $@
+
+# 시스템 프로그램: userland/<이름>/main.c -> fs:/usr/<이름>.run (= app:/<이름>.run)
+USER_PROGS     = init login nysh poweroff
+USER_PROG_ELFS = $(addprefix $(USR_DIR)/,$(addsuffix .run,$(USER_PROGS)))
+
+$(USER_PROG_ELFS): $(USR_DIR)/%.run: $(ROOT)/userland/%/main.c $(ULIB_OBJS) $(ULIB_DIR)/nyx.h $(USER_LDS)
+	@mkdir -p $(BUILD)/obj/user $(USR_DIR)
+	$(CC) $(USER_CFLAGS) -I$(ULIB_DIR) -c $< -o $(BUILD)/obj/user/$*.o
+	$(USER_LD) -o $@ $(ULIB_OBJS) $(BUILD)/obj/user/$*.o
+
+# elftest: 자체 점검용 (자기 start.s 로 진입 레지스터를 검사하고, 공용 런타임도 쓴다)
+$(ELFTEST_ELF): $(ELFTEST_DIR)/elftest.c $(ELFTEST_DIR)/systest.c $(ELFTEST_DIR)/start.s $(USER_LDS) $(BUILD)/obj/ulib/nyx.o $(ULIB_DIR)/nyx.h
+	@mkdir -p $(BUILD)/obj/elftest $(USR_DIR)
+	$(CC) $(USER_CFLAGS) -I$(ULIB_DIR) -c $(ELFTEST_DIR)/elftest.c -o $(BUILD)/obj/elftest/elftest.o
+	$(CC) $(USER_CFLAGS) -I$(ULIB_DIR) -c $(ELFTEST_DIR)/systest.c -o $(BUILD)/obj/elftest/systest.o
 	$(AS) $(ASFLAGS) $(ELFTEST_DIR)/start.s -o $(BUILD)/obj/elftest/start.o
-	$(LD) -m elf_x86_64 -nostdlib -z max-page-size=0x1000 -z noexecstack --no-warn-rwx-segments \
-		-T $(ELFTEST_DIR)/linker.lds -o $@ $(BUILD)/obj/elftest/start.o $(BUILD)/obj/elftest/elftest.o
+	$(USER_LD) -o $@ $(BUILD)/obj/elftest/start.o $(BUILD)/obj/elftest/elftest.o $(BUILD)/obj/elftest/systest.o $(BUILD)/obj/ulib/nyx.o
 
 INITRD_RUN = $(ROOT)/userland/initrd/_ns_/app/hellowld.run
 INITRD_IMG = $(BUILD)/initrd.img
 OS_IMG     = $(BUILD)/esp.img
+NYFS_PACK  = $(ROOT)/tools/nyfs-utils/build/nyfs-pack
+ROOTFS_MANIFEST = $(BUILD)/rootfs.manifest
+ROOTFS_SIZE = 8M
 
-$(INITRD_IMG): $(INITRD_RUN) $(ELFTEST_ELF)
+# =========================
+# 사용자 DB (roi:/users)
+#   실제 이미지: config/users.db (git 이 추적하지 않음). `make users` 로 만든다 (비밀번호는 터미널에서 묻는다).
+#   SELFTEST 이미지: 빌드마다 무작위 비밀번호의 root/test 계정 ($(BUILD)/test-password 에 기록, 테스트 하네스용)
+# =========================
+USERS_DB ?= $(ROOT)/config/users.db
+
+ifneq ($(SELFTEST),)
+ROOT_USERS_DB  = $(BUILD)/test-users.db
+ROOTFS_EXTRA   = --file /roi/test_password=$(BUILD)/test-password:0600
+$(ROOT_USERS_DB): $(ROOT)/tools/mkusers.py
+	@mkdir -p $(BUILD)
+	python3 $(ROOT)/tools/mkusers.py --test $(ROOT_USERS_DB) $(BUILD)/test-password
+else
+ROOT_USERS_DB  = $(USERS_DB)
+ROOTFS_EXTRA   =
+$(USERS_DB):
+	@echo "error: no user database ($(USERS_DB))." >&2
+	@echo "       run 'make users' to create accounts (or build with SELFTEST=1 for a test image)." >&2
+	@false
+endif
+
+users:
+	python3 $(ROOT)/tools/mkusers.py $(USERS_DB)
+
+# 종단 간 검사: SELFTEST 이미지로 부팅 -> 로그인 -> nysh -> poweroff 까지 시리얼과 PS/2 키보드 두 경로로 확인
+test-e2e:
+	@if [ ! -f $(BUILD)/test-password ]; then echo "build a test image first: make clean && make SELFTEST=1 os" >&2; exit 1; fi
+	python3 $(ROOT)/tools/e2e_login_test.py $(BUILD) serial
+	python3 $(ROOT)/tools/e2e_login_test.py $(BUILD) ps2
+
+$(NYFS_PACK):
+	$(MAKE) -C $(ROOT)/tools/nyfs-utils pack
+
+# 루트 파일시스템 = nyfs 이미지 (커널이 fs:/ 로 마운트)
+$(INITRD_IMG): $(USER_PROG_ELFS) $(ELFTEST_ELF) $(INITRD_RUN) $(ROOT_USERS_DB) $(NYFS_PACK) $(ROOT)/tools/mkrootfs.py
+	python3 $(ROOT)/tools/mkrootfs.py --users $(ROOT_USERS_DB) --bin $(USR_DIR) \
+		--file /usr/hellowld.run=$(INITRD_RUN):0644 $(ROOTFS_EXTRA) > $(ROOTFS_MANIFEST)
+	$(NYFS_PACK) -s $(ROOTFS_SIZE) -o $@ $(ROOTFS_MANIFEST)
+
+# FAT16 은 운영체제에서 쓰지 않는다: 호스트 테스트(make test-host)용 이미지만 만든다
+FAT16_TEST_IMG = $(BUILD)/fat16-test.img
+
+$(FAT16_TEST_IMG): $(INITRD_RUN)
 	@mkdir -p $(BUILD)
 	rm -f $@
 	dd if=/dev/zero of=$@ bs=1M count=16 status=none
@@ -296,7 +375,6 @@ $(INITRD_IMG): $(INITRD_RUN) $(ELFTEST_ELF)
 	mmd -i $@ ::_ns_
 	mmd -i $@ ::_ns_/app
 	mcopy -i $@ $(INITRD_RUN) ::_ns_/app/hellowld.run
-	mcopy -i $@ $(ELFTEST_ELF) ::_ns_/app/elftest.run
 
 os: $(OS_IMG)
 
@@ -409,7 +487,7 @@ HOST_KSRCS = $(ROOT)/drivers/filesystem/core.c $(ROOT)/drivers/filesystem/vfs.c 
 ITER      ?= 2000
 SEED      ?= 1
 
-test-host: $(INITRD_IMG)
+test-host: $(FAT16_TEST_IMG)
 	@mkdir -p $(HOST_OUT)
 	@for s in $(HOST_KSRCS); do \
 		o=$(HOST_OUT)/$$(basename $$s .c).o; \
@@ -421,7 +499,7 @@ test-host: $(INITRD_IMG)
 	$(CC) -std=gnu99 -Wall -Wextra -DNYX_HOST_TEST $(HOST_SAN) \
 		-idirafter $(INCLUDE_DIR) -I$(ROOT) -I. \
 		$(HOST_DIR)/fat16_test.c $(HOST_OUT)/core.o $(HOST_OUT)/vfs.o $(HOST_OUT)/fat16.o $(HOST_OUT)/ramdisk.o -o $(HOST_OUT)/fat16_test
-	$(HOST_OUT)/fat16_test $(INITRD_IMG) $(ITER) $(SEED)
+	$(HOST_OUT)/fat16_test $(FAT16_TEST_IMG) $(ITER) $(SEED)
 	$(CC) -std=c89 -pedantic -Wall -Wextra -Werror -Wmissing-prototypes -Wshadow -Wdeclaration-after-statement -nostdinc \
 		-DNYX_HOST_TEST $(HOST_SAN) -I$(INCLUDE_DIR) -I$(ROOT) -I. -c kernel/boot/multiboot2.c -o $(HOST_OUT)/mb2_adapter.o
 	$(CC) -std=gnu99 -Wall -Wextra -DNYX_HOST_TEST $(HOST_SAN) -idirafter $(INCLUDE_DIR) -I$(ROOT) -I. \
@@ -442,4 +520,4 @@ check:
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all kernel os iso run run-nographic run-usb run-grub-bios run-grub-uefi prepare-run check test-host clean
+.PHONY: all kernel os iso run run-nographic run-usb run-grub-bios run-grub-uefi prepare-run check test-host clean users test-e2e

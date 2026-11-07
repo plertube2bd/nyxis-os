@@ -5,6 +5,11 @@
 #include "kernel/syscall/handles.h"
 #include "memory.h"
 #include "kernel/process/process.h"
+#include "kernel/security/auth.h"
+#include "kernel/ipc/channel.h"
+#include "kernel/dev/device.h"
+#include "kernel/crypto/sha256.h"
+#include "kernel/mm/kheap.h"
 
 /* 핸들 값 = (세대 << 32) | 슬롯 번호 */
 static u64 make_handle(u32 generation, u32 index)
@@ -99,6 +104,13 @@ Nstatus nx_handle_close(nx_handle_table_t *table, u64 handle)
         (void)vfs_close(&slot->file);
     else if (slot->type == NX_HANDLE_PROCESS && slot->proc)
         process_release(slot->proc);      /* 마지막 참조였고 이미 끝났으면 슬롯이 여기서 회수된다 */
+    else if (slot->type == NX_HANDLE_TOKEN && slot->token) {
+        crypto_wipe(slot->token, sizeof(*slot->token));
+        kfree(slot->token);
+    } else if (slot->type == NX_HANDLE_CHANNEL && slot->chan)
+        channel_release(slot->chan, slot->chan_receiver);
+    else if (slot->type == NX_HANDLE_DEVICE && slot->dev)
+        device_close(slot->dev, slot->dev->owner, slot->dev_write);   /* 장치 핸들은 복제 불가: 소유자 = 이 핸들의 프로세스 */
 
     {
         u32 gen = slot->generation + 1U;      /* 이 슬롯의 오래된 핸들 값을 무효화 */

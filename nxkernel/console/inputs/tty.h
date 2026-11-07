@@ -33,4 +33,14 @@ void tty_input_char(char c);
  */
 Nstatus tty_read(char *buf, usize len, usize *out_got);
 
+/* 에코 켜기/끄기 (NX_DEVCMD_TTY_ECHO). 꺼도 Enter 의 줄바꿈은 보여 준다 */
+void tty_set_echo(bool on);
+
+/* COM1 수신을 stdin 으로 받을지 (dev:/com1 을 사용자 프로세스가 가져가면 끈다) */
+void tty_set_serial_rx(bool on);
+
+/* NxPoll 용: 읽을 줄(또는 EOF)이 있는지, 기다릴 대기 큐 */
+bool tty_input_ready(void);
+struct waitq *tty_waitq(void);
+
 #endif /* CONSOLE_INPUTS_TTY_H */

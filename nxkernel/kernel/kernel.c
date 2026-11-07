@@ -32,6 +32,9 @@
 #include "drivers/filesystem/vfs.h"
 #include "drivers/filesystem/fat16/fat16.h"
 #include "drivers/filesystem/nyfs/nyfs.h"
+#include "kernel/process/spawn.h"
+#include "kernel/security/auth.h"
+#include "kernel/dev/device.h"
 #include "drivers/pic/pic.h"
 #include "kernel/boot/multiboot2.h"
 #include "kernel/syscall/syscall.h"
@@ -172,95 +175,56 @@ static void console_init_from_boot_info(const NTBLI *info)
         printk("Framebuffer console init failed (%r): serial only\n", status);
 }
 
-/* initrd(FAT16 램디스크)를 마운트하고 app: 네임스페이스를 등록 */
-static void mount_initrd(NTBLI *info)
-{
-    fat16_mount_params_t initrd_params;
-    Nstatus status;
-
-    status = ramdisk_init(0, (usize)info->initrd_base, (usize)info->initrd_size, info);
-    if (NSTATUS_IS_ERR(status)) {
-        printk("Initrd ramdisk init failed: %r\n", status);
-        return;
-    }
-
-    initrd_params.mount_path = "initrd:/";
-    initrd_params.info = info;
-    initrd_params.read = ramdisk_read;
-    initrd_params.write = nNULL;
-
-    status = fat16_mount(0, &initrd_params);
-    if (NSTATUS_IS_ERR(status)) {
-        printk("Initrd FAT16 mount failed: %r\n", status);
-        return;
-    }
-
-    status = vfs_register_namespace("app", "initrd:/_ns_/app");
-    if (NSTATUS_IS_ERR(status)) {
-        status = vfs_register_namespace("app", "initrd:/");
-        if (NSTATUS_IS_ERR(status)) {
-            printk("Failed to register app namespace: %r\n", status);
-            return;
-        }
-    }
-
-    printk("Initrd available: %lu bytes\n", (unsigned long)info->initrd_size);
-}
-
-/* 초기 사용자 프로그램 파일이 읽히는지 확인하는 간단한 점검 */
-static void probe_first_app(void)
-{
-    handle_t file_handle;
-    usize read_bytes = 0;
-    char buffer[256];
-    Nstatus status;
-
-    status = vfs_open("app:/hellowld.run", 0, &file_handle);
-    if (NSTATUS_IS_ERR(status)) {
-        printk("app:/hellowld.run not found: %r\n", status);
-        return;
-    }
-
-    status = vfs_read(&file_handle, buffer, sizeof(buffer) - 1, &read_bytes);
-    if (!NSTATUS_IS_ERR(status)) {
-        buffer[read_bytes] = '\0';
-        printk("app:/hellowld.run (%lu bytes):\n%s\n", (unsigned long)read_bytes, buffer);
-    } else {
-        printk("app:/hellowld.run read failed: %r\n", status);
-    }
-
-    (void)vfs_close(&file_handle);
-}
-
 /*
- * nyfs 스모크 테스트: 커널 이미지 안에 예약해 둔 1MiB 짜리 메모리 영역을 램디스크
- * (diskno=1 - initrd 가 이미 0을 쓰고 있다)로 등록하고, 그 위에 nyfs 를 mkfs 한 뒤
- * mount, mkdir, create, write, read, readdir, unlink 를 순서대로 실제로 실행해본다.
- * 실패해도 AHCI 와 같은 방식으로 경고만 남기고 부팅은 계속한다 - 이건 어디까지나
- * "새로 만든 파일시스템이 최소한 동작은 한다"를 확인하는 용도다.
+ * 루트 파일시스템: initrd 는 빌드 때 만든 nyfs 이미지다 (tools/nyfs-utils 의 nyfs-pack).
+ * 부트로더가 RAM 에 올려 둔 그 이미지를 그대로 RAM 디스크(diskno 0)로 삼아 fs:/ 로 마운트한다.
+ * 쓰기도 되지만 RAM 이라 재부팅하면 처음 이미지로 돌아간다 (영속 저장소는 아직 없다).
+ * 구조: fs:/usr (= app:/), fs:/home/<사용자> (= face:/), fs:/roi (= roi:/, 사용자 DB 포함).
  */
-#define NYFS_TEST_RAMDISK_DISKNO  1U
-#define NYFS_TEST_RAMDISK_SIZE    (1024U * 1024U)   /* 1 MiB */
-#define NYFS_TEST_BLOCK_SHIFT     12U                /* 4 KiB 블록 */
+#define ROOT_DISKNO        0U
+#define TMP_DISKNO         1U
+#define TMP_SIZE           (2U * 1024U * 1024U)   /* tmp:/ 2 MiB */
+#define TMP_BLOCK_SHIFT    12U
 
-static u8 g_nyfs_test_ramdisk[NYFS_TEST_RAMDISK_SIZE] __attribute__((aligned(4096)));
+static u8 g_tmp_ramdisk[TMP_SIZE] __attribute__((aligned(4096)));
+static process_t *g_init = nNULL;
 
-static void test_nyfs(NTBLI *info)
+static bool mount_root(NTBLI *info)
 {
     nyfs_mount_params_t params;
     Nstatus status;
-    handle_t h;
-    char readback[64];
-    usize done;
-    const char *payload = "hello from nyfs\n";
-    u64 idx;
-    char entry_name[64];
-    u32 entry_type;
 
-    status = ramdisk_init(NYFS_TEST_RAMDISK_DISKNO, (usize)g_nyfs_test_ramdisk,
-                           NYFS_TEST_RAMDISK_SIZE, info);
+    status = ramdisk_init(ROOT_DISKNO, (usize)info->initrd_base, (usize)info->initrd_size, info);
     if (NSTATUS_IS_ERR(status)) {
-        printk("nyfs test: ramdisk init failed: %r\n", status);
+        printk("root: ramdisk init failed: %r\n", status);
+        return false;
+    }
+
+    memset(&params, 0, sizeof(params));
+    params.mount_path = "fs:/";
+    params.info = info;
+    params.read = ramdisk_read;
+    params.write = ramdisk_write;
+
+    status = nyfs_mount(ROOT_DISKNO, &params);
+    if (NSTATUS_IS_ERR(status)) {
+        printk("root: initrd is not a valid nyfs image (%r)\n", status);
+        return false;
+    }
+
+    printk("Root file system: fs:/ (nyfs, %lu KiB in RAM)\n", (unsigned long)(info->initrd_size / 1024UL));
+    return true;
+}
+
+/* tmp:/ : 부팅할 때마다 새로 포맷하는 RAM nyfs (누구나 쓸 수 있음) */
+static void mount_tmp(NTBLI *info)
+{
+    nyfs_mount_params_t params;
+    Nstatus status;
+
+    status = ramdisk_init(TMP_DISKNO, (usize)g_tmp_ramdisk, TMP_SIZE, info);
+    if (NSTATUS_IS_ERR(status)) {
+        printk("tmp: ramdisk init failed: %r\n", status);
         return;
     }
 
@@ -268,116 +232,49 @@ static void test_nyfs(NTBLI *info)
     params.info = info;
     params.read = ramdisk_read;
     params.write = ramdisk_write;
-    params.total_blocks = NYFS_TEST_RAMDISK_SIZE / (1U << NYFS_TEST_BLOCK_SHIFT);
-    params.inode_count = 0;   /* 자동 */
-    params.block_size_shift = (u8)NYFS_TEST_BLOCK_SHIFT;
+    params.total_blocks = TMP_SIZE / (1U << TMP_BLOCK_SHIFT);
+    params.block_size_shift = (u8)TMP_BLOCK_SHIFT;
+    params.root_mode = 0777;
 
-    status = nyfs_format(NYFS_TEST_RAMDISK_DISKNO, &params);
-    if (NSTATUS_IS_ERR(status)) {
-        printk("nyfs test: format failed: %r\n", status);
-        return;
+    status = nyfs_format(TMP_DISKNO, &params);
+    if (!NSTATUS_IS_ERR(status)) {
+        params.mount_path = "tmp:/";
+        status = nyfs_mount(TMP_DISKNO, &params);
     }
+    if (NSTATUS_IS_ERR(status))
+        printk("tmp: format/mount failed: %r\n", status);
+}
 
-    params.mount_path = "nyfs:/";
-    status = nyfs_mount(NYFS_TEST_RAMDISK_DISKNO, &params);
-    if (NSTATUS_IS_ERR(status)) {
-        printk("nyfs test: mount failed: %r\n", status);
-        return;
-    }
+static void load_users(void)
+{
+    u32 n = 0;
+    Nstatus status = auth_load_users("fs:/roi/users", &n);
 
-    status = vfs_mkdir("nyfs:/hello", 0755);
-    if (NSTATUS_IS_ERR(status)) {
-        printk("nyfs test: mkdir failed: %r\n", status);
-        return;
-    }
+    if (NSTATUS_IS_ERR(status))
+        printk("auth: cannot read roi:/users (%r): nobody can log in\n", status);
+    else
+        printk("auth: %u user(s) loaded from roi:/users\n", n);
+}
 
-    status = vfs_create("nyfs:/hello/world.txt", 0644);
-    if (NSTATUS_IS_ERR(status)) {
-        printk("nyfs test: create failed: %r\n", status);
-        return;
-    }
+/* 첫 사용자 프로세스 app:/init 을 root 로 띄운다 (자식들은 이 신원을 물려받는다) */
+static void start_init(void)
+{
+    static const char init_args[] = "init";
+    spawn_args_t args;
+    Nstatus status;
 
-    status = vfs_open("nyfs:/hello/world.txt", NX_O_WRITE, &h);
-    if (NSTATUS_IS_ERR(status)) {
-        printk("nyfs test: open(write) failed: %r\n", status);
-        return;
-    }
-    status = vfs_write(&h, payload, strlen(payload), &done);
-    (void)vfs_close(&h);
-    if (NSTATUS_IS_ERR(status) || done != strlen(payload)) {
-        printk("nyfs test: write failed: %r\n", status);
-        return;
-    }
+    args.argc = 1;
+    args.envc = 0;
+    args.size = sizeof(init_args);
+    args.strings = init_args;
 
-    status = vfs_open("nyfs:/hello/world.txt", NX_O_READ, &h);
+    status = process_spawn("fs:/usr/init.run", &args, &g_init);
     if (NSTATUS_IS_ERR(status)) {
-        printk("nyfs test: open(read) failed: %r\n", status);
+        printk("init: cannot start app:/init.run (%r)\n", status);
+        g_init = nNULL;
         return;
     }
-    status = vfs_read(&h, readback, sizeof(readback) - 1U, &done);
-    (void)vfs_close(&h);
-    if (NSTATUS_IS_ERR(status)) {
-        printk("nyfs test: read failed: %r\n", status);
-        return;
-    }
-    readback[done] = '\0';
-    printk("nyfs test: read back %lu bytes: %s", (unsigned long)done, readback);
-
-    printk("nyfs test: nyfs:/hello listing:\n");
-    idx = 0;
-    for (;;) {
-        status = vfs_readdir("nyfs:/hello", idx, entry_name, sizeof(entry_name), &entry_type);
-        if (status == NnotFound) {
-            break;
-        }
-        if (NSTATUS_IS_ERR(status)) {
-            printk("nyfs test: readdir failed: %r\n", status);
-            break;
-        }
-        printk("  - %s (type=%u)\n", entry_name, (unsigned int)entry_type);
-        idx++;
-    }
-
-    /* rename: 같은 디렉터리 안에서 이름 바꾸기 */
-    status = vfs_rename("nyfs:/hello/world.txt", "nyfs:/hello/renamed.txt");
-    if (NSTATUS_IS_ERR(status)) {
-        printk("nyfs test: rename(same dir) failed: %r\n", status);
-        return;
-    }
-
-    /* rename: 다른 디렉터리로 옮기기 */
-    status = vfs_mkdir("nyfs:/moved", 0755);
-    if (NSTATUS_IS_ERR(status)) {
-        printk("nyfs test: mkdir(moved) failed: %r\n", status);
-        return;
-    }
-    status = vfs_rename("nyfs:/hello/renamed.txt", "nyfs:/moved/final.txt");
-    if (NSTATUS_IS_ERR(status)) {
-        printk("nyfs test: rename(cross dir) failed: %r\n", status);
-        return;
-    }
-
-    status = vfs_open("nyfs:/moved/final.txt", NX_O_READ, &h);
-    if (NSTATUS_IS_ERR(status)) {
-        printk("nyfs test: open after rename failed: %r\n", status);
-        return;
-    }
-    status = vfs_read(&h, readback, sizeof(readback) - 1U, &done);
-    (void)vfs_close(&h);
-    if (NSTATUS_IS_ERR(status)) {
-        printk("nyfs test: read after rename failed: %r\n", status);
-        return;
-    }
-    readback[done] = '\0';
-    printk("nyfs test: after rename, nyfs:/moved/final.txt = %s", readback);
-
-    status = vfs_unlink("nyfs:/moved/final.txt");
-    if (NSTATUS_IS_ERR(status)) {
-        printk("nyfs test: unlink failed: %r\n", status);
-        return;
-    }
-
-    printk("nyfs test: all steps completed\n");
+    printk("init started (pid %u)\n", g_init->pid);
 }
 
 /*
@@ -528,14 +425,22 @@ void kernel_main(u32 boot_kind, u64 boot_info_phys)
     if (NSTATUS_IS_ERR(status))
         fatal(status, "Failed to register nyfs file system");
 
-    if (g_boot_info.initrd_base && g_boot_info.initrd_size) {
-        mount_initrd(&g_boot_info);
-        probe_first_app();
-    } else {
-        printk("No initrd loaded\n");
-    }
+    {
+        bool root_ok = false;
 
-    test_nyfs(&g_boot_info);
+        if (g_boot_info.initrd_base && g_boot_info.initrd_size)
+            root_ok = mount_root(&g_boot_info);
+        else
+            printk("No initrd loaded: no root file system\n");
+
+        mount_tmp(&g_boot_info);
+
+        /* 장치: 프레임버퍼, COM1, 루트 RAM 디스크(마운트됨: 읽기만), rd0 */
+        device_init(&g_boot_info, ROOT_DISKNO, root_ok ? g_boot_info.initrd_size : 0);
+
+        if (root_ok)
+            load_users();
+    }
 
     /* 8. 저장장치 (없어도 계속 부팅) */
     status = ahci_init();
@@ -551,9 +456,14 @@ void kernel_main(u32 boot_kind, u64 boot_info_phys)
     nyx_selftest();
 #endif
 
-    /* idle 루프: 실행 가능한 다른 프로세스가 있으면 양보하고, 없으면 인터럽트를 기다린다 */
+    start_init();
+
+    /* idle 루프: 실행 가능한 다른 프로세스가 있으면 양보하고, 없으면 인터럽트를 기다린다.
+     * init 이 죽으면 로그인도 전원 끄기도 할 수 없으므로 멈춘다 (원인을 화면에 남긴다). */
     for (;;) {
         schedule();
+        if (g_init && g_init->state == PROCESS_TERMINATED)
+            kernel_panic_simple("init exited", NprocessFailed);
         hlt();
     }
 }

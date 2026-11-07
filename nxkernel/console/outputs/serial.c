@@ -63,6 +63,13 @@ void serial_enable_rx_interrupt(void)
     outb(COM1_BASE + UART_IER, 0x01);
 }
 
+void serial_disable_rx_interrupt(void)
+{
+    if (!g_serial_ready)
+        return;
+    outb(COM1_BASE + UART_IER, 0x00);
+}
+
 bool serial_rx_ready(void)
 {
     if (!g_serial_ready)

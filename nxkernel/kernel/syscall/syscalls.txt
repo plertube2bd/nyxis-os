@@ -1,5 +1,5 @@
 ; =========================================================
-; Nyxis OS Syscall ABI v2 (NX_ABI_VERSION 2.0)
+; Nyxis OS Syscall ABI v2 (NX_ABI_VERSION 2.1)
 ; x86_64
 ; =========================================================
 
@@ -17,6 +17,9 @@
 ;   3  NxGetTime(clock_id)                clock_id: NX_CLOCK_MONOTONIC(0) 만 지원
 ;   4  NxSleep(ms)                        ms <= NX_SLEEP_MAX_MS(1h)
 ;   5  NxYield
+;   8  NxGetIdentity(struct nx_identity *out)   uid/gid/사용자 이름
+;   9  NxPowerOff()                       uid 0 만 (보통 init 이 svc:/sys/init 요청을 받아 호출)
+;   10 NxAuthenticate(name, password)     -> 일회용 토큰 핸들. 실패 시 1초 지연 후 Nauthentication
 ;
 ;   32 NxOpen(const char *path, flags)    flags: NX_O_READ|NX_O_WRITE -> 핸들
 ;   33 NxClose(handle)
@@ -27,8 +30,14 @@
 ;   36 NxSeek(handle, offset, whence)     whence: NX_SEEK_SET/CUR/END -> 새 오프셋
 ;   37 NxStat(handle, struct nx_stat *out)
 ;   41 NxDuplicateHandle(handle, rights_mask) -> 새 핸들 (권한은 줄이기만 가능)
+;   42 NxPoll(struct nx_pollfd *fds, n, timeout_ms) -> 준비된 수 (채널/프로세스/stdin, 레벨 트리거)
 ;
-;   64 NxProcessCreate(const char *path, argv, envp) -> 프로세스 핸들 (WAIT|KILL|STAT|DUP).
+;   경로는 이름공간 규칙을 따른다: fs:/ (root 만), app:/=fs:/usr/, face:/=fs:/home/<사용자>/,
+;   roi:/=fs:/roi/ (root 만, roi:/users 는 커널 전용), tmp:/, dev:/ (root 만), svc:/ (채널)
+;
+;   64 NxProcessCreate(const char *path, argv, envp, token) -> 프로세스 핸들 (WAIT|KILL|STAT|DUP).
+;                                          token: NX_NO_TOKEN(0) 이면 부모 신원 상속, 아니면 그 토큰의
+;                                          신원으로 시작하고 토큰은 소모된다.
 ;                                          ELF64 ET_EXEC 를 새 주소 공간에 적재하고 System V
 ;                                          초기 스택(argc/argv/envp/auxv)으로 ring3 실행.
 ;                                          자세한 규약은 include/nyx_abi.h 참고.
@@ -41,6 +50,17 @@
 ;   96 NxVirtualAlloc(increment)          -> 새 brk. 부호 있는 증가분(sbrk 방식): 양수=늘리기,
 ;                                          음수=줄이기, 0=조회. 97(NxVirtualFree)은 미래의
 ;                                          mmap 스타일 API 를 위해 번호만 예약(v1 미구현).
+;
+;   129 NxChannelCreate(path, flags)      svc:/sys/<이름> (root) 또는 svc:/<사용자>/<이름> -> 수신 핸들
+;   130 NxChannelSend(h, buf, len)        NxOpen("svc:/...", NX_O_WRITE) 로 얻은 송신 핸들. 가득 차면 Nbusy
+;   131 NxChannelReceive(h, buf, len, struct nx_msginfo *info, timeout_ms) 보낸 쪽 pid/uid/gid 가 붙는다
+;
+;   162 NxCreateNode(path, type, mode)    163 NxRemoveNode(path)
+;   164 NxRenameNode(old, new)            165 NxReadDir(path, index, struct nx_dirent *out)
+;
+;   193 NxDeviceCommand(h, cmd, arg)      NX_DEVCMD_INFO / IOPERM / TTY_ECHO(stdin)
+;   194 NxDeviceMapMMIO(h, u64 *out_addr) dev:/fb0 를 자기 주소 공간에 매핑
+;       장치는 NxOpen("dev:/fb0|com1|rd0|rootdisk") 로 연다 (root 만, 배타적 소유)
 ;
 ;   771 NxKernelPrint(const char *str)    디버그 로그. 서식 문자열 아님, 제어 문자는 '?' 로 치환
 ;   777 NxDebugNop
@@ -74,6 +94,9 @@
 5   | NxYield  ; [구현됨]
 6   | NxRandom
 7   | NxSysInfo  ; [구현됨]
+8   | NxGetIdentity  ; [구현됨]
+9   | NxPowerOff  ; [구현됨]
+10  | NxAuthenticate  ; [구현됨]
 
 ; =========================================================
 ; 0x0020 ~ 0x003F : Object / Handle API
@@ -89,7 +112,7 @@
 39  | NxMap
 40  | NxUnmap
 41  | NxDuplicateHandle  ; [구현됨]
-42  | NxPoll
+42  | NxPoll  ; [구현됨]
 
 ; =========================================================
 ; 0x0040 ~ 0x005F : Process / Thread
@@ -121,9 +144,9 @@
 ; =========================================================
 
 128 | NxPipeCreate
-129 | NxChannelCreate
-130 | NxChannelSend
-131 | NxChannelReceive
+129 | NxChannelCreate  ; [구현됨]
+130 | NxChannelSend  ; [구현됨]
+131 | NxChannelReceive  ; [구현됨]
 132 | NxSignal
 133 | NxEventCreate
 
@@ -133,18 +156,18 @@
 
 160 | NxMount
 161 | NxUnmount
-162 | NxCreateNode
-163 | NxRemoveNode
-164 | NxRenameNode
-165 | NxReadDir
+162 | NxCreateNode  ; [구현됨]
+163 | NxRemoveNode  ; [구현됨]
+164 | NxRenameNode  ; [구현됨]
+165 | NxReadDir  ; [구현됨]
 
 ; =========================================================
 ; 0x00C0 ~ 0x00DF : Device / Driver
 ; =========================================================
 
 192 | NxDeviceOpen
-193 | NxDeviceCommand
-194 | NxDeviceMapMMIO
+193 | NxDeviceCommand  ; [구현됨]
+194 | NxDeviceMapMMIO  ; [구현됨]
 195 | NxInterruptWait
 
 ; =========================================================

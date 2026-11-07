@@ -212,8 +212,10 @@ Nstatus elf_load(handle_t *file, addr_space_t *as, u64 *out_entry, u64 *out_imag
         if (ph->p_type != PT_LOAD)
             continue;
 
-        if (ph->p_memsz == 0 || ph->p_filesz > ph->p_memsz)
+        if (ph->p_filesz > ph->p_memsz)
             return NinvalidFormat;
+        if (ph->p_memsz == 0)
+            continue;                   /* 빈 PT_LOAD 는 규격상 허용된다 (예: .data 가 없는 프로그램의 RW 세그먼트) */
         if (ph->p_offset > file_size || ph->p_filesz > file_size - ph->p_offset)
             return NinvalidFormat;
         if ((ph->p_vaddr & (PAGE_SIZE - 1)) != 0)
@@ -238,7 +240,7 @@ Nstatus elf_load(handle_t *file, addr_space_t *as, u64 *out_entry, u64 *out_imag
         return NinvalidFormat;
 
     for (i = 0; i < hdr.e_phnum; i++) {
-        if (phdrs[i].p_type != PT_LOAD)
+        if (phdrs[i].p_type != PT_LOAD || phdrs[i].p_memsz == 0)
             continue;
 
         status = load_segment(file, as, &phdrs[i]);

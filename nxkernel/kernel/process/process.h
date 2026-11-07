@@ -54,6 +54,7 @@
 
 #define PROCESS_MAX          16U
 #define PROCESS_KSTACK_SIZE  16384U
+#define NX_USER_NAME_MAX     32U        /* 사용자 이름 최대 길이 (NUL 포함) */
 #define PROCESS_KSTACK_GUARD 4096U      /* 스택 아래 매핑하지 않는 가드 페이지 (PAGE_SIZE 와 같아야 함) */
 
 /* Process states */
@@ -71,12 +72,13 @@ typedef struct process {
     u32   pid;
     u32   state;
 
-    /* 파일 권한 검사(UNIX 모드/ACL)가 참조하는 호출자 신원.
-     * 아직 ring3 프로세스/로그인 개념이 없어 전부 0(root)으로 시작하고, 모든
-     * process_create() 경로가 memset(0) 을 거치므로 별도 초기화 없이 안전하다.
-     * 실제 사용자 인증이 생기면 그 경로에서 이 값을 채워 넣으면 된다. */
+    /* 신원. 파일 권한 검사(nyfs UNIX 모드/ACL), 이름공간 해석(face:/ = fs:/home/<user_name>/),
+     * fs:/·roi:/·dev:/ 접근(uid 0 만)이 참조한다. 새 프로세스는 만든 프로세스의 신원을 그대로
+     * 물려받고(첫 프로세스 init 은 커널이 root 로 만든다), 다른 신원은 커널이 인증 후 발급한
+     * 일회용 토큰으로만 얻는다 (kernel/security/auth.h). */
     u32   uid;
     u32   gid;
+    char  user_name[NX_USER_NAME_MAX];
 
     void *stack;          /* 인자로 전달되는 값(예: 유저 스택). 커널 스레드는 NULL 가능 */
     process_entry_t entry_point;
@@ -96,10 +98,12 @@ typedef struct process {
     u32   parent_pid;     /* 생성한 프로세스의 pid (idle/부트 스레드가 만들었으면 0). 정보용 */
     u32   refs;           /* 이 슬롯을 참조하는 수 (프로세스 핸들 등). 0 이고 종료되었으면 슬롯 회수 */
     u32   slice_ticks;    /* 남은 타임슬라이스 (사용자 모드 선점, schedule.h) */
+    u16   io_base;        /* ring3 에서 직접 in/out 할 수 있는 포트 범위 (dev:/com1 의 NX_DEVCMD_IOPERM). */
+    u16   io_count;       /* 0 이면 없음. 전환할 때마다 TSS I/O 비트맵에 반영된다 */
 
-    waitq_t exit_waiters;      /* 이 프로세스의 종료를 기다리는 프로세스들 */
-    waitq_t *wq;               /* 지금 기다리고 있는 대기 큐 (없으면 NULL) */
-    struct process *wq_next;   /* 그 대기 큐 안의 다음 대기자 */
+    waitq_t exit_waiters;          /* 이 프로세스의 종료를 기다리는 프로세스들 */
+    waitq_entry_t *wait_entries;   /* 지금 매달려 있는 대기 항목들 (여러 큐 가능, NxPoll). 없으면 NULL */
+    bool  wait_woken;              /* 마지막 대기에서 누군가 깨웠는지 (false 면 시간 초과) */
 
     nx_handle_table_t handles;   /* 이 프로세스의 핸들 테이블 (stdin/stdout/stderr + 열린 파일) */
 

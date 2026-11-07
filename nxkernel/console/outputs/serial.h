@@ -20,6 +20,7 @@ bool serial_available(void);
 
 /* 수신 인터럽트(COM1 = IRQ4)를 켠다. 핸들러 등록과 PIC 마스크 해제는 호출자(tty.c)가 한다. */
 void serial_enable_rx_interrupt(void);
+void serial_disable_rx_interrupt(void);
 
 /* 수신 버퍼에 바이트가 있는지 / 하나 읽기 (serial_rx_ready() 가 true 일 때만 의미 있음) */
 bool serial_rx_ready(void);

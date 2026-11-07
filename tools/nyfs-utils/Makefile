@@ -22,7 +22,7 @@ LDFLAGS_FUSE = $(shell pkg-config --libs fuse3)
 
 BUILD = build
 
-.PHONY: all clean install test
+.PHONY: all clean install test pack
 
 all: $(BUILD)/mkfs.nyfs $(BUILD)/nyfs-fuse
 
@@ -37,6 +37,15 @@ $(BUILD)/mkfs_nyfs.o: src/mkfs_nyfs.c include/nyfs_core.h | $(BUILD)
 
 $(BUILD)/mkfs.nyfs: $(BUILD)/mkfs_nyfs.o $(BUILD)/nyfs_core.o
 	$(CC) $(CFLAGS_C89) $^ -o $@
+
+# nyfs-pack: 매니페스트로 이미지 생성 (NyxisOS 루트 initrd 빌드용, FUSE 불필요)
+$(BUILD)/nyfs_pack.o: src/nyfs_pack.c include/nyfs_core.h | $(BUILD)
+	$(CC) $(CFLAGS_C89) -D_POSIX_C_SOURCE=200809L -c $< -o $@
+
+$(BUILD)/nyfs-pack: $(BUILD)/nyfs_pack.o $(BUILD)/nyfs_core.o
+	$(CC) $(CFLAGS_C89) $^ -o $@
+
+pack: $(BUILD)/nyfs-pack
 
 # nyfs_fuse.c 만 C99(gnu99)로 별도 컴파일한다(위 설명 참고).
 $(BUILD)/nyfs_fuse.o: src/nyfs_fuse.c include/nyfs_core.h | $(BUILD)
