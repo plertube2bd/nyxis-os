@@ -22,6 +22,22 @@
  *  - 프로세스가 완전히 정리(process_reap)될 때 전용 주소 공간이면 paging_addrspace_destroy()
  *    로 회수한다 (모든 PT/PD/PDPT/PML4 및 그 안의 데이터 프레임이 pfa.h 로 돌아간다).
  *
+ * [수명 주기: 자원과 슬롯을 분리한다]
+ *  - 종료(TERMINATED)된 프로세스의 "자원"(주소 공간, 핸들)은 CPU 가 그 프로세스에서 벗어나는 즉시
+ *    회수한다 (schedule()/생성/종료 경로의 process_reap). 메모리가 다음 프로세스 생성 때까지
+ *    묶여 있지 않는다.
+ *  - "슬롯"(pid + 종료 코드)은 수거할 주체가 있을 때만 남긴다(zombie):
+ *      * 사용자 프로세스(process_create_user)는 부모(생성한 프로세스)가 process_get_exit_code() 로
+ *        수거할 때까지 슬롯이 남는다. 예전에는 다른 프로세스 하나만 생성돼도 종료 코드가 사라졌다.
+ *      * 커널 스레드(process_create)는 수거 API 가 없으므로 종료 즉시 슬롯도 회수된다(detached).
+ *      * 부모가 먼저 종료되면 자식은 고아(detached)가 되어 종료 즉시 회수된다. 이미 zombie 인
+ *        자식은 그 자리에서 회수된다 (아무도 수거하지 않아 슬롯이 새는 일이 없다).
+ *  - pid 는 단조 증가하며, 한 바퀴 돌면 0(idle)과 사용 중인 pid 를 건너뛴다.
+ *
+ * [커널 스택 가드]
+ *  - 각 커널 스택 바로 아래 4KiB 는 매핑하지 않는다 (process_init 이 해제). 커널 스택이 넘치면
+ *    옆 프로세스의 커널 스택을 조용히 덮어쓰는 대신 즉시 #PF -> #DF(IST 스택) -> 패닉 메시지가 난다.
+ *
  * 현재 지원: 커널 스레드/사용자 프로세스 생성·종료·양보(협력형 라운드 로빈), 프로세스별 주소 공간.
  * 미지원(추후): 타이머 기반 선점, 프로세스 간 fork/exec, 자식 프로세스 wait.
  */
@@ -35,6 +51,7 @@
 
 #define PROCESS_MAX          16U
 #define PROCESS_KSTACK_SIZE  16384U
+#define PROCESS_KSTACK_GUARD 4096U      /* 스택 아래 매핑하지 않는 가드 페이지 (PAGE_SIZE 와 같아야 함) */
 
 /* Process states */
 typedef enum {
@@ -72,6 +89,9 @@ typedef struct process {
 
     u64   wake_tick;      /* BLOCKED(sleep) 상태일 때 깨어날 tick. 0 이면 타이머 대기 아님 */
     i32   exit_code;      /* 종료 코드 (NxProcessExit 인자, 예외로 죽으면 -1) */
+
+    u32   parent_pid;     /* 생성한 프로세스의 pid (idle/부트 스레드가 만들었으면 0) */
+    bool  waitable;       /* true: 종료 후 부모가 수거할 때까지 슬롯 유지 (zombie). false: 즉시 회수 */
 
     nx_handle_table_t handles;   /* 이 프로세스의 핸들 테이블 (stdin/stdout/stderr + 열린 파일) */
 
@@ -133,15 +153,17 @@ u32 process_count(void);
 
 /*
  * 이미 종료된(TERMINATED) 프로세스들의 자원(전용 주소 공간 등)을 지금 즉시 회수한다.
- * 평소에는 다음 프로세스 생성/종료 때 자동으로 수행되지만, 자원 회수를 정확히 확인해야 하는
- * 자체 점검이나 메모리 압박 시 명시적으로 부를 수 있다.
+ * 평소에는 schedule()/프로세스 생성·종료 때 자동으로 수행되지만, 자원 회수를 정확히 확인해야 하는
+ * 자체 점검이나 메모리 압박 시 명시적으로 부를 수 있다. 수거 대기 중인(zombie) 슬롯은 남는다.
  */
 void process_reap_terminated(void);
 
 /*
- * 종료된(TERMINATED) 프로세스의 종료 코드를 조회한다. 아직 회수(reap)되기 전이어야 한다.
- * 살아 있으면 Nbusy, 그런 pid 가 없으면(이미 회수되었거나 잘못된 pid) NnotFound.
- * (이후 NxProcessWait 의 기반이 된다)
+ * 종료된 자식 프로세스의 종료 코드를 "수거"한다. 성공하면 그 프로세스의 슬롯이 해제되므로
+ * 같은 pid 로 다시 부르면 NnotFound 다 (한 번만 수거할 수 있다).
+ *   - 호출자(current_process)가 그 프로세스의 부모가 아니면 Npermission
+ *   - 아직 살아 있으면 Nbusy, 그런 pid 가 없으면(이미 수거되었거나 잘못된 pid) NnotFound
+ * (NxProcessWait 의 기반이 된다)
  */
 Nstatus process_get_exit_code(u32 pid, i32 *out_code);
 

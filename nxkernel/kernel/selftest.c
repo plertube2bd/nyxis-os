@@ -10,6 +10,7 @@
  *   5 : .text 에 쓰기       -> W^X(CR0.WP) 로 #PF 가 나와야 함
  *   6 : 데이터 영역 실행    -> NX 로 #PF(instruction fetch) 가 나와야 함
  *   7 : 잘못된 명령(ud2)    -> #UD
+ *   8 : 커널 스레드 스택 오버플로 -> 그 스레드의 가드 페이지 #PF -> #DF 덤프 후 패닉 (옆 스택을 덮어쓰지 않음)
  */
 
 #include "nyxis.h"
@@ -112,20 +113,27 @@ static int live_processes(void)
 
 /*
  * 새 전용 주소 공간을 만들어 [start,end) 의 flat 바이너리를 USER_CODE_VADDR 에, 사용자
- * 스택을 USER_STACK_VADDR 에 매핑하고 ring3 로 실행한다. 종료를 기다린 뒤(reap 은 하지 않음:
- * 호출자가 데이터 페이지를 읽어야 하므로), 데이터 페이지의 커널 쪽 별칭(HHDM)을 돌려준다.
- * 실패하면 *out_data_kva 를 NULL 로 남긴다.
+ * 스택을 USER_STACK_VADDR 에 매핑하고 ring3 로 실행한다. 종료를 기다려 종료 코드를 수거한 뒤,
+ * 데이터 페이지의 커널 쪽 별칭(HHDM)과 물리 주소를 돌려준다.
+ *
+ * 데이터 페이지는 PAGE_NOFREE 로 매핑한다: 종료된 프로세스의 주소 공간은 schedule() 이 즉시
+ * 회수하므로, 소유권을 주소 공간에 주면 결과를 읽기 전에 프레임이 해제된다. 호출자가 결과를 다
+ * 읽은 뒤 *out_data_phys 를 pfa_free() 해야 한다. 실패하면 *out_data_kva 를 NULL 로 남긴다.
  */
-static void run_user_program(const u8 *start, const u8 *end, volatile u64 **out_data_kva)
+static void run_user_program(const u8 *start, const u8 *end, volatile u64 **out_data_kva,
+                             u64 *out_data_phys, i32 *out_exit_code)
 {
     addr_space_t as;
     u64 code_phys;
     u64 data_phys;
     u64 stack_phys;
     u32 i;
+    u32 pid = 0;
     Nstatus status;
 
     *out_data_kva = nNULL;
+    *out_data_phys = 0;
+    *out_exit_code = 0x7FFFFFFF;
 
     if (NSTATUS_IS_ERR(paging_addrspace_create(&as))) {
         check(0, "paging_addrspace_create() for ring3 test");
@@ -147,39 +155,45 @@ static void run_user_program(const u8 *start, const u8 *end, volatile u64 **out_
     check(paging_map_page(&as, (void *)(usize)code_phys, (void *)USER_CODE_VADDR, PAGE_USER) == Nok,
           "map user code page (R-X)");
     check(paging_map_page(&as, (void *)(usize)data_phys, (void *)USER_DATA_VADDR,
-                          PAGE_RW | PAGE_USER | PAGE_NX) == Nok, "map user data page (RW-)");
+                          PAGE_RW | PAGE_USER | PAGE_NX | PAGE_NOFREE) == Nok, "map user data page (RW-, not owned)");
     check(paging_map_page(&as, (void *)(usize)stack_phys, (void *)USER_STACK_VADDR,
                           PAGE_RW | PAGE_USER | PAGE_NX) == Nok, "map user stack page (RW-)");
 
-    status = process_create_user(as, USER_CODE_VADDR, USER_STACK_VADDR + PAGE_SIZE, 0, &i);
-    (void)status;
+    status = process_create_user(as, USER_CODE_VADDR, USER_STACK_VADDR + PAGE_SIZE, 0, &pid);
     if (status != Nok) {
         check(0, "process_create_user() for ring3 test");
         paging_addrspace_destroy(&as);
+        (void)pfa_free(data_phys);              /* NOFREE 라서 주소 공간 파기로는 회수되지 않는다 */
         return;
     }
 
-    /* 사용자 프로그램이 끝날 때까지 양보하며 대기 (최대 약 1초) */
-    for (i = 0; i < 200 && live_processes() > 1; i++) {
+    /* 사용자 프로그램이 끝날 때까지 양보하며 대기 (최대 약 1초) 후 종료 코드 수거 */
+    for (i = 0; i < 200; i++) {
+        if (process_get_exit_code(pid, out_exit_code) == NSTATUS_OK)
+            break;
         schedule();
         sleep_ms(5);
     }
 
     *out_data_kva = (volatile u64 *)(usize)phys_to_virt(data_phys);
+    *out_data_phys = data_phys;
 }
 
 static void ring3_tests(void)
 {
     volatile u64 *r = nNULL;
+    u64 data_phys = 0;
+    i32 code = 0;
 
     printk("SELFTEST: ring 3 (user mode)\n");
 
-    run_user_program(user_prog1_start, user_prog1_end, &r);
+    run_user_program(user_prog1_start, user_prog1_end, &r, &data_phys, &code);
     check(r != nNULL, "run_user_program(user_prog1) produced a data page");
     if (!r)
         return;
 
     check(live_processes() == 1, "user program exited via NxProcessExit (syscall)");
+    check(code == 0, "user program's exit code (NxProcessExit(0) via syscall) was collected by its parent");
     check(r[0] == 0, "ring3: syscall instruction -> NxDebugNop == 0");
     check(r[1] == 0, "ring3: int 0x80 -> NxDebugNop == 0");
     check(r[2] == 0, "ring3: NxKernelPrint(user string) == 0");
@@ -252,8 +266,13 @@ static void ring3_tests(void)
     /* --- NxProcessCreate 가 알 수 없는(존재하지 않는) 실행 파일을 거부하는지 (syscall 경로) --- */
     check((i64)r[27] < 0, "ring3: NxProcessCreate(nonexistent path) via syscall is rejected");
 
-    run_user_program(user_prog2_start, user_prog2_end, &r);
+    (void)pfa_free(data_phys);
+
+    run_user_program(user_prog2_start, user_prog2_end, &r, &data_phys, &code);
     check(live_processes() == 1, "user-mode #GP (hlt) terminated only the user process; kernel survived");
+    check(code == -1, "a process killed by a user-mode fault reports exit code -1");
+    if (data_phys)
+        (void)pfa_free(data_phys);
 
     process_reap_terminated();   /* 두 테스트 프로세스의 전용 주소 공간을 즉시 회수 */
 }
@@ -297,15 +316,21 @@ static void spawn_tests(void)
     check(status == Nok, "process_spawn(app:/elftest.run) succeeded");
 
     if (status == Nok) {
-        for (waited = 0; waited < 400; waited++) {
-            if (process_get_exit_code(pid, &code) == NSTATUS_OK)
-                break;
+        /* 종료만 기다린다 (아직 수거하지 않는다) */
+        for (waited = 0; waited < 400 && live_processes() > 1; waited++) {
             schedule();
             sleep_ms(5);
         }
         check(waited < 400, "elftest process finished within ~2s");
+
+        /* 회귀: 예전에는 reap(다른 프로세스 생성/명시적 회수) 한 번에 종료 코드가 사라졌다 */
+        process_reap_terminated();
+        check(pfa_free_count() == pfa_before,
+              "terminated process's address space was reclaimed before its exit code was collected");
+        check(process_get_exit_code(pid, &code) == Nok, "exit code survives reaping until the parent collects it");
         check(code == 42,
-              "elftest process exited with code 42 (ELF segments, stack, heap, file I/O all verified inside it)");
+              "elftest process exited with code 42 (ELF segments, stack, heap, file I/O, syscall instr all verified inside it)");
+        check(process_get_exit_code(pid, &code) == NnotFound, "an exit code can be collected only once");
     }
 
     process_reap_terminated();
@@ -314,7 +339,7 @@ static void spawn_tests(void)
           "process teardown returned every frame to the allocator (address space + heap + stack, no leak)");
 }
 
-#if NYX_SELFTEST == 4
+#if NYX_SELFTEST == 4 || NYX_SELFTEST == 8
 static unsigned long recurse(unsigned long n)
 {
     volatile char pad[512];
@@ -323,6 +348,14 @@ static unsigned long recurse(unsigned long n)
     if (n == 0xFFFFFFFFFFFFFFFFUL)      /* 컴파일러의 무한 재귀 경고/제거를 피하기 위한 (도달 불가) 종료 조건 */
         return 0;
     return recurse(n + 1) + (unsigned long)pad[0];
+}
+#endif
+
+#if NYX_SELFTEST == 8
+static void overflow_thread(void *arg)
+{
+    (void)arg;
+    printk("%lu\n", recurse(0));
 }
 #endif
 
@@ -381,6 +414,18 @@ static void functional_tests(void)
     /* --- 커널 스레드 컨텍스트 스위치 --- */
     check(process_create(thread_a, nNULL) == Nok, "process_create(thread_a)");
     check(process_create(thread_b, nNULL) == Nok, "process_create(thread_b)");
+    {
+        process_t *p;
+        int guarded = 0;
+
+        for (p = process_list; p; p = p->next) {
+            if (p->pid != 0 && p->kernel_stack &&
+                !paging_kernel_page_mapped((const u8 *)p->kernel_stack - PAGE_SIZE) &&
+                paging_kernel_page_mapped(p->kernel_stack))
+                guarded++;
+        }
+        check(guarded == 2, "kernel stacks have an unmapped guard page below them");
+    }
     for (i = 0; i < 40; i++)
         schedule();
     check(g_thread_a == 5 && g_thread_b == 10, "two kernel threads ran interleaved to completion");
@@ -436,6 +481,10 @@ void nyx_selftest(void)
 #elif NYX_SELFTEST == 7
     printk("SELFTEST: triggering #UD\n");
     __asm__ volatile ("ud2");
+#elif NYX_SELFTEST == 8
+    printk("SELFTEST: overflowing a kernel thread's stack (expect #DF via guard page)\n");
+    (void)process_create(overflow_thread, nNULL);
+    schedule();
 #endif
     (void)g_scratch_page;
     (void)functional_tests;

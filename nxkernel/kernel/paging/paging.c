@@ -368,6 +368,49 @@ void paging_enable(void)
     write_cr3(table_phys(g_pml4));
 }
 
+/* 커널 이미지 가상 주소 virt 의 PT 엔트리 위치 (PT 가 없으면 NULL) */
+static u64 *kernel_pte(u64 virt)
+{
+    u32 pd_idx;
+    u64 pde;
+
+    if (!g_pd_kernel || virt < (u64)(usize)__text_start || virt >= align_up((u64)(usize)__kernel_end, PAGE_SIZE))
+        return nNULL;
+
+    pd_idx = (u32)(((virt - KERNEL_VMA_BASE) >> 21) & 0x1FFU);
+    pde = g_pd_kernel[pd_idx];
+    if (!(pde & PAGE_PRESENT) || (pde & PAGE_HUGE))
+        return nNULL;
+
+    return &table_of(pde)[(virt >> 12) & 0x1FFU];
+}
+
+Nstatus paging_unmap_kernel_page(void *virt)
+{
+    u64 v = (u64)(usize)virt;
+    u64 *pte;
+
+    if (v & (PAGE_SIZE - 1))
+        return NinvalidArg;
+    if (v < (u64)(usize)__data_start)
+        return Npermission;                /* .text/.rodata 는 가드 페이지 대상이 아니다 */
+
+    pte = kernel_pte(v);
+    if (!pte)
+        return NinvalidArg;
+
+    *pte = 0;
+    invlpg(virt);
+    return NSTATUS_OK;
+}
+
+bool paging_kernel_page_mapped(const void *virt)
+{
+    u64 *pte = kernel_pte((u64)(usize)virt & ~(PAGE_SIZE - 1));
+
+    return (pte && (*pte & PAGE_PRESENT)) ? true : false;
+}
+
 u64 paging_hhdm_limit(void)
 {
     return g_hhdm_limit;
@@ -506,8 +549,8 @@ void paging_addrspace_destroy(addr_space_t *as)
                 for (i1 = 0; i1 < ENTRIES_PER_TABLE; i1++) {
                     u64 e1 = pt[i1];
 
-                    if (e1 & PAGE_PRESENT)
-                        (void)pfa_free(e1 & ENTRY_ADDR_MASK);   /* 실제 데이터 프레임 회수 */
+                    if ((e1 & PAGE_PRESENT) && !(e1 & PAGE_NOFREE))
+                        (void)pfa_free(e1 & ENTRY_ADDR_MASK);   /* 실제 데이터 프레임 회수 (소유한 것만) */
                 }
 
                 (void)pfa_free(virt_to_phys(pt));               /* PT 테이블 자신 회수 */
@@ -563,7 +606,9 @@ Nstatus paging_map_page(addr_space_t *as, void *phys, void *virt, u64 flags)
     if (pt[pt_idx] & PAGE_PRESENT)
         return NalreadyExists;
 
-    pt[pt_idx] = p | (flags & (PAGE_RW | PAGE_USER | PAGE_PWT | PAGE_PCD | PAGE_GLOBAL | PAGE_NX))
+    /* PAGE_GLOBAL 은 사용자 매핑에 허용하지 않는다: 전역 TLB 항목은 CR3 전환 때 비워지지 않으므로
+     * 다른 프로세스로 전환한 뒤에도 이전 프로세스의 매핑이 TLB 에 남아 보이게 된다 (격리 붕괴). */
+    pt[pt_idx] = p | (flags & (PAGE_RW | PAGE_USER | PAGE_PWT | PAGE_PCD | PAGE_NX | PAGE_NOFREE))
                    | PAGE_PRESENT | PAGE_USER;
 
     invlpg(virt);
@@ -629,6 +674,9 @@ Nstatus paging_unmap_free_page(addr_space_t *as, void *virt)
 
     pt[(v >> 12) & 0x1FFU] = 0;
     invlpg(virt);
+
+    if (entry & PAGE_NOFREE)
+        return NSTATUS_OK;                 /* 이 주소 공간의 소유가 아닌 프레임: 매핑만 해제 */
 
     /* 매핑을 먼저 지운 뒤에 프레임을 돌려준다 (반대 순서면 잠깐 동안 남의 프레임이 매핑된 채로 남는다) */
     return pfa_free(entry & ENTRY_ADDR_MASK);

@@ -381,7 +381,7 @@ static void test_nyfs(NTBLI *info)
 
 /*
  * ring3 로 진입한다. iretq 프레임: ss, rsp, rflags, cs, rip 순서로 push.
- * 주의: 유저 주소 공간이 준비되지 않은 현재는 사용할 수 없다 (미검증).
+ * 호출 시점에 CR3 는 이미 현재 프로세스의 주소 공간이어야 한다 (process_switch 가 보장).
  */
 void enter_ring3(void *entry, void *stack_top)
 {
@@ -391,12 +391,34 @@ void enter_ring3(void *entry, void *stack_top)
     u64 user_rip = (u64)(usize)entry;
     u64 user_rflags = 0x202;    /* IF=1, IOPL=0 */
 
+    /*
+     * iretq 직전에 범용 레지스터를 전부 0 으로 지운다. 지우지 않으면 커널 코드가 쓰던 값(커널 텍스트/
+     * 스택/HHDM 주소 등)이 새 프로세스의 첫 명령 시점 레지스터에 그대로 남아 사용자에게 노출된다
+     * (실제로 R8/R10/R12 에 0xffffffff80... 주소가 보였다 — 이후 KASLR 을 넣어도 무력화되는 정보 누출).
+     * 피연산자 레지스터는 먼저 push 했으므로 지워도 된다. 이 함수는 반환하지 않으므로 clobber 도 상관없다.
+     * 초기 스택 규약(umem.h)상 사용자 진입 시 레지스터 값에는 의미가 없다 (모두 0 이 기대값).
+     */
     __asm__ volatile(
         "pushq %0\n\t"
         "pushq %1\n\t"
         "pushq %2\n\t"
         "pushq %3\n\t"
         "pushq %4\n\t"
+        "xorl %%eax, %%eax\n\t"
+        "xorl %%ebx, %%ebx\n\t"
+        "xorl %%ecx, %%ecx\n\t"
+        "xorl %%edx, %%edx\n\t"
+        "xorl %%esi, %%esi\n\t"
+        "xorl %%edi, %%edi\n\t"
+        "xorl %%ebp, %%ebp\n\t"
+        "xorl %%r8d, %%r8d\n\t"
+        "xorl %%r9d, %%r9d\n\t"
+        "xorl %%r10d, %%r10d\n\t"
+        "xorl %%r11d, %%r11d\n\t"
+        "xorl %%r12d, %%r12d\n\t"
+        "xorl %%r13d, %%r13d\n\t"
+        "xorl %%r14d, %%r14d\n\t"
+        "xorl %%r15d, %%r15d\n\t"
         "iretq"
         :
         : "r"(user_ss), "r"(user_rsp), "r"(user_rflags), "r"(user_cs), "r"(user_rip)

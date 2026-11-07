@@ -135,6 +135,48 @@ static UINT64 align_up(UINT64 v, UINT64 a)
     return (v + a - 1) & ~(a - 1);
 }
 
+/*
+ * 메모리 헬퍼 (gnu-efi 의 CopyMem/SetMem/ZeroMem/CompareMem 대신 사용)
+ *
+ * gnu-efi 는 버전마다 이 함수들의 호출 규약이 다르다. 3.x 는 SysV 로 빌드되지만 4.x 의 libefi 는
+ * SetMem/CopyMem 을 EFIAPI(ms_abi, rcx/rdx/r8)로 빌드한다. 이 파일은 GNU_EFI_USE_MS_ABI 없이
+ * 컴파일되므로(헤더의 EFIAPI 가 빈 매크로) 4.x 에서는 인자가 rdi/rsi/rdx 로 넘어가 엉뚱한 주소에
+ * 복사된다 — 실제로 커널이 0x100000 에 전혀 복사되지 않아 진입 즉시 #UD 가 났다.
+ * 라이브러리 구현에 기대지 않도록 직접 구현한다. (루프가 memcpy 호출로 바뀌지 않도록 Makefile 에서
+ * -fno-tree-loop-distribute-patterns 를 지정한다)
+ */
+static VOID nytb_copy(VOID *dst, const VOID *src, UINTN len)
+{
+    UINT8 *d = (UINT8 *)dst;
+    const UINT8 *s = (const UINT8 *)src;
+    UINTN i;
+
+    for (i = 0; i < len; i++)
+        d[i] = s[i];
+}
+
+static VOID nytb_fill(VOID *dst, UINTN len, UINT8 value)
+{
+    UINT8 *d = (UINT8 *)dst;
+    UINTN i;
+
+    for (i = 0; i < len; i++)
+        d[i] = value;
+}
+
+static INTN nytb_compare(const VOID *a, const VOID *b, UINTN len)
+{
+    const UINT8 *x = (const UINT8 *)a;
+    const UINT8 *y = (const UINT8 *)b;
+    UINTN i;
+
+    for (i = 0; i < len; i++) {
+        if (x[i] != y[i])
+            return (INTN)x[i] - (INTN)y[i];
+    }
+    return 0;
+}
+
 /* =========================================================
  * 파일 읽기
  * ========================================================= */
@@ -319,7 +361,7 @@ static EFI_STATUS load_elf_kernel(
     if (EFI_ERROR(Status))
         return Status;
 
-    SetMem((VOID *)(UINTN)lo, (UINTN)(hi - lo), 0);
+    nytb_fill((VOID *)(UINTN)lo, (UINTN)(hi - lo), 0);
 
     /* 2차 패스: 파일 데이터 복사 (범위는 1차 패스에서 이미 검증됨) */
     for (i = 0; i < hdr->e_phnum; i++) {
@@ -329,7 +371,7 @@ static EFI_STATUS load_elf_kernel(
         if (ph->p_type != PT_LOAD || ph->p_filesz == 0)
             continue;
 
-        CopyMem((VOID *)(UINTN)ph->p_paddr,
+        nytb_copy((VOID *)(UINTN)ph->p_paddr,
                 (VOID *)(base + ph->p_offset),
                 (UINTN)ph->p_filesz);
     }
@@ -464,9 +506,9 @@ static VOID *find_rsdp(EFI_SYSTEM_TABLE *SystemTable)
     for (i = 0; i < SystemTable->NumberOfTableEntries; i++) {
         EFI_CONFIGURATION_TABLE *t = &SystemTable->ConfigurationTable[i];
 
-        if (CompareMem(&t->VendorGuid, &g_acpi20_guid, sizeof(EFI_GUID)) == 0)
+        if (nytb_compare(&t->VendorGuid, &g_acpi20_guid, sizeof(EFI_GUID)) == 0)
             return t->VendorTable;
-        if (CompareMem(&t->VendorGuid, &g_acpi10_guid, sizeof(EFI_GUID)) == 0)
+        if (nytb_compare(&t->VendorGuid, &g_acpi10_guid, sizeof(EFI_GUID)) == 0)
             rsdp10 = t->VendorTable;
     }
 
@@ -687,7 +729,7 @@ efi_main(
         Print(L"BootInfo allocation failed\n");
         return EFI_OUT_OF_RESOURCES;
     }
-    ZeroMem(BootInfo, sizeof(NTBLI));
+    nytb_fill(BootInfo, sizeof(NTBLI), 0);
 
     BootInfo->magic = NTBLI_MAGIC;
     BootInfo->version = NTBLI_VERSION;

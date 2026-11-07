@@ -15,6 +15,20 @@ static long sc(unsigned long nr, unsigned long a0, unsigned long a1, unsigned lo
     return (long)syscall_wrapper(nr, a0, a1, a2, 0, 0, 0);
 }
 
+/* `syscall` 명령 경로 (nyxstd.h 의 래퍼는 int 0x80 을 쓴다). 인자는 3개까지만 쓴다. */
+static long sc_fast(unsigned long nr, unsigned long a0, unsigned long a1, unsigned long a2)
+{
+    unsigned long ret;
+
+    __asm__ volatile (
+        "syscall"
+        : "=a"(ret)
+        : "a"(nr), "D"(a0), "S"(a1), "d"(a2)
+        : "rcx", "r11", "memory"
+    );
+    return (long)ret;
+}
+
 static unsigned long slen(const char *s)
 {
     unsigned long n = 0;
@@ -138,6 +152,17 @@ int elftest_main(long argc, char **argv)
         return 20;                      /* 한 번에 너무 큰 요청 */
     if ((unsigned long)sc(NX_SYS_VIRTUAL_ALLOC, 0, 0, 0) != brk2)
         return 21;                      /* 실패한 요청은 brk 를 바꾸면 안 된다 */
+
+    /* 8. `syscall` 명령 경로: 양보(다른 프로세스로 전환됐다가 돌아옴) 전후로 계속 동작해야 한다.
+     *    (예전에는 syscall 경로에서 전환/종료가 일어나면 GS 가 뒤바뀐 채 남아 다음 syscall 에서 커널 패닉) */
+    if (sc_fast(NX_SYS_GET_VERSION, 0, 0, 0) != (long)NX_ABI_VERSION)
+        return 22;
+    if (sc_fast(NX_SYS_YIELD, 0, 0, 0) != 0)
+        return 23;
+    if (sc_fast(NX_SYS_GET_VERSION, 0, 0, 0) != (long)NX_ABI_VERSION)
+        return 24;
+    if (sc(NX_SYS_GET_VERSION, 0, 0, 0) != (long)NX_ABI_VERSION)
+        return 25;                      /* int 0x80 경로와 섞어 써도 된다 */
 
     say("elftest: ALL PASS\n");
     return PASS_CODE;

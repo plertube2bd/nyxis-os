@@ -44,6 +44,15 @@
 #define PAGE_GLOBAL     0x100UL
 #define PAGE_NX         0x8000000000000000UL
 
+/*
+ * 소프트웨어 전용 비트 (x86 이 무시하는 AVL 비트 9). "이 매핑의 물리 프레임은 이 주소 공간의 소유가
+ * 아니다" 라는 표시다. paging_addrspace_destroy()/paging_unmap_free_page() 는 이 비트가 켜진 페이지의
+ * 프레임을 pfa_free() 하지 않는다 (매핑만 지운다). 프레임 소유자(호출자)가 직접 수명을 관리한다.
+ * 용도: 프로세스가 끝난 뒤에도 커널이 읽어야 하는 페이지(자체 점검 결과 페이지), 이후의 공유 메모리,
+ * 프레임버퍼/MMIO 를 사용자에게 매핑하는 경우 등.
+ */
+#define PAGE_NOFREE     0x200UL
+
 /* 사용자 공간 상한 (x86_64 canonical 하위 절반의 끝) */
 #define USER_SPACE_END  0x0000800000000000UL
 
@@ -110,7 +119,17 @@ Nstatus paging_unmap_page(addr_space_t *as, void *virt);
  * 사용자 영역의 프레임은 항상 pfa.h 로 할당된 것이므로(파일 매핑 같은 공유 프레임이 아직 없다)
  * 힙 축소처럼 "이 프로세스가 소유한 페이지를 돌려줄 때" 쓴다.
  */
-Nstatus paging_unmap_free_page(addr_space_t *as, void *virt);
+Nstatus paging_unmap_free_page(addr_space_t *as, void *virt);   /* PAGE_NOFREE 페이지는 매핑만 해제 */
+
+/*
+ * 커널 이미지 영역(PML4[511])의 4KiB 페이지 하나를 매핑 해제한다 (가드 페이지용).
+ * 이 테이블은 모든 주소 공간이 공유하므로 시스템 전체에 적용된다. virt 는 커널 이미지
+ * (.data/.bss) 안의 4KiB 정렬 주소여야 한다. paging_enable() 이후에 호출한다.
+ */
+Nstatus paging_unmap_kernel_page(void *virt);
+
+/* 커널 이미지 영역의 virt 가 현재 매핑되어 있는지 (자체 점검용) */
+bool paging_kernel_page_mapped(const void *virt);
 
 /*
  * as 안에서 [virt, virt+len) 전체가 "유저 모드에서 접근 가능"(필요하면 쓰기 가능)하게

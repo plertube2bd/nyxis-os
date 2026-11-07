@@ -386,3 +386,87 @@ BIOS**, **GRUB UEFI** 모두에서 79개 점검(기존 67개 + 새 12개) 전부
 3. `argv`/`envp` 전달 — 스택 레이아웃은 이미 이를 염두에 두고 설계했으므로(현재 필드들이 우연이 아니라
    전부 0인 이유), `NxProcessCreate` 의 인자를 늘리는 형태로 확장 가능하다.
 4. `NxProtect`(요청서가 나중이어도 된다고 명시)와 진짜 mmap 스타일 `NxVirtualAlloc`/`NxVirtualFree`.
+
+## 10. 부팅 불가(gnu-efi 4.x) / syscall GS 불균형 / 레지스터 누출 / 프로세스 수명 주기 / 커널 스택 가드 (5차 작업)
+
+검증 환경: Arch Linux, gcc 16.2, binutils 2.47, **gnu-efi 4.0.4**, QEMU + OVMF(4M).
+이번 문제 중 위의 두 개(10.1, 10.2)는 QEMU 에서 실제로 재현한 뒤 고쳤고, 고친 코드를 되돌리면 새 점검이
+다시 실패하는 것까지 확인했다.
+
+### 10.1 [C] gnu-efi 4.x 에서 부트로더가 커널을 적재하지 못함 (재현됨)
+
+증상: `BdsDxe: failed to start Boot0002 ... Invalid Parameter`, 또는 커널 진입 직후 RIP=0x80201A 에서 #UD.
+gdb 로 진입 시점을 보면 0x100000~ 커널 영역 전체가 0 이었다 (CPU 가 `00 00`(add) 를 미끄러져 내려감).
+
+- objcopy 의 `-j` 목록에 `.rodata` 가 없었다. gnu-efi 3.x 링커 스크립트는 `.rodata` 를 `.data` 안에 넣었지만
+  4.x 는 별도 섹션으로 만들어서, 문자열과 GUID 가 EFI 이미지에서 통째로 빠졌다. -> `-j .rodata` 추가.
+- 4.x 의 libefi 는 `SetMem`/`CopyMem` 을 `EFIAPI`(ms_abi: rcx/rdx/r8)로 빌드하는데 nytb3.c 는
+  `GNU_EFI_USE_MS_ABI` 없이 컴파일되어(헤더의 EFIAPI 가 빈 매크로) SysV(rdi/rsi/rdx)로 인자를 넘겼다.
+  커널 복사가 엉뚱한 주소로 갔다. `GNU_EFI_USE_MS_ABI` 를 켜는 방법은 4.x 의 `_entry` 가 `efi_main` 을
+  SysV 로 부르는 것과 다시 충돌하고 3.x 와도 호환되지 않으므로, 라이브러리의 메모리 헬퍼를 쓰지 않도록
+  바꿨다. -> `nytb_copy/nytb_fill/nytb_compare` 자체 구현 (+ 루프가 memcpy 호출로 바뀌지 않게
+  `-fno-tree-loop-distribute-patterns`). 나머지 사용 함수(`InitializeLib/Print/AllocatePool/FreePool`)는
+  EFIAPI 가 아니어서 두 버전 모두 SysV 로 일치한다.
+
+### 10.2 [C][보안] `syscall` 경로의 GS 불균형 -> 유저 스택 위 커널 패닉 (재현됨)
+
+`syscall_entry.s` 는 진입 시 `swapgs` 후 GS 가 뒤바뀐(swapped) 상태로 C 코드를 실행하고 sysret 직전에
+되돌렸다. 그런데 `NxProcessExit/NxSleep/NxYield` 는 C 코드 안에서 `schedule()` 로 다른 프로세스로 넘어가고,
+그 프로세스는 iretq(ISR/`int 0x80`/`enter_ring3`, 모두 swapgs 없음)로 ring3 에 돌아가므로 짝이 깨졌다.
+기존 자체 점검의 ring3 프로그램이 `syscall` 로 `NxProcessExit` 을 부르는 순간부터 GS 가 뒤바뀐 채 남았고,
+그 뒤 아무 프로세스가 `syscall` 을 하면 `movq %rsp, %gs:8` 이 주소 0x8 에 쓰다 커널 모드 #PF 가 났다
+(`RSP` = 유저 스택, `CR2=0x8`). 유저가 rsp 를 커널 주소로 맞추면 예외 프레임이 커널 메모리에 써지는
+보안 문제이기도 하다. elftest/nyxstd.h 가 `int 0x80` 만 써서 드러나지 않았다.
+
+-> 사용자 rsp 를 프레임에 넣은 즉시 `swapgs` 로 되돌린다. swapped 상태는 진입부 몇 명령(IF=0)에만
+존재하고, C 코드/스케줄러/ISR 은 항상 같은 GS 상태만 본다. sysret 쪽과 `syscall_bad_return` 쪽의
+`swapgs` 는 제거했다.
+
+### 10.3 [M][보안] `enter_ring3` 가 커널 레지스터 값을 유저에게 노출
+
+새 프로세스의 첫 명령 시점에 R8/R10/R12 등에 `0xffffffff80...` 커널 주소가 남아 있었다 (향후 KASLR 무력화).
+-> iretq 직전 범용 레지스터 15개를 모두 0 으로.
+
+### 10.4 [M] 종료 코드가 너무 일찍 사라짐 / 종료된 프로세스의 메모리가 늦게 회수됨
+
+`process_reap()` 이 생성/종료 때마다 TERMINATED 프로세스를 슬롯째 지워서, 자식이 끝난 뒤 누가 프로세스를
+하나 더 만들면 종료 코드가 사라졌다 (`NxProcessWait` 의 기반이 성립하지 않음). 반대로 아무도 프로세스를
+만들지 않으면 종료된 프로세스의 주소 공간이 계속 남았다.
+
+-> 자원과 슬롯을 분리했다 (process.h [수명 주기] 참고).
+- 주소 공간은 CPU 가 그 프로세스를 떠나는 즉시 회수 (`schedule()` 에서 reap).
+- 사용자 프로세스는 `parent_pid` 를 기록하고, 부모가 `process_get_exit_code()` 로 수거할 때까지 슬롯 유지
+  (zombie). 수거는 한 번만 가능하고, 부모가 아니면 `Npermission`.
+- 커널 스레드와 고아(부모가 먼저 종료)는 detached: 종료 즉시 슬롯 회수 -> 아무도 수거하지 않아 슬롯이 새는 일 없음.
+- pid 가 32비트를 한 바퀴 돌아도 0(idle)과 사용 중인 pid 는 주지 않는다.
+- 이에 따라 PTE 소프트웨어 비트 `PAGE_NOFREE`(AVL bit 9)를 추가했다: 주소 공간이 소유하지 않는 프레임의
+  매핑 (파기/`unmap_free` 시 매핑만 제거). 자체 점검의 결과 페이지가 쓰고, 이후 공유 메모리/프레임버퍼
+  사용자 매핑에도 쓸 수 있다.
+- 덤: `paging_map_page()` 가 사용자 매핑에 `PAGE_GLOBAL` 을 허용하던 것을 막았다 (전역 TLB 항목은 CR3
+  전환에도 남아 다른 프로세스에 이전 프로세스의 매핑이 보일 수 있다).
+
+### 10.5 [L] 커널 스택 가드 페이지
+
+`g_kstacks[16][16KiB]` 가 연속이라 넘치면 옆 프로세스의 커널 스택을 조용히 덮어썼다 (`-fstack-usage` 로
+보면 nyfs extent 함수 하나가 ~2.1KiB, `elf_load` 2KiB — 현재 경로는 16KiB 안에 들어간다).
+-> 슬롯마다 [가드 4KiB][스택 16KiB] 로 배치하고 `process_init()` 이 가드를 매핑 해제
+(`paging_unmap_kernel_page()` 신설). 넘치면 #PF -> #DF(IST) -> 패닉.
+
+### 10.6 검증
+
+- `SELFTEST=1`: 85개 점검 전부 통과. 새 점검: 커널 스택 가드 존재, ring3 프로그램 종료 코드 수거(0 / 폴트 시 -1),
+  reap 이후에도 종료 코드 유지, 주소 공간은 수거 전에 이미 회수, 한 번만 수거 가능.
+- elftest 가 진입 시 레지스터가 전부 0 인지 검사(아니면 종료 코드 90)하고, `syscall` 명령으로 양보 전후
+  시스템 콜 + `syscall` 로 종료한다.
+- 회귀 확인: GS 수정을 되돌리면 같은 커널 패닉(`CR2=0x8`, 커널 RSP=유저 스택)이 재현되고, 레지스터 지우기를
+  되돌리면 elftest 점검이 실패한다.
+- `SELFTEST=8`(신설): 커널 스레드 스택 오버플로 -> 가드 페이지 주소에서 #DF 덤프 후 패닉.
+- `make check`(-O0/-O2), `make test-host` 통과.
+
+### 검증하지 못한 것
+
+- gnu-efi 3.x 환경(Ubuntu)에서의 재빌드. 수정은 라이브러리 메모리 헬퍼 의존을 없앤 것이라 3.x 에서도 같은
+  동작이어야 하지만 이 머신에서는 확인할 수 없었다. GRUB(Multiboot2) 경로도 이번에는 다시 돌리지 않았다
+  (부트로더 변경과 무관한 경로).
+- 고아 프로세스 처리(부모가 먼저 종료되는 경우)는 코드 리뷰로만 확인했다 (사용자 프로세스가 자식을 만든 뒤
+  먼저 끝나는 점검은 아직 없다).

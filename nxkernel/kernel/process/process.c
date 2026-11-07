@@ -18,12 +18,41 @@ process_t *process_list = nNULL;
 /* Current process */
 process_t *current_process = nNULL;
 
+/*
+ * 커널 스택: 슬롯마다 [가드 4KiB (매핑 해제)][스택 PROCESS_KSTACK_SIZE]. 페이지 정렬이어야
+ * 가드 페이지만 정확히 매핑 해제할 수 있다 (process_init 참고).
+ */
+NX_STATIC_ASSERT(kstack_guard_is_page, PROCESS_KSTACK_GUARD == PAGE_SIZE);
+NX_STATIC_ASSERT(kstack_size_is_pages, (PROCESS_KSTACK_SIZE % PAGE_SIZE) == 0);
+
 static process_t g_procs[PROCESS_MAX];
-static u8 g_kstacks[PROCESS_MAX][PROCESS_KSTACK_SIZE] __attribute__((aligned(16)));
+static u8 g_kstacks[PROCESS_MAX][PROCESS_KSTACK_GUARD + PROCESS_KSTACK_SIZE] __attribute__((aligned(4096)));
 static u32 g_next_pid = 1;
 static i32 g_last_exit_code = 0;
 
-/* 종료된 프로세스의 슬롯을 회수한다 (현재 실행 중인 것은 제외) */
+/* 슬롯의 커널 스택 최하위 주소 (가드 페이지 바로 위) */
+static u8 *kstack_bottom(u32 slot)
+{
+    return &g_kstacks[slot][PROCESS_KSTACK_GUARD];
+}
+
+/* 리스트에서 p 를 떼어내고 슬롯을 비운다 (인터럽트가 꺼진 상태에서 호출) */
+static void free_slot_locked(process_t *p, process_t *prev)
+{
+    if (prev)
+        prev->next = p->next;
+    else
+        process_list = p->next;
+
+    memset(p, 0, sizeof(*p));      /* in_use = false */
+}
+
+/*
+ * 종료된 프로세스들을 정리한다 (인터럽트가 꺼진 상태에서 호출).
+ *  - 자원(전용 주소 공간)은 항상 즉시 회수한다.
+ *  - 슬롯은 수거할 주체가 없을 때(!waitable)만 회수한다. 부모가 수거할 zombie 는 남긴다.
+ * 현재 실행 중인 프로세스는 제외한다: 아직 그 커널 스택과 CR3 위에서 실행 중일 수 있다.
+ */
 static void process_reap(void)
 {
     process_t *p = process_list;
@@ -33,35 +62,75 @@ static void process_reap(void)
         process_t *next = p->next;
 
         if (p->state == PROCESS_TERMINATED && p != current_process && p->pid != 0) {
-            if (prev)
-                prev->next = next;
-            else
-                process_list = next;
-
-            /* 이 프로세스는 더 이상 CR3 로 실려 있지 않다고 보장된다 (TERMINATED 이고
-             * current_process 도 아니므로 이미 다른 프로세스로 전환된 뒤이다). 그래야만
-             * paging_addrspace_destroy() 로 전용 주소 공간(ELF 세그먼트 + 힙 + 스택)의
-             * 모든 페이지를 안전하게 회수할 수 있다. */
+            /* TERMINATED 이고 current_process 도 아니므로 이미 다른 프로세스로 전환된 뒤이다 —
+             * CR3 로 실려 있지 않으므로 주소 공간(ELF 세그먼트 + 힙 + 스택)을 안전하게 회수할 수 있다. */
             if (p->addrspace.pml4)
                 paging_addrspace_destroy(&p->addrspace);
 
-            memset(p, 0, sizeof(*p));      /* in_use = false */
-        } else {
-            prev = p;
+            if (!p->waitable) {
+                free_slot_locked(p, prev);
+                p = next;
+                continue;           /* prev 는 그대로 */
+            }
         }
 
+        prev = p;
         p = next;
+    }
+}
+
+/* 종료하는 프로세스 pid 의 자식들을 고아(detached)로 만든다. 이미 zombie 인 자식은 다음 reap 에서 회수된다. */
+static void detach_children_locked(u32 pid)
+{
+    process_t *p;
+
+    for (p = process_list; p; p = p->next) {
+        if (p->in_use && p->pid != pid && p->parent_pid == pid)
+            p->waitable = false;
+    }
+}
+
+static bool pid_in_use_locked(u32 pid)
+{
+    process_t *p;
+
+    for (p = process_list; p; p = p->next) {
+        if (p->in_use && p->pid == pid)
+            return true;
+    }
+    return false;
+}
+
+/* 새 pid. 32비트가 한 바퀴 돌아도 0(idle) 과 사용 중인 pid 는 주지 않는다 (슬롯은 최대 PROCESS_MAX 개) */
+static u32 alloc_pid_locked(void)
+{
+    for (;;) {
+        u32 pid = g_next_pid++;
+
+        if (g_next_pid == 0)
+            g_next_pid = 1;
+        if (pid != 0 && !pid_in_use_locked(pid))
+            return pid;
     }
 }
 
 Nstatus process_init(void)
 {
     process_t *idle = &g_procs[0];
+    u32 i;
 
     if (process_list)
         return NalreadyInitialized;
 
     memset(g_procs, 0, sizeof(g_procs));
+
+    /* 모든 커널 스택 아래의 가드 페이지를 매핑 해제한다 (paging_enable() 이후여야 한다) */
+    for (i = 0; i < PROCESS_MAX; i++) {
+        Nstatus status = paging_unmap_kernel_page(g_kstacks[i]);
+
+        if (NSTATUS_IS_ERR(status))
+            return status;
+    }
 
     /* 부트 스레드 = idle 프로세스. 스택은 start.s 의 부트 스택을 계속 사용한다. */
     idle->pid = 0;
@@ -77,22 +146,22 @@ Nstatus process_init(void)
     return NSTATUS_OK;
 }
 
-Nstatus process_create(process_entry_t entry_point, void *stack)
+/*
+ * 빈 슬롯을 하나 잡아 공통 필드와 초기 커널 스택을 구성하고 리스트 끝에 매단다
+ * (인터럽트가 꺼진 상태에서 호출). 빈 슬롯이 없으면 NULL.
+ *
+ * 초기 커널 스택 구성 (switch.s 주석 참고). top 은 16바이트 정렬.
+ *   top-8  : 반환 주소 = process_entry_trampoline
+ *   top-16 : rbp, top-24 : rbx, top-32 : r12(진입 함수), top-40 : r13(인자),
+ *   top-48 : r14, top-56 : r15   <- 저장된 rsp
+ */
+static process_t *alloc_process_locked(process_entry_t entry, void *arg)
 {
     u32 i;
     u32 slot = PROCESS_MAX;
     process_t *proc;
     process_t *tail;
     u64 *sp;
-    u64 top;
-    u64 flags;
-
-    if (!entry_point)
-        return NinvalidArg;
-    if (!process_list)
-        return NnotInitialized;
-
-    flags = irq_save();
 
     process_reap();
 
@@ -102,46 +171,58 @@ Nstatus process_create(process_entry_t entry_point, void *stack)
             break;
         }
     }
-
-    if (slot == PROCESS_MAX) {
-        irq_restore(flags);
-        return NprocessFailed;
-    }
+    if (slot == PROCESS_MAX)
+        return nNULL;
 
     proc = &g_procs[slot];
     memset(proc, 0, sizeof(*proc));
-    memset(g_kstacks[slot], 0, PROCESS_KSTACK_SIZE);
+    memset(kstack_bottom(slot), 0, PROCESS_KSTACK_SIZE);   /* 가드 페이지는 건드리지 않는다 */
 
-    proc->pid = g_next_pid++;
+    proc->pid = alloc_pid_locked();
+    proc->parent_pid = current_process ? current_process->pid : 0;
     proc->state = PROCESS_READY;
-    proc->stack = stack;
-    proc->entry_point = entry_point;
-    proc->kernel_stack = g_kstacks[slot];
+    proc->entry_point = entry;
+    proc->kernel_stack = kstack_bottom(slot);
     proc->in_use = true;
     nx_handles_init(&proc->handles);
 
-    /*
-     * 초기 커널 스택 구성 (switch.s 주석 참고). top 은 16바이트 정렬.
-     *   top-8  : 반환 주소 = process_entry_trampoline
-     *   top-16 : rbp, top-24 : rbx, top-32 : r12(진입 함수), top-40 : r13(인자),
-     *   top-48 : r14, top-56 : r15   <- 저장된 rsp
-     */
-    top = (u64)(usize)g_kstacks[slot] + PROCESS_KSTACK_SIZE;
-    sp = (u64 *)(usize)top;
+    sp = (u64 *)(usize)((u64)(usize)kstack_bottom(slot) + PROCESS_KSTACK_SIZE);
     *--sp = (u64)(usize)process_entry_trampoline;  /* 반환 주소 */
     *--sp = 0;                                     /* rbp */
     *--sp = 0;                                     /* rbx */
-    *--sp = (u64)(usize)entry_point;               /* r12 */
-    *--sp = (u64)(usize)stack;                     /* r13 */
+    *--sp = (u64)(usize)entry;                     /* r12 */
+    *--sp = (u64)(usize)arg;                       /* r13 */
     *--sp = 0;                                     /* r14 */
     *--sp = 0;                                     /* r15 */
     proc->kernel_rsp = (u64)(usize)sp;
 
-    /* 리스트 끝에 추가 */
     tail = process_list;
     while (tail->next)
         tail = tail->next;
     tail->next = proc;
+
+    return proc;
+}
+
+Nstatus process_create(process_entry_t entry_point, void *stack)
+{
+    process_t *proc;
+    u64 flags;
+
+    if (!entry_point)
+        return NinvalidArg;
+    if (!process_list)
+        return NnotInitialized;
+
+    flags = irq_save();
+
+    proc = alloc_process_locked(entry_point, stack);
+    if (!proc) {
+        irq_restore(flags);
+        return NprocessFailed;
+    }
+    proc->stack = stack;
+    proc->waitable = false;        /* 커널 스레드: 수거 API 가 없으므로 종료 즉시 회수 */
 
     irq_restore(flags);
     return NSTATUS_OK;
@@ -169,12 +250,7 @@ Nstatus process_create_user(
     u64 heap_start_vaddr,
     u32 *out_pid
 ) {
-    u32 i;
-    u32 slot = PROCESS_MAX;
     process_t *proc;
-    process_t *tail;
-    u64 *sp;
-    u64 top;
     u64 flags;
 
     if (!as.pml4 || !out_pid)
@@ -184,53 +260,17 @@ Nstatus process_create_user(
 
     flags = irq_save();
 
-    process_reap();
-
-    for (i = 1; i < PROCESS_MAX; i++) {
-        if (!g_procs[i].in_use) {
-            slot = i;
-            break;
-        }
-    }
-
-    if (slot == PROCESS_MAX) {
+    proc = alloc_process_locked(user_process_entry_thunk, nNULL);
+    if (!proc) {
         irq_restore(flags);
         return NprocessFailed;
     }
-
-    proc = &g_procs[slot];
-    memset(proc, 0, sizeof(*proc));
-    memset(g_kstacks[slot], 0, PROCESS_KSTACK_SIZE);
-
-    proc->pid = g_next_pid++;
-    proc->state = PROCESS_READY;
-    proc->stack = nNULL;
-    proc->entry_point = user_process_entry_thunk;
     proc->addrspace = as;
     proc->user_entry = entry_vaddr;
     proc->user_stack_top = stack_top_vaddr;
     proc->heap_start = heap_start_vaddr;
     proc->heap_brk = heap_start_vaddr;
-    proc->kernel_stack = g_kstacks[slot];
-    proc->in_use = true;
-    nx_handles_init(&proc->handles);
-
-    /* 초기 커널 스택 구성은 process_create() 와 동일하다 (switch.s 주석 참고). */
-    top = (u64)(usize)g_kstacks[slot] + PROCESS_KSTACK_SIZE;
-    sp = (u64 *)(usize)top;
-    *--sp = (u64)(usize)process_entry_trampoline;  /* 반환 주소 */
-    *--sp = 0;                                     /* rbp */
-    *--sp = 0;                                     /* rbx */
-    *--sp = (u64)(usize)user_process_entry_thunk;  /* r12 */
-    *--sp = 0;                                     /* r13 (thunk 은 arg 를 쓰지 않음) */
-    *--sp = 0;                                     /* r14 */
-    *--sp = 0;                                     /* r15 */
-    proc->kernel_rsp = (u64)(usize)sp;
-
-    tail = process_list;
-    while (tail->next)
-        tail = tail->next;
-    tail->next = proc;
+    proc->waitable = true;         /* 부모가 process_get_exit_code() 로 수거할 때까지 슬롯 유지 */
 
     *out_pid = proc->pid;
 
@@ -298,6 +338,7 @@ Nstatus process_terminate(u32 pid)
     /* 프로세스가 가진 모든 핸들(열린 파일 포함)을 닫는다. 그러지 않으면 드라이버 자원이 새어 나간다 */
     nx_handles_close_all(&proc->handles);
     proc->state = PROCESS_TERMINATED;
+    detach_children_locked(proc->pid);   /* 이 프로세스가 수거할 예정이던 자식은 이제 아무도 수거하지 않는다 */
 
     if (proc == current_process) {
         /* 자기 자신을 종료: 다른 프로세스로 전환하며 이 함수는 반환하지 않는다 */
@@ -370,23 +411,36 @@ void process_reap_terminated(void)
 Nstatus process_get_exit_code(u32 pid, i32 *out_code)
 {
     process_t *p;
+    process_t *prev = nNULL;
     u64 flags;
 
     if (!out_code)
         return NinvalidArg;
+    if (pid == 0)
+        return Npermission;            /* idle 은 종료하지 않는다 */
 
     flags = irq_save();
 
-    for (p = process_list; p; p = p->next) {
+    for (p = process_list; p; prev = p, p = p->next) {
         if (!p->in_use || p->pid != pid)
             continue;
 
+        if (current_process && p->parent_pid != current_process->pid) {
+            irq_restore(flags);
+            return Npermission;        /* 부모만 수거할 수 있다 */
+        }
         if (p->state != PROCESS_TERMINATED) {
             irq_restore(flags);
             return Nbusy;
         }
 
         *out_code = p->exit_code;
+
+        /* 수거: 자원이 아직 남아 있으면(reap 전) 지금 회수하고 슬롯을 비운다 */
+        if (p->addrspace.pml4)
+            paging_addrspace_destroy(&p->addrspace);
+        free_slot_locked(p, prev);
+
         irq_restore(flags);
         return NSTATUS_OK;
     }

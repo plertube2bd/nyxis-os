@@ -29,6 +29,9 @@
 #  - 규칙 반복(복붙 20여 개)을 패턴 규칙으로 통합, 헤더 의존성(-MMD) 추적.
 #  - initrd.img 를 저장소의 추적 파일에 덮어쓰지 않고 out/ 에 생성.
 #  - 링커: 4KiB 정렬 세그먼트(-z max-page-size=0x1000), NX 스택 표시.
+#  - 부트로더를 gnu-efi 4.x 에서도 빌드 가능하게 (docs/AUDIT.md 10절):
+#      objcopy 에 -j .rodata 추가 (4.x 링커 스크립트는 .rodata 를 별도 섹션으로 만든다. 빠지면 문자열/GUID 소실)
+#      -fno-tree-loop-distribute-patterns : nytb3.c 의 자체 메모리 루프가 memcpy/memset 호출로 바뀌지 않도록
 # =====================================================================
 
 CC      = gcc
@@ -59,7 +62,7 @@ OVMF_VARS = /usr/share/OVMF/OVMF_VARS_4M.fd
 #   -isystem 으로 포함하고 -pedantic 은 사용하지 않는다. (자체 코드는 make check 가 '//' 사용을 검사)
 # =========================
 CFLAGS = \
-	-std=c89 \
+	-std=gnu89 \
 	-Wall -Wextra -Werror \
 	-Wstrict-prototypes -Wmissing-prototypes -Wshadow -Wdeclaration-after-statement -Wvla \
 	$(OPT) \
@@ -73,6 +76,7 @@ CFLAGS = \
 	-fno-stack-protector \
 	-fno-builtin \
 	-fno-common \
+	-fno-tree-loop-distribute-patterns \
 	-MMD -MP
 
 ifeq ($(DEBUG),1)
@@ -219,6 +223,7 @@ $(BOOTLOADER): $(BOOTLOADER_SO)
 		-j .text \
 		-j .sdata \
 		-j .data \
+		-j .rodata \
 		-j .dynamic \
 		-j .dynsym \
 		-j .rel \
@@ -226,7 +231,7 @@ $(BOOTLOADER): $(BOOTLOADER_SO)
 		-j .rel.* \
 		-j .rela.* \
 		-j .reloc \
-		--target=efi-app-x86_64 \
+		--output-target=efi-app-x86_64 \
 		$< \
 		$@
 

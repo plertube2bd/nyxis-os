@@ -13,7 +13,8 @@
  * 15개(120) 를 더 push 하므로 (40 + 16 + 120 = 176 = 16 * 11) call 직전 rsp 는
  * 16바이트 정렬이다. (SysV ABI 요구 충족)
  *
- * 참고: 이 커널은 sysret/swapgs 를 쓰지 않으므로 swapgs 는 필요 없다.
+ * 참고: swapgs 는 필요 없다. syscall_entry.s 가 GS 를 뒤바꾸는 구간은 진입부 몇 명령(IF=0)뿐이고
+ * C 코드는 항상 평상시 GS 상태에서 실행된다 (syscall_entry.s 의 [GS 규칙] 참고).
  */
 
     .altmacro
