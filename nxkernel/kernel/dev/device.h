@@ -38,6 +38,9 @@ typedef struct nx_device {
 /* 부팅 때 장치들을 등록한다 (boot info 의 프레임버퍼, COM1, 루트 RAM 디스크(마운트됨), rd0) */
 void device_init(const NTBLI *info, u32 rootdisk_no, u64 rootdisk_size);
 
+/* 등록된 index 번째 장치의 이름 (없으면 NULL). dev:/ 목록용 */
+const char *device_name_at(u32 index);
+
 /* name 의 장치를 현재 프로세스 이름으로 연다. write 이면 쓰기 열기. 독점 규칙 위반이면 Nbusy */
 Nstatus device_open(const char *name, bool write, nx_device_t **out);
 

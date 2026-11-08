@@ -137,7 +137,7 @@ static Nstatus build_initial_stack(addr_space_t *as, const spawn_args_t *args, u
     return NSTATUS_OK;
 }
 
-Nstatus process_spawn(const char *path, const spawn_args_t *args, process_t **out_proc)
+Nstatus spawn_build_image(const char *path, const spawn_args_t *args, spawn_image_t *out)
 {
     handle_t file;
     addr_space_t as;
@@ -146,7 +146,7 @@ Nstatus process_spawn(const char *path, const spawn_args_t *args, process_t **ou
     u64 rsp = 0;
     Nstatus status;
 
-    if (!path || !out_proc)
+    if (!path || !out)
         return NinvalidArg;
     if (args) {
         status = validate_args(args);
@@ -154,7 +154,8 @@ Nstatus process_spawn(const char *path, const spawn_args_t *args, process_t **ou
             return status;
     }
 
-    status = vfs_open(path, 1U, &file);         /* 1 = 읽기 */
+    /* 읽기 + 실행 권한 (보안 계층: 실행 비트가 없는 파일은 실행할 수 없다) */
+    status = vfs_open(path, 1U | VFS_O_EXEC, &file);
     if (NSTATUS_IS_ERR(status))
         return status;
 
@@ -183,11 +184,27 @@ Nstatus process_spawn(const char *path, const spawn_args_t *args, process_t **ou
         return status;
     }
 
-    status = process_create_user(as, entry, rsp, image_end, out_proc);
+    out->as = as;
+    out->entry = entry;
+    out->stack = rsp;
+    out->image_end = image_end;
+    return NSTATUS_OK;
+}
+
+Nstatus process_spawn(const char *path, const spawn_args_t *args, process_t **out_proc)
+{
+    spawn_image_t img;
+    Nstatus status;
+
+    if (!path || !out_proc)
+        return NinvalidArg;
+    status = spawn_build_image(path, args, &img);
+    if (NSTATUS_IS_ERR(status))
+        return status;
+    status = process_create_user(img.as, img.entry, img.stack, img.image_end, out_proc);
     if (NSTATUS_IS_ERR(status)) {
-        paging_addrspace_destroy(&as);
+        paging_addrspace_destroy(&img.as);
         return status;
     }
-
     return NSTATUS_OK;
 }

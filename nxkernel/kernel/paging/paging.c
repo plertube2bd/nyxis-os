@@ -566,6 +566,59 @@ void paging_addrspace_destroy(addr_space_t *as)
     as->pml4 = nNULL;
 }
 
+Nstatus paging_addrspace_clone_user(const addr_space_t *src, addr_space_t *dst)
+{
+    u32 i4, i3, i2, i1;
+
+    if (!src || !src->pml4 || !dst || !dst->pml4)
+        return NinvalidArg;
+
+    for (i4 = 0; i4 < HHDM_PML4_INDEX; i4++) {
+        u64 e4 = src->pml4[i4];
+        u64 *pdpt;
+
+        if (!(e4 & PAGE_PRESENT))
+            continue;
+        pdpt = table_of_dyn(e4);
+        for (i3 = 0; i3 < ENTRIES_PER_TABLE; i3++) {
+            u64 e3 = pdpt[i3];
+            u64 *pd;
+
+            if (!(e3 & PAGE_PRESENT) || (e3 & PAGE_HUGE))
+                continue;
+            pd = table_of_dyn(e3);
+            for (i2 = 0; i2 < ENTRIES_PER_TABLE; i2++) {
+                u64 e2 = pd[i2];
+                u64 *pt;
+
+                if (!(e2 & PAGE_PRESENT) || (e2 & PAGE_HUGE))
+                    continue;
+                pt = table_of_dyn(e2);
+                for (i1 = 0; i1 < ENTRIES_PER_TABLE; i1++) {
+                    u64 e1 = pt[i1];
+                    u64 virt = ((u64)i4 << 39) | ((u64)i3 << 30) | ((u64)i2 << 21) | ((u64)i1 << 12);
+                    u64 phys;
+                    Nstatus status;
+
+                    if (!(e1 & PAGE_PRESENT) || (e1 & PAGE_NOFREE))
+                        continue;
+                    status = pfa_alloc(&phys);
+                    if (NSTATUS_IS_ERR(status))
+                        return status;
+                    memcpy(phys_to_virt(phys), phys_to_virt(e1 & ENTRY_ADDR_MASK), PAGE_SIZE);
+                    status = paging_map_page(dst, (void *)(usize)phys, (void *)(usize)virt,
+                                             e1 & (PAGE_RW | PAGE_USER | PAGE_PWT | PAGE_PCD | PAGE_NX));
+                    if (NSTATUS_IS_ERR(status)) {
+                        (void)pfa_free(phys);
+                        return status;
+                    }
+                }
+            }
+        }
+    }
+    return NSTATUS_OK;
+}
+
 Nstatus paging_map_page(addr_space_t *as, void *phys, void *virt, u64 flags)
 {
     u64 p = (u64)(usize)phys;

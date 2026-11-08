@@ -614,10 +614,72 @@ PFA + HHDM 위의 크기별 slab: 16~2048 바이트 8 클래스, 페이지 머�
 
 ### 알려진 한계 / 남은 문제
 
-- 영속 저장소 없음: `fs:/` 는 RAM (재부팅 시 이미지로 돌아감), 비밀번호 변경·사용자 추가는 이미지 재생성. `rd:/`, `d:/`·`e:/`, `info:/` 미구현.
+- 영속 저장소 없음: `fs:/` 는 RAM (재부팅 시 이미지로 돌아감), 비밀번호 변경·사용자 추가는 이미지 재생성. `rd:/`, `d:/`·`e:/` 미구현 (`info:/` 는 13장).
 - VFS dentry 캐시가 한 번 찾은 경로의 디렉터리 순회 권한(EXECUTE) 검사를 다시 하지 않는다. 일반 사용자는 `fs:/` 를 못 써서 지금은
   `face:/`·`tmp:/`·`app:/` 안에서만 의미가 있지만, 디렉터리 권한을 세밀하게 쓰기 전에 고쳐야 한다.
 - `tmp:/` 에 sticky 비트 의미가 없다 (다른 사용자의 파일도 지울 수 있다). 실행 권한은 읽기 권한으로 대신한다(실행 비트 미검사).
 - 로그인 시도 제한은 실패당 1초 지연뿐이다 (잠금 없음). 프롬프트 전에 미리 친 글자(type-ahead)는 에코된다.
 - 프레임버퍼를 돌려받아도 화면을 다시 그리지 않는다 (이후 출력부터 보임). 채널 수신 중 사용자 버퍼 복사가 실패하면 그 메시지는 버려진다.
 - GRUB 경로와 gnu-efi 3.x 빌드, 실기는 이번에도 확인하지 못했다 (이 머신에 grub-mkrescue 없음).
+
+## 13. 레지스트리 트리: roi:/ 사용자 공간, 새 사용자용 틀, info:/ (8차 작업)
+
+사용자 DB(`roi:/users`)만 있던 `roi:/` 를 파일 트리로 넓히고, 누구나 읽는 `info:/` 를 더했다. ABI 2.2.
+
+### 13.1 설계 (질의응답으로 정한 것)
+
+- `roi:/` 는 **일반 nyfs 파일 트리**다. 값은 "파일 하나에 값 하나" 관례를 따르고, 커널은 경로 권한만 본다. 형식을 아는 항목
+  (`hostname`)은 읽는 쪽에서 검사하고, 틀리면 기본값을 쓴다.
+- 경계는 이름공간 단계(`nspath`)에서 강제한다. uid 0 은 `roi:/` 전부(`roi:/users` 는 여전히 커널 전용), 그 외 사용자는
+  첫 구성요소가 **자기 uid(10진수)** 인 경로만 쓸 수 있다. 정규화가 끝난 뒤에 검사하므로 `roi:/1000/../0`, `roi:/01000`,
+  `roi:/100`(앞부분만 같음)도 막힌다. 공간 안의 세부 권한은 nyfs 의 모드와 소유자가 정한다.
+  ```
+  fs:/roi/              0711 root      들어가기만 (목록은 root)
+  fs:/roi/users         0600 root      커널 전용
+  fs:/roi/hostname      0644 root      info:/hostname 의 원본
+  fs:/roi/default/      0500 TEMPLATE  새 사용자용 틀
+  fs:/roi/<uid>/        0500 <uid>     본인: 목록/들어가기만 (새 항목 못 만듦)
+  fs:/roi/<uid>/app/    0700 <uid>     본인: 앱 설정
+  fs:/roi/<uid>/shell   0444 root      관리자가 정한 로그인 셸 (본인은 읽기만)
+  ```
+- **틀(default)은 새 사용자를 만들 때 한 번 복사**된다 (이후 연결 없음). 틀의 "새 사용자 소유" 항목은 이미지 안에서도
+  소유자 `NX_UID_TEMPLATE`(0xFFFFFFFE)로 표시해 둔다. 복사 규칙은 하나: *소유자가 TEMPLATE 이면 새 uid/gid, 아니면 그대로*.
+  지금은 빌드 때 `tools/mkrootfs.py` 가 DB 의 모든 사용자(root 포함)에게 적용한다. 나중에 실행 중 사용자 생성을 넣을 때도
+  이미지 안의 `fs:/roi/default/` 를 보고 같은 규칙을 쓰면 된다.
+  - 저장소 쪽 원본: `rootfs/roi/hostname`, `rootfs/roi/default/`(내용), `rootfs/roi/default.owners`(경로·모드·root|user).
+- uid/gid 2^31 이상은 **예약**(`NX_UID_RESERVED_MIN`). 커널 `auth.c` 가 그런 DB 줄을 거부하고, `mkrootfs.py` 도 빌드를 멈춘다.
+  (이전에는 `mkusers.py` 만 막고 커널은 u32 전체를 받아들였다 — 손으로 고친 DB 로 TEMPLATE 소유 파일의 주인이 될 수 있었다.)
+- `info:/` 는 **커널이 만드는 가상 파일**이다 (`kernel/info/`). 누구나 읽고 아무도 쓸 수 없다(쓰기 열기·만들기·지우기·이름
+  바꾸기·실행은 `Npermission`). 내용은 **열 때 한 번 만들어** 핸들(`NX_HANDLE_INFO`, 최대 256B)에 보관한다: read/seek/stat/dup 은
+  일반 파일과 같고, 새 값은 다시 열어서 읽는다. 항목은 고정 표:
+  `hostname`, `version`, `abi`, `uptime_ms`, `memory/total_kib`, `memory/free_kib`. 디렉터리는 `NxReadDir` 로 나열한다.
+- `info:/hostname` 은 `fs:/roi/hostname` 을 **커널 신원(uid 0)으로** 읽는다 (원본의 모드와 무관하게 공개). 시스템 콜 안은
+  IRQ 꺼짐 + 커널 비선점 + RAM 읽기는 잠들지 않으므로, 호출자 uid 를 잠깐 0 으로 바꿨다 되돌리는 사이에 다른 일이 끼지 않는다.
+  끝의 `\n` 하나를 떼고 1~63 자 `[a-z0-9-]`, `-` 로 시작하지 않음을 검사한다. 없거나 틀리면 `nyxis`.
+- `NxGetIdentity(out, token)`: 두 번째 인자가 토큰 핸들이면 그 신원을 **조회만** 한다 (소모하지 않음). login 은 이것으로 uid 를
+  알아내 `roi:/<uid>/shell` 을 읽고 그 셸을 토큰으로 띄운다. 값이 없거나 `app:/` 실행 파일 형식이 아니면 `app:/nysh.run`,
+  띄우기에 실패해도 기본 셸로 다시 시도한다 (실패한 spawn 은 토큰을 소모하지 않으므로).
+- nysh: 프롬프트의 호스트 이름을 `info:/hostname` 에서 읽고, 내장 명령 `cat <경로>...`, `ls [경로]` 를 더했다.
+
+### 13.2 검증
+
+- `SELFTEST=1`: 135 개 점검 전부 통과. 새 커널 측 점검: 일반 사용자의 `roi:/` 경계(자기 공간 허용, 뿌리·hostname·default·
+  남의 uid·`..`·앞자리 0·접두 일치 거부), `info:/` 이름 정규화, `info_open` 스냅샷/디렉터리/없는 이름, `info_readdir`, hostname 형식 규칙.
+- elftest(root, 500번대): info 값(hostname/version/abi), 쓰기·만들기·지우기·이름 바꾸기 거부, 나열, 스냅샷(연 뒤 30ms 지나도
+  같은 값, 다시 열면 증가), stat/seek/dup(같은 스냅샷, 오프셋은 따로), 메모리 값의 관계, 디렉터리 핸들, root 가 `roi:/hostname` 을
+  바꾸면 반영·형식이 틀리거나 지우면 `nyxis`, 틀과 `roi:/0`·`roi:/1000` 복사 결과. 인증(414~417): 토큰 신원 조회, 조회 후에도
+  토큰 유효, 토큰이 아닌 핸들 거부.
+- elftest 의 test(uid 1000) 쪽(17~29): 자기 `shell` 읽기 가능·쓰기/지우기/옮기기 불가, 자기 공간 바로 아래 만들기 불가,
+  `app/` 에서 파일·디렉터리 만들기/쓰기/지우기, 자기 공간 나열, `roi:/hostname`·`roi:/default`·`roi:/0`·`roi:/` 나열·`..`·
+  앞자리 0·`roi:/1001` 만들기 거부, `info:/` 읽기 가능·쓰기 거부.
+- `make test-e2e` (시리얼, PS/2 모두): 기존 단계 + `cat info:/hostname roi:/1000/shell`, `cat roi:/hostname` 거부,
+  `ls info:/memory`.
+- `make check`, `make test-host`, nyfs-utils `make test`, `SELFTEST=8/9`(의도한 패닉) 재확인. 일반 이미지(`config/users.db`)가
+  `roi:/1000/` 을 갖고 로그인 프롬프트까지 부팅.
+
+### 알려진 한계
+
+- 사용자가 `roi:/<uid>/app/` 에 쓴 값은 재부팅하면 사라진다 (`fs:/` 가 RAM). 영속은 `rd:/` 의 몫.
+- 실행 중 사용자 생성은 아직 없다 (틀 복사 규칙만 정해 둠). `roi:/<uid>/shell` 을 기본값이 아닌 셸로 바꾼 경로는 자동 테스트가 없다
+  (테스트 이미지에서 바꿀 수 있는 사용자가 root 뿐이고, login 은 init 이 띄우므로).
+- `info:/` 는 `NxPoll` 로 값 변화를 기다릴 수 없다. 형식 검사는 `hostname` 에만 있다 (`roi:/` 쓰기 시점 검사 없음).

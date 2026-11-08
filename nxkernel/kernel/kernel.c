@@ -26,12 +26,15 @@
 #include "kernel/timer/pit/pit_base.h"
 #include "kernel/error_handling/panic.h"
 #include "console/outputs/printk.h"
+#include "console/outputs/conout.h"
+#include "console/outputs/outputs_base.h"
 #include "console/outputs/serial.h"
 #include "drivers/ahci/ahci.h"
 #include "drivers/ramdisk/ramdisk.h"
 #include "drivers/filesystem/vfs.h"
 #include "drivers/filesystem/fat16/fat16.h"
 #include "drivers/filesystem/nyfs/nyfs.h"
+#include "drivers/filesystem/nyfs/nyfs_disk.h"
 #include "kernel/process/spawn.h"
 #include "kernel/security/auth.h"
 #include "kernel/dev/device.h"
@@ -74,7 +77,7 @@ const NTBLI *get_kernel_info(void)
 /* 치명적 오류: 메시지를 출력하고 정지한다 */
 static void fatal(Nstatus error, const char *message)
 {
-    printk("Kernel error: %s : %r\n", message, error);
+    printk_err("Kernel error: %s : %r\n", message, error);
     kernel_panic_simple(message, error);
 }
 
@@ -146,33 +149,44 @@ static void console_init_from_boot_info(const NTBLI *info)
     Nstatus status;
 
     if (!info->framebuffer_base) {
-        printk("No framebuffer: using serial console only\n");
+        printk_warn("No framebuffer: using serial console only\n");
         return;
     }
 
     if (info->pixel_format != NTBLI_PIXEL_RGB && info->pixel_format != NTBLI_PIXEL_BGR) {
-        printk("Unsupported pixel format %u: framebuffer console disabled\n", info->pixel_format);
+        printk_warn("Unsupported pixel format %u: framebuffer console disabled\n", info->pixel_format);
         return;
     }
 
     if (((usize)info->framebuffer_base & 3UL) != 0) {
-        printk("Misaligned framebuffer: framebuffer console disabled\n");
+        printk_warn("Misaligned framebuffer: framebuffer console disabled\n");
         return;
     }
 
     /* stride*height*4 바이트가 실제 프레임버퍼 크기 안에 있는지 확인 */
     needed = (u64)info->pixels_per_scan_line * (u64)info->height * 4UL;
     if (info->framebuffer_size < needed) {
-        printk("Framebuffer size mismatch: framebuffer console disabled\n");
+        printk_warn("Framebuffer size mismatch: framebuffer console disabled\n");
         return;
     }
 
-    status = printk_init((u32 *)info->framebuffer_base,
+    status = conout_init((u32 *)info->framebuffer_base,
                          info->pixels_per_scan_line,
                          info->width,
-                         info->height);
-    if (NSTATUS_IS_ERR(status))
-        printk("Framebuffer console init failed (%r): serial only\n", status);
+                         info->height,
+                         info->pixel_format);
+    if (NSTATUS_IS_ERR(status)) {
+        printk_warn("Framebuffer console init failed (%r): serial only\n", status);
+        return;
+    }
+
+    if (font_is_ttf())
+        printk_ok("Console font: TrueType %ux%u\n", font_cell_width(), font_cell_height());
+    else if (NSTATUS_IS_ERR(font_init()))
+        printk_warn("Console font: TrueType init failed (%r), using %ux%u bitmap\n",
+               font_init(), font_cell_width(), font_cell_height());
+    else
+        printk_ok("Console font: %ux%u bitmap\n", font_cell_width(), font_cell_height());
 }
 
 /*
@@ -183,10 +197,11 @@ static void console_init_from_boot_info(const NTBLI *info)
  */
 #define ROOT_DISKNO        0U
 #define TMP_DISKNO         1U
-#define TMP_SIZE           (2U * 1024U * 1024U)   /* tmp:/ 2 MiB */
+#define TMP_SIZE           (16U * 1024U * 1024U)  /* tmp:/ 16 MiB (컴파일 작업 공간으로도 쓴다) */
 #define TMP_BLOCK_SHIFT    12U
 
-static u8 g_tmp_ramdisk[TMP_SIZE] __attribute__((aligned(4096)));
+/* tmp:/ 의 RAM 은 커널 이미지(BSS)에 두지 않는다: 부트로더가 커널을 고정 주소에 올릴 때 그만큼 연속된
+ * 메모리가 필요해져 부팅이 실패할 수 있다. 대신 pfa 가 부팅 때 떼어 둔 연속 영역을 쓴다 (pfa_set_boot_reserve) */
 static process_t *g_init = nNULL;
 
 static bool mount_root(NTBLI *info)
@@ -196,7 +211,7 @@ static bool mount_root(NTBLI *info)
 
     status = ramdisk_init(ROOT_DISKNO, (usize)info->initrd_base, (usize)info->initrd_size, info);
     if (NSTATUS_IS_ERR(status)) {
-        printk("root: ramdisk init failed: %r\n", status);
+        printk_err("root: ramdisk init failed: %r\n", status);
         return false;
     }
 
@@ -208,11 +223,11 @@ static bool mount_root(NTBLI *info)
 
     status = nyfs_mount(ROOT_DISKNO, &params);
     if (NSTATUS_IS_ERR(status)) {
-        printk("root: initrd is not a valid nyfs image (%r)\n", status);
+        printk_err("root: initrd is not a valid nyfs image (%r)\n", status);
         return false;
     }
 
-    printk("Root file system: fs:/ (nyfs, %lu KiB in RAM)\n", (unsigned long)(info->initrd_size / 1024UL));
+    printk_ok("Root file system: fs:/ (nyfs, %lu KiB in RAM)\n", (unsigned long)(info->initrd_size / 1024UL));
     return true;
 }
 
@@ -222,9 +237,19 @@ static void mount_tmp(NTBLI *info)
     nyfs_mount_params_t params;
     Nstatus status;
 
-    status = ramdisk_init(TMP_DISKNO, (usize)g_tmp_ramdisk, TMP_SIZE, info);
+    {
+        u64 phys;
+
+        status = pfa_boot_reserve(&phys);
+        if (NSTATUS_IS_ERR(status)) {
+            printk_warn("tmp: no contiguous memory for tmp:/ (%r)\n", status);
+            return;
+        }
+        memset((void *)(usize)phys_to_virt(phys), 0, TMP_SIZE);
+        status = ramdisk_init(TMP_DISKNO, (usize)phys_to_virt(phys), TMP_SIZE, info);
+    }
     if (NSTATUS_IS_ERR(status)) {
-        printk("tmp: ramdisk init failed: %r\n", status);
+        printk_warn("tmp: ramdisk init failed: %r\n", status);
         return;
     }
 
@@ -235,6 +260,7 @@ static void mount_tmp(NTBLI *info)
     params.total_blocks = TMP_SIZE / (1U << TMP_BLOCK_SHIFT);
     params.block_size_shift = (u8)TMP_BLOCK_SHIFT;
     params.root_mode = 0777;
+    params.inode_count = 1024;           /* 자동값(블록 수/8)은 작은 파일이 많을 때 모자란다 */
 
     status = nyfs_format(TMP_DISKNO, &params);
     if (!NSTATUS_IS_ERR(status)) {
@@ -242,7 +268,47 @@ static void mount_tmp(NTBLI *info)
         status = nyfs_mount(TMP_DISKNO, &params);
     }
     if (NSTATUS_IS_ERR(status))
-        printk("tmp: format/mount failed: %r\n", status);
+        printk_warn("tmp: format/mount failed: %r\n", status);
+}
+
+/*
+ * disk:/ : 재부팅해도 남는 저장소. SATA 디스크 중 첫 섹터에 nyfs 슈퍼블록 매직이 있는 첫 디스크를 마운트한다.
+ * 커널은 디스크를 절대 포맷하지 않는다 (실제 PC 에서 다른 OS 의 디스크를 지우지 않도록):
+ * 디스크 이미지는 호스트에서 만든다 (nxkernel/Makefile 의 DISK_IMG, nyfs-pack).
+ */
+static void mount_disk(NTBLI *info)
+{
+    static u8 sector[512] __attribute__((aligned(16)));
+    nyfs_mount_params_t params;
+    u32 i;
+    u32 count = ahci_disk_count();
+
+    for (i = 0; i < count; i++) {
+        u32 diskno = AHCI_DISKNO_BASE + i;
+        u32 magic;
+        Nstatus status = ahci_disk_read(diskno, 0, sector, sizeof(sector), info);
+
+        if (NSTATUS_IS_ERR(status))
+            continue;
+        memcpy(&magic, sector, sizeof(magic));
+        if (magic != NYFS_MAGIC)
+            continue;
+
+        memset(&params, 0, sizeof(params));
+        params.mount_path = "disk:/";
+        params.info = info;
+        params.read = ahci_disk_read;
+        params.write = ahci_disk_write;
+        status = nyfs_mount(diskno, &params);
+        if (NSTATUS_IS_ERR(status)) {
+            printk_warn("disk: SATA disk %u has a bad nyfs volume (%r)\n", i, status);
+            continue;
+        }
+        printk_ok("Persistent storage: disk:/ (nyfs on SATA disk %u)\n", i);
+        return;
+    }
+    if (count > 0)
+        printk_warn("disk: no nyfs-formatted SATA disk: disk:/ unavailable\n");
 }
 
 static void load_users(void)
@@ -251,9 +317,9 @@ static void load_users(void)
     Nstatus status = auth_load_users("fs:/roi/users", &n);
 
     if (NSTATUS_IS_ERR(status))
-        printk("auth: cannot read roi:/users (%r): nobody can log in\n", status);
+        printk_err("auth: cannot read roi:/users (%r): nobody can log in\n", status);
     else
-        printk("auth: %u user(s) loaded from roi:/users\n", n);
+        printk_ok("auth: %u user(s) loaded from roi:/users\n", n);
 }
 
 /* 첫 사용자 프로세스 app:/init 을 root 로 띄운다 (자식들은 이 신원을 물려받는다) */
@@ -270,11 +336,11 @@ static void start_init(void)
 
     status = process_spawn("fs:/usr/init.run", &args, &g_init);
     if (NSTATUS_IS_ERR(status)) {
-        printk("init: cannot start app:/init.run (%r)\n", status);
+        printk_err("init: cannot start app:/init.run (%r)\n", status);
         g_init = nNULL;
         return;
     }
-    printk("init started (pid %u)\n", g_init->pid);
+    printk_ok("init started (pid %u)\n", g_init->pid);
 }
 
 /*
@@ -350,7 +416,7 @@ void kernel_main(u32 boot_kind, u64 boot_info_phys)
         status = Nunsupported;
     }
     if (NSTATUS_IS_ERR(status)) {
-        printk("Invalid boot info (kind %u): %r\n", boot_kind, status);
+        printk_err("Invalid boot info (kind %u): %r\n", boot_kind, status);
         kernel_panic_simple("Invalid boot info", status);
     }
     boot_info_sanitize_initrd();
@@ -359,11 +425,12 @@ void kernel_main(u32 boot_kind, u64 boot_info_phys)
     /* 3. CPU 구조: GDT/TSS, IDT, PIC, syscall (인터럽트는 아직 꺼져 있음) */
     gdt_init();
     gdt_set_kernel_stack((u64)(usize)boot_stack_top);
+    cpu_fpu_init();
     interrupt_init();
     pic_remap(VEC_IRQ_BASE, VEC_IRQ_BASE + 8);
     status = syscall_init();
     if (NSTATUS_IS_ERR(status))
-        printk("syscall/sysret unavailable (%r): int 0x80 only\n", status);
+        printk_warn("syscall/sysret unavailable (%r): int 0x80 only\n", status);
 
     /* 4. 메모리 보호: 자체 페이지 테이블(HHDM + higher-half 커널, W^X). 이후 낮은 주소 항등 매핑은 사라진다 */
     status = paging_init(&g_boot_info);
@@ -382,6 +449,7 @@ void kernel_main(u32 boot_kind, u64 boot_info_phys)
         u64 initrd_phys_start = g_boot_info.initrd_base ? virt_to_phys(g_boot_info.initrd_base) : 0;
         u64 initrd_phys_end = g_boot_info.initrd_base ? initrd_phys_start + g_boot_info.initrd_size : 0;
 
+        pfa_set_boot_reserve(TMP_SIZE);    /* tmp:/ 의 연속 RAM (mount_tmp) */
         status = pfa_init(&g_boot_info, kernel_phys_start, kernel_phys_end,
                           initrd_phys_start, initrd_phys_end, paging_hhdm_limit());
         if (NSTATUS_IS_ERR(status))
@@ -391,13 +459,13 @@ void kernel_main(u32 boot_kind, u64 boot_info_phys)
     /* 5. 콘솔 (프레임버퍼는 HHDM 주소로 접근) */
     console_init_from_boot_info(&g_boot_info);
 
-    printk("Nyxis OS Kernel Started (%s boot)\n", boot_kind == BOOT_KIND_UEFI ? "UEFI" : "Multiboot2");
-    printk("Memory top: 0x%lx, initrd: %lu bytes, %ux%u framebuffer\n",
+    printk(KC_BOLD KC_CYAN "Nyxis OS Kernel Started" KC_RESET " (%s boot)\n", boot_kind == BOOT_KIND_UEFI ? "UEFI" : "Multiboot2");
+    printk(KC_GRAY "Memory top: 0x%lx, initrd: %lu bytes, %ux%u framebuffer\n",
            (unsigned long)g_boot_info.memory_size,
            (unsigned long)g_boot_info.initrd_size,
            g_boot_info.width, g_boot_info.height);
-    printk("GDT/IDT/PIC ready, paging enabled (higher-half, HHDM, W^X, NX, WP)\n");
-    printk("Physical frame allocator ready: %lu free pages (%lu MiB)\n",
+    printk_ok("GDT/IDT/PIC ready, paging enabled (higher-half, HHDM, W^X, NX, WP)\n");
+    printk_ok("Physical frame allocator ready: %lu free pages (%lu MiB)\n",
            (unsigned long)pfa_free_count(), (unsigned long)(pfa_free_count() * PAGE_SIZE / (1024UL * 1024UL)));
 
     /* 6. 프로세스 / 타이머 */
@@ -431,7 +499,7 @@ void kernel_main(u32 boot_kind, u64 boot_info_phys)
         if (g_boot_info.initrd_base && g_boot_info.initrd_size)
             root_ok = mount_root(&g_boot_info);
         else
-            printk("No initrd loaded: no root file system\n");
+            printk_warn("No initrd loaded: no root file system\n");
 
         mount_tmp(&g_boot_info);
 
@@ -445,12 +513,14 @@ void kernel_main(u32 boot_kind, u64 boot_info_phys)
     /* 8. 저장장치 (없어도 계속 부팅) */
     status = ahci_init();
     if (NSTATUS_IS_ERR(status))
-        printk("AHCI unavailable (%r): continuing without SATA storage\n", status);
+        printk_warn("AHCI unavailable (%r): continuing without SATA storage\n", status);
+    else
+        mount_disk(&g_boot_info);
 
     /* 9. 이제 핸들러가 모두 준비되었으므로 인터럽트를 켠다 */
     sti();
 
-    printk("Kernel initialization complete.\n");
+    printk_ok("Kernel initialization complete.\n");
 
 #ifdef NYX_SELFTEST
     nyx_selftest();

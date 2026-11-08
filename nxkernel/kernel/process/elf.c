@@ -83,6 +83,11 @@ typedef struct {
 NX_STATIC_ASSERT(elf64_header_size, sizeof(elf64_header_t) == 64);
 NX_STATIC_ASSERT(elf64_phdr_size, sizeof(elf64_phdr_t) == 56);
 
+static u64 align_down(u64 v, u64 a)
+{
+    return v & ~(a - 1);
+}
+
 static u64 align_up(u64 v, u64 a)
 {
     return (v + a - 1) & ~(a - 1);
@@ -118,6 +123,7 @@ static Nstatus read_exact(handle_t *file, u64 offset, void *buf, usize len)
 static Nstatus load_segment(handle_t *file, addr_space_t *as, const elf64_phdr_t *ph)
 {
     u64 vaddr_end = align_up(ph->p_vaddr + ph->p_memsz, PAGE_SIZE);
+    u64 file_end = ph->p_vaddr + ph->p_filesz;     /* 이 주소 앞까지가 파일 내용, 뒤는 0 (.bss) */
     u64 flags = (u64)PAGE_USER;
     u64 page;
 
@@ -126,9 +132,10 @@ static Nstatus load_segment(handle_t *file, addr_space_t *as, const elf64_phdr_t
     if (!(ph->p_flags & PF_X))
         flags |= PAGE_NX;
 
-    for (page = ph->p_vaddr; page < vaddr_end; page += PAGE_SIZE) {
+    /* p_vaddr 가 페이지 중간이면 첫 페이지의 앞부분은 0 으로 남는다 */
+    for (page = align_down(ph->p_vaddr, PAGE_SIZE); page < vaddr_end; page += PAGE_SIZE) {
         u64 phys;
-        u64 seg_off = page - ph->p_vaddr;
+        u64 from = (page > ph->p_vaddr) ? page : ph->p_vaddr;     /* 이 페이지에서 채울 시작 주소 */
         u64 copy_len = 0;
         Nstatus status;
 
@@ -136,15 +143,16 @@ static Nstatus load_segment(handle_t *file, addr_space_t *as, const elf64_phdr_t
         if (NSTATUS_IS_ERR(status))
             return status;
 
-        if (seg_off < ph->p_filesz) {
-            u64 remain = ph->p_filesz - seg_off;
+        if (from < file_end) {
+            u64 remain = file_end - from;
+            u64 room = page + PAGE_SIZE - from;
 
-            copy_len = (remain < PAGE_SIZE) ? remain : (u64)PAGE_SIZE;
+            copy_len = (remain < room) ? remain : room;
         }
 
         if (copy_len > 0) {
-            status = read_exact(file, ph->p_offset + seg_off,
-                                (void *)(usize)phys_to_virt(phys), (usize)copy_len);
+            status = read_exact(file, ph->p_offset + (from - ph->p_vaddr),
+                                (u8 *)phys_to_virt(phys) + (from - page), (usize)copy_len);
             if (NSTATUS_IS_ERR(status)) {
                 (void)pfa_free(phys);   /* 아직 매핑 전이라 as 의 페이지 테이블에는 없다 */
                 return status;
@@ -218,9 +226,9 @@ Nstatus elf_load(handle_t *file, addr_space_t *as, u64 *out_entry, u64 *out_imag
             continue;                   /* 빈 PT_LOAD 는 규격상 허용된다 (예: .data 가 없는 프로그램의 RW 세그먼트) */
         if (ph->p_offset > file_size || ph->p_filesz > file_size - ph->p_offset)
             return NinvalidFormat;
-        if ((ph->p_vaddr & (PAGE_SIZE - 1)) != 0)
-            return NinvalidFormat;      /* 페이지 정렬 요구 (elf.h 문서 참고) */
-        if (ph->p_vaddr < NX_USER_ELF_MIN_VADDR || ph->p_vaddr >= NX_USER_ELF_MAX_VADDR)
+        if ((ph->p_vaddr & (PAGE_SIZE - 1)) != (ph->p_offset & (PAGE_SIZE - 1)))
+            return NinvalidFormat;      /* ELF 규칙: 페이지 안의 위치가 파일과 같아야 한다 (elf.h 문서 참고) */
+        if (align_down(ph->p_vaddr, PAGE_SIZE) < NX_USER_ELF_MIN_VADDR || ph->p_vaddr >= NX_USER_ELF_MAX_VADDR)
             return NinvalidFormat;
         if (ph->p_memsz > NX_USER_ELF_MAX_VADDR - ph->p_vaddr)
             return NinvalidFormat;      /* 오버플로/범위 초과 */
@@ -238,6 +246,30 @@ Nstatus elf_load(handle_t *file, addr_space_t *as, u64 *out_entry, u64 *out_imag
 
     if (!any_load || !entry_ok)
         return NinvalidFormat;
+
+    /*
+     * 세그먼트끼리 페이지를 나눠 쓰면 안 된다: 한 페이지에 권한이 하나뿐이라 RX 와 RW 가 섞이면 W^X 가
+     * 깨진다 (그리고 두 번째 매핑은 어차피 실패한다). 표준 링커와 tcc 는 권한이 다른 세그먼트를 다른
+     * 페이지에 둔다.
+     */
+    for (i = 0; i < hdr.e_phnum; i++) {
+        u32 j;
+
+        if (phdrs[i].p_type != PT_LOAD || phdrs[i].p_memsz == 0)
+            continue;
+        for (j = i + 1; j < hdr.e_phnum; j++) {
+            u64 a0, a1, b0, b1;
+
+            if (phdrs[j].p_type != PT_LOAD || phdrs[j].p_memsz == 0)
+                continue;
+            a0 = align_down(phdrs[i].p_vaddr, PAGE_SIZE);
+            a1 = align_up(phdrs[i].p_vaddr + phdrs[i].p_memsz, PAGE_SIZE);
+            b0 = align_down(phdrs[j].p_vaddr, PAGE_SIZE);
+            b1 = align_up(phdrs[j].p_vaddr + phdrs[j].p_memsz, PAGE_SIZE);
+            if (a0 < b1 && b0 < a1)
+                return NinvalidFormat;
+        }
+    }
 
     for (i = 0; i < hdr.e_phnum; i++) {
         if (phdrs[i].p_type != PT_LOAD || phdrs[i].p_memsz == 0)

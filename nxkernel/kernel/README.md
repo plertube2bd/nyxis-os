@@ -209,7 +209,47 @@ E820 기반 맵은 이미 쓰이고 있는 그 영역들도 "사용 가능"으�
 매핑하고(오버플로가 다른 것을 덮어쓰지 않고 즉시 폴트로 드러나게), 프로세스를 등록합니다.
 어느 단계에서든 실패하면 그때까지 만든 것을 전부 정리합니다.
 
+### 파일시스템 캐시와 ELF 로더
+- VFS(`drivers/filesystem/vfs.c`)의 경로 캐시(dentry, 256개)는 차면 쓰지 않는 말단 항목을 거둔다. vnode 는 참조 수를
+  가진다(dentry 하나 + 열린 핸들마다 하나): 열린 파일의 vnode 는 거두지 않고, 지운 파일은 마지막 close 때 해제한다.
+  마운트 지점과 이름공간 루트는 고정이다. 파일시스템 데이터는 `vfs_ops_t.release` 로 돌려준다.
+- ELF 로더(`process/elf.c`)는 표준 규칙(`p_vaddr ≡ p_offset (mod 4KiB)`)을 따른다: 세그먼트가 페이지 중간에서
+  시작해도 된다(TinyCC 가 이렇게 만든다). 세그먼트끼리 같은 페이지를 쓰면 거부한다(W^X).
+- tmp:/ 는 16MiB RAM nyfs(inode 1024개). RAM 은 커널 BSS 가 아니라 pfa 가 부팅 때 떼어 둔 연속 영역
+  (`pfa_set_boot_reserve`): BSS 를 키우면 부트로더가 커널을 고정 주소에 올릴 연속 메모리를 못 찾는다.
+
+### 실행 계층 (`exec/`)
+- `exec_fork()` (NxProcessFork): 사용자 주소 공간을 새 프레임에 통째로 복사하고(`paging_addrspace_clone_user`, 즉시 복사 — COW 아님),
+  부모가 시스템 콜에 들어온 순간의 `trap_frame`(rax = 0)으로 자식이 사용자 모드에 돌아간다(`fork_return.s`, iretq).
+  핸들 테이블은 슬롯 번호와 세대까지 그대로 물려준다(`nx_handles_inherit`) — 메모리에 남은 핸들 값이 자식에서도 유효하다.
+  프로세스/토큰/장치/채널 수신 끝은 물려주지 않는다. FPU 상태는 fork 순간의 하드웨어 값을 저장해 넘긴다.
+- `exec_replace()` (NxProcessExec): `spawn_build_image()`로 새 이미지를 **끝까지** 만든 다음에야 옛 주소 공간을 버린다
+  (실패는 옛 프로그램에 오류로 돌아간다). 성공하면 시스템 콜 프레임을 새 프로그램의 시작 상태로 바꿔, 복귀가 곧 시작이 된다.
+  CLOEXEC 핸들을 닫고 남은 핸들의 세대를 0 으로(새 프로그램에서 핸들 값 = 슬롯 번호), FPU 초기화, 장치 MMIO 매핑 기록 정리.
+
+### IPC 계층 (`ipc/`)
+- 채널(`channel.c`): svc:/ 이름이 있는 메시지 큐 (보낸 쪽 pid/uid/gid 첨부).
+- 파이프(`pipe.c`): 4KiB 링 버퍼, 읽기/쓰기 끝 참조 수. 빈 파이프 읽기는 잠들고 쓰는 쪽이 모두 닫히면 EOF,
+  읽는 쪽이 모두 닫힌 뒤의 쓰기는 `Ndisconnected`. 512바이트 이하 쓰기는 섞이지 않는다. NxPoll 지원.
+
+### 보안 계층 (`security/`)
+- 인증(`auth.c`): PBKDF2 비밀번호 확인과 일회용 신원 토큰.
+- 권한(`perm.c`): 새 노드에 umask 적용, chmod 입력 검사(0777 이하), stat 의 mode/uid/gid. 권한 *판정* 은 파일시스템
+  드라이버 한 곳(`nyfs_check_access`)에서만 한다 — chmod 를 누가 할 수 있는지(소유자/root)도 드라이버가 판정한다.
+- 실행 권한: NxProcessCreate/NxProcessExec 는 `VFS_O_EXEC` 로 열어 x 비트를 요구한다 (root 도 x 비트가 하나는 있어야 한다).
+
+### 콘솔 (`../console/`)
+- `outputs/conout.c`: 출력 장치 — 프레임버퍼 글자 콘솔 + COM1 시리얼. 바이트를 거르지 않는다.
+- `outputs/printk.c`: 커널 로그. 서식만 풀어 conout 으로 보낸다.
+- `inputs/tty.c`: 터미널 — 줄 편집 입력(`tty_read`)과 사용자 출력(`tty_write`, 제어 문자를 `?` 로 거른다).
+  사용자 프로그램의 stdout/stderr 는 tty -> conout 으로 가고 printk 를 거치지 않는다 (NxKernelPrint 만 커널 로그로 간다).
+- 표준 스트림 장치: `dev:/tty`(터미널), `dev:/stdin|stdout|stderr`(호출자의 0/1/2 번을 공유하는 새 핸들,
+  리디렉션을 따른다). `dev:/` 의 다른 장치와 달리 누구나 열 수 있다 (`nspath.c` 의 `nsp_dev_is_public`,
+  `syscall.c` 의 `open_stream`).
+
 ### 시스템 콜 (`syscall/`)
+- 파일 핸들은 공유 가능한 "열린 파일"(`nx_ofile_t`, 오프셋 + 참조 수)을 가리킨다: dup(NX_DUP_SHARE)/fork/상속이 오프셋을 공유한다.
+- `syscall_ext.c`: 실행/IPC/보안 계층과 핸들 확장(dup2, CLOEXEC)의 시스템 콜 진입점.
 
 `int 0x80` 과 `syscall`/`sysret`(`syscall_entry.s`) 둘 다 지원. `rax` = 번호, `rdi, rsi, rdx, r10, r8, r9` = 인자,
 결과는 `rax` (음수 = `Nstatus` 오류). `syscall` 은 `rcx`/`r11` 을 파괴합니다. 번호/구조체/상수는 유저랜드와 공유하는

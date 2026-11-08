@@ -13,6 +13,11 @@
  *  - create_namespace 안의 의미 없는 spin_lock/unlock 쌍 삭제 (sync.h 수정 전에는 이 unlock 이
  *    인터럽트를 켜서 IDT 가 준비되기 전에 인터럽트가 발생할 수 있었다).
  *  - C89 호환 (for 루프 선언/혼합 선언/라인 주석 제거), 'private' -> 'priv'.
+ *  - dentry 캐시 거둬들이기: 캐시가 차면 쓰지 않는 말단 항목을 지운다 (예전에는 지우지 않아서, 서로 다른
+ *    파일을 VFS_MAX_DENTRIES 개 넘게 연 뒤로는 시스템 전체에서 새 경로를 열 수 없었다 — exec 도 실패).
+ *    vnode 는 참조 수를 가진다: dentry 하나 + 열린 핸들마다 하나 (vfs_open/vfs_reopen 이 늘리고 vfs_close
+ *    가 줄인다). 열린 파일의 vnode 는 지우지 않으며, 지운 파일(unlink)의 vnode 는 마지막 close 때 해제한다.
+ *    마운트 지점과 이름공간 루트는 고정(pinned)이라 지우지 않는다.
  *  - 락: 이 VFS 는 현재 단일 코어 + 인터럽트 비사용 경로에서만 쓰인다.
  *    mount/unmount 는 g_vfs_lock 으로 보호하지만 resolve/open 경로는 락이 없다.
  *    멀티코어/선점 도입 전에 반드시 보완해야 한다.
@@ -22,8 +27,8 @@
 #include "memory.h"
 #include "string.h"
 
-#define VFS_MAX_DENTRIES    64
-#define VFS_MAX_VNODES      128
+#define VFS_MAX_DENTRIES    256     /* 캐시 크기. 차면 쓰지 않는 항목을 거둔다 (evict_dentry) */
+#define VFS_MAX_VNODES      512     /* dentry 마다 하나 + 지웠지만 아직 열려 있는 파일 + 파일시스템 루트 */
 #define VFS_MAX_HANDLES     64
 #define VFS_MAX_NAMESPACES  16
 #define VFS_NAME_MAX        255
@@ -46,6 +51,7 @@ struct dentry {
     dentry_t *first_child;
     dentry_t *next_sibling;
     atomic_t refcnt;
+    bool pinned;        /* 마운트 지점 / 이름공간 루트: 캐시에서 거두지 않는다 */
 };
 
 typedef struct vfs_namespace {
@@ -63,22 +69,88 @@ static vfs_namespace_t *g_default_namespace = nNULL;
 static spinlock_t g_vfs_lock;
 static vnode_t g_vnodes[VFS_MAX_VNODES];
 
-static dentry_t *alloc_dentry(const char *name, vnode_t *node, dentry_t *parent)
+static bool is_namespace_cwd(const dentry_t *d)
 {
     u32 i;
 
-    for (i = 0; i < VFS_MAX_DENTRIES; i++) {
-        if (g_dentries[i].refcnt.value != 0) {
-            continue;
-        }
+    for (i = 0; i < VFS_MAX_NAMESPACES; i++) {
+        if (g_namespaces[i].in_use && (g_namespaces[i].cwd == d || g_namespaces[i].root == d))
+            return true;
+    }
+    return false;
+}
 
-        memset(&g_dentries[i], 0, sizeof(dentry_t));
-        strncpy(g_dentries[i].name, name, VFS_NAME_MAX);
-        g_dentries[i].name[VFS_NAME_MAX] = '\0';
-        g_dentries[i].node = node;
-        g_dentries[i].parent = parent;
-        atomic_set(&g_dentries[i].refcnt, 1);
-        return &g_dentries[i];
+static void free_vnode(vnode_t *vnode);
+static void detach_child(dentry_t *parent, dentry_t *child);
+static void free_dentry(dentry_t *dentry);
+
+/* vnode 참조 하나를 놓는다. 0 이 되면 파일시스템의 vnode 데이터를 돌려주고(release) 해제한다 */
+static void vnode_put(vnode_t *vnode)
+{
+    if (!vnode || atomic_read(&vnode->refcnt) == 0) {
+        return;
+    }
+    atomic_dec(&vnode->refcnt);
+    if (atomic_read(&vnode->refcnt) == 0) {
+        if (vnode->ops && vnode->ops->release) {
+            vnode->ops->release(vnode);
+        }
+        free_vnode(vnode);
+    }
+}
+
+static bool is_namespace_cwd(const dentry_t *d);
+
+/*
+ * 캐시에서 항목 하나를 거둔다: 자식이 없는 말단, 고정되지 않음, 부모가 있음(트리 루트 아님),
+ * vnode 를 dentry 혼자 참조함(열린 파일 없음), keep(지금 그 아래에 붙이려는 부모)이 아님.
+ * 시계 방식으로 돌며 고른다. 거두면 true.
+ */
+static bool evict_dentry(const dentry_t *keep)
+{
+    static u32 hand = 0;
+    u32 n;
+
+    for (n = 0; n < VFS_MAX_DENTRIES; n++) {
+        dentry_t *d = &g_dentries[hand];
+
+        hand = (hand + 1U) % VFS_MAX_DENTRIES;
+        if (atomic_read(&d->refcnt) == 0 || d->pinned || !d->parent || d->first_child || d == keep)
+            continue;
+        if (d->node && atomic_read(&d->node->refcnt) != 1)
+            continue;                   /* 열린 파일이 있다 */
+        if (is_namespace_cwd(d))
+            continue;
+        detach_child(d->parent, d);
+        vnode_put(d->node);
+        free_dentry(d);
+        return true;
+    }
+    return false;
+}
+
+static dentry_t *alloc_dentry(const char *name, vnode_t *node, dentry_t *parent)
+{
+    u32 i;
+    u32 attempt;
+
+    for (attempt = 0; attempt < 2; attempt++) {
+        for (i = 0; i < VFS_MAX_DENTRIES; i++) {
+            if (g_dentries[i].refcnt.value != 0) {
+                continue;
+            }
+
+            memset(&g_dentries[i], 0, sizeof(dentry_t));
+            strncpy(g_dentries[i].name, name, VFS_NAME_MAX);
+            g_dentries[i].name[VFS_NAME_MAX] = '\0';
+            g_dentries[i].node = node;
+            g_dentries[i].parent = parent;
+            atomic_set(&g_dentries[i].refcnt, 1);
+            return &g_dentries[i];
+        }
+        if (!evict_dentry(parent)) {
+            break;
+        }
     }
 
     return nNULL;
@@ -95,6 +167,7 @@ static void free_dentry(dentry_t *dentry)
     dentry->parent = nNULL;
     dentry->first_child = nNULL;
     dentry->next_sibling = nNULL;
+    dentry->pinned = false;
 }
 
 static void attach_child(dentry_t *parent, dentry_t *child)
@@ -513,7 +586,7 @@ static Nstatus resolve_path_internal_ns(
 
             child = alloc_dentry(name, vnode, current);
             if (!child) {
-                vfs_free_vnode(vnode);
+                vnode_put(vnode);
                 return NoutOfMemory;
             }
             attach_child(current, child);
@@ -592,7 +665,7 @@ static Nstatus resolve_parent_ns(
 
             child = alloc_dentry(name, vnode, current);
             if (!child) {
-                vfs_free_vnode(vnode);
+                vnode_put(vnode);
                 return NoutOfMemory;
             }
             attach_child(current, child);
@@ -663,6 +736,7 @@ Nstatus vfs_register_namespace(const char *namespace_name, const char *source_pa
         return NtooManyFileSystem;
     }
 
+    root->pinned = true;               /* 다른 이름공간의 루트: 캐시에서 거두면 안 된다 */
     target_ns->root = root;
     target_ns->cwd = root;
     return Nok;
@@ -730,6 +804,7 @@ Nstatus vfs_mount(const char *path, vfs_filesystem_t *fs)
     } else {
         existing->node = fs->root;
     }
+    existing->pinned = true;           /* 마운트 지점 */
 
     spin_unlock(&g_vfs_lock);
     return Nok;
@@ -841,7 +916,8 @@ Nstatus vfs_open(const char *path, u32 flags, handle_t *out_handle)
         return status;
     }
 
-    /* 호출자가 가진 handle_t 로 사본을 넘기고, 전역 슬롯은 즉시 반환한다 */
+    /* 호출자가 가진 handle_t 로 사본을 넘기고, 전역 슬롯은 즉시 반환한다. 열린 동안 vnode 를 붙잡는다 */
+    atomic_inc(&handle->vnode->refcnt);
     *out_handle = *handle;
     free_handle(handle);
     return Nok;
@@ -911,6 +987,7 @@ Nstatus vfs_close(handle_t *handle)
         return status;
     }
 
+    vnode_put(handle->vnode);          /* 지운 파일이면 여기서 마지막 참조가 풀린다 */
     free_handle(handle);
     return Nok;
 }
@@ -927,6 +1004,43 @@ Nstatus vfs_fstat(handle_t *handle, vfs_stat_t *out)
 
     memset(out, 0, sizeof(*out));
     return handle->vnode->ops->stat(handle->vnode, out);
+}
+
+Nstatus vfs_stat_path(const char *path, vfs_stat_t *out)
+{
+    dentry_t *target = nNULL;
+    Nstatus status;
+
+    if (!path || !out) {
+        return NinvalidArg;
+    }
+    status = resolve_path_internal(path, &target);
+    if (NSTATUS_IS_ERR(status)) {
+        return status;
+    }
+    if (!target || !target->node || !target->node->ops || !target->node->ops->stat) {
+        return Nunsupported;
+    }
+    memset(out, 0, sizeof(*out));
+    return target->node->ops->stat(target->node, out);
+}
+
+Nstatus vfs_chmod(const char *path, u32 mode)
+{
+    dentry_t *target = nNULL;
+    Nstatus status;
+
+    if (!path) {
+        return NinvalidArg;
+    }
+    status = resolve_path_internal(path, &target);
+    if (NSTATUS_IS_ERR(status)) {
+        return status;
+    }
+    if (!target || !target->node || !target->node->ops || !target->node->ops->chmod) {
+        return Nunsupported;
+    }
+    return target->node->ops->chmod(target->node, mode);
 }
 
 Nstatus vfs_reopen(const handle_t *src, handle_t *dst)
@@ -955,6 +1069,7 @@ Nstatus vfs_reopen(const handle_t *src, handle_t *dst)
         return status;
     }
 
+    atomic_inc(&slot->vnode->refcnt);
     *dst = *slot;
     free_handle(slot);
     return Nok;
@@ -1023,7 +1138,7 @@ Nstatus vfs_create(const char *path, u32 mode)
 
         if (!new_dentry) {
             spin_unlock(&g_vfs_lock);
-            vfs_free_vnode(child);
+            vnode_put(child);
             return NoutOfMemory;
         }
         attach_child(parent, new_dentry);
@@ -1090,7 +1205,7 @@ Nstatus vfs_mkdir(const char *path, u32 mode)
 
         if (!new_dentry) {
             spin_unlock(&g_vfs_lock);
-            vfs_free_vnode(child);
+            vnode_put(child);
             return NoutOfMemory;
         }
         attach_child(parent, new_dentry);
@@ -1148,9 +1263,7 @@ Nstatus vfs_unlink(const char *path)
     existing = find_child(parent, name);
     if (existing) {
         detach_child(parent, existing);
-        if (existing->node) {
-            vfs_free_vnode(existing->node);
-        }
+        vnode_put(existing->node);     /* 아직 열려 있으면 마지막 close 때 해제된다 */
         free_dentry(existing);
     }
 
@@ -1264,9 +1377,7 @@ Nstatus vfs_rename(const char *old_path, const char *new_path)
         /* v1 드라이버는 덮어쓰기 rename 자체를 거부하므로 정상적으로는 여기 오지
          * 않지만, 방어적으로 캐시에 남은 자리를 치운다 */
         detach_child(new_parent, existing_new);
-        if (existing_new->node) {
-            vfs_free_vnode(existing_new->node);
-        }
+        vnode_put(existing_new->node);
         free_dentry(existing_new);
     }
 

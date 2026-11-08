@@ -2,7 +2,9 @@
  * process.c - 프로세스/커널 스레드 테이블과 컨텍스트 전환 (설계는 process.h 참고)
  */
 
+#include "console/inputs/tty.h"
 #include "kernel/process/process.h"
+#include "kernel/process/signal.h"
 #include "kernel/paging/paging.h"
 #include "kernel/mm/pfa.h"
 #include "kernel/error_handling/panic.h"
@@ -149,6 +151,32 @@ Nstatus process_init(void)
  *   top-16 : rbp, top-24 : rbx, top-32 : r12(진입 함수), top-40 : r13(인자),
  *   top-48 : r14, top-56 : r15   <- 저장된 rsp
  */
+#define CR0_MP          (1UL << 1)
+#define CR0_EM          (1UL << 2)
+#define CR0_TS          (1UL << 3)
+#define CR0_NE          (1UL << 5)
+#define CR4_OSFXSR      (1UL << 9)
+#define CR4_OSXMMEXCPT  (1UL << 10)
+
+void cpu_fpu_init(void)
+{
+    /* EM=0: x87 명령을 에뮬레이션 트랩 없이 실행, TS=0: 지연 전환 안 씀, MP/NE: 표준 x87 오류 보고(#MF) */
+    write_cr0((read_cr0() & ~(CR0_EM | CR0_TS)) | CR0_MP | CR0_NE);
+    /* OSFXSR: FXSAVE/FXRSTOR 와 SSE 명령 허용, OSXMMEXCPT: SIMD 예외를 #XM 으로 */
+    write_cr4(read_cr4() | CR4_OSFXSR | CR4_OSXMMEXCPT);
+    __asm__ volatile ("fninit");
+}
+
+/* FNINIT + 기본 MXCSR 과 같은 FXSAVE 이미지 (나머지는 0: 레지스터 비어 있음) */
+static void fpu_state_init(u8 *st)
+{
+    memset(st, 0, PROCESS_FPU_STATE_SIZE);
+    st[0] = 0x7F;           /* FCW = 0x037F: 모든 예외 마스크, 확장 정밀도, 가까운 값으로 반올림 */
+    st[1] = 0x03;
+    st[24] = 0x80;          /* MXCSR = 0x1F80: 모든 SIMD 예외 마스크, 가까운 값으로 반올림 */
+    st[25] = 0x1F;
+}
+
 static process_t *alloc_process_locked(process_entry_t entry, void *arg)
 {
     u32 i;
@@ -170,10 +198,13 @@ static process_t *alloc_process_locked(process_entry_t entry, void *arg)
 
     proc = &g_procs[slot];
     memset(proc, 0, sizeof(*proc));
+    fpu_state_init(proc->fpu_state);
     memset(kstack_bottom(slot), 0, PROCESS_KSTACK_SIZE);   /* 가드 페이지는 건드리지 않는다 */
 
     proc->pid = alloc_pid_locked();
     proc->parent_pid = current_process ? current_process->pid : 0;
+    /* 프로세스 그룹: 사용자 프로세스가 만들면 물려받고, 커널이 만들면(init) 새 그룹 */
+    proc->pgid = (current_process && current_process->addrspace.pml4) ? current_process->pgid : proc->pid;
 
     /* 신원 상속 (토큰으로 바꾸는 것은 process_spawn 이 생성 직후, 실행 전에 한다) */
     if (current_process) {
@@ -181,6 +212,9 @@ static process_t *alloc_process_locked(process_entry_t entry, void *arg)
         proc->gid = current_process->gid;
         memcpy(proc->user_name, current_process->user_name, sizeof(proc->user_name));
     }
+    /* umask: 사용자 프로세스가 만들면 물려주고, 커널이 만들면(init 등) 기본값 */
+    proc->umask = (current_process && current_process->addrspace.pml4) ? current_process->umask
+                                                                       : NX_UMASK_DEFAULT;
     proc->state = PROCESS_READY;
     proc->entry_point = entry;
     proc->kernel_stack = kstack_bottom(slot);
@@ -280,6 +314,47 @@ Nstatus process_create_user(
     return NSTATUS_OK;
 }
 
+/* fork 로 만든 자식이 처음 실행될 때: 부모가 시스템 콜에 들어온 순간의 레지스터(rax = 0)로 사용자 모드에 돌아간다 */
+static void forked_entry_thunk(void *arg)
+{
+    struct trap_frame tf = current_process->fork_frame;   /* 자기 커널 스택으로 옮긴 뒤 복귀 */
+
+    (void)arg;
+    fork_return_to_user(&tf);
+}
+
+Nstatus process_create_forked(addr_space_t as, const struct trap_frame *frame, process_t **out_proc)
+{
+    process_t *parent = current_process;
+    process_t *proc;
+    u64 flags;
+
+    if (!as.pml4 || !frame || !out_proc || !parent)
+        return NinvalidArg;
+
+    flags = irq_save();
+    proc = alloc_process_locked(forked_entry_thunk, nNULL);
+    if (!proc) {
+        irq_restore(flags);
+        return NprocessFailed;
+    }
+    proc->addrspace = as;
+    proc->user_entry = parent->user_entry;
+    proc->user_stack_top = parent->user_stack_top;
+    proc->heap_start = parent->heap_start;
+    proc->heap_brk = parent->heap_brk;
+    proc->umask = parent->umask;
+    signal_fork_copy(proc, parent);
+    proc->fork_frame = *frame;
+    proc->fork_frame.rax = 0;              /* 자식에게 fork 는 0 을 돌려준다 */
+    /* 부모의 FPU/SSE 레지스터는 아직 하드웨어에 있다 (전환할 때만 저장한다): 지금 값을 자식 영역에 저장 */
+    __asm__ volatile ("fxsave64 (%0)" : : "r"(proc->fpu_state) : "memory");
+    proc->refs = 1;                        /* 부모의 프로세스 핸들이 가질 참조 */
+    *out_proc = proc;
+    irq_restore(flags);
+    return NSTATUS_OK;
+}
+
 Nstatus process_switch(process_t *proc)
 {
     process_t *old;
@@ -314,6 +389,10 @@ Nstatus process_switch(process_t *proc)
     proc->state = PROCESS_RUNNING;
     proc->slice_ticks = SCHED_SLICE_TICKS;
 
+    /* 사용자 FPU/SSE 상태 교체 (process.h 의 fpu_state 설명) */
+    __asm__ volatile ("fxsave64 (%0)" : : "r"(old->fpu_state) : "memory");
+    __asm__ volatile ("fxrstor64 (%0)" : : "r"(proc->fpu_state) : "memory");
+
     cpu_switch_context(&old->kernel_rsp, proc->kernel_rsp);
 
     /* 이 컨텍스트가 다시 선택되면 여기서 이어서 실행된다 */
@@ -340,8 +419,23 @@ static Nstatus terminate_locked(process_t *proc, i32 code)
      * 아무도 참조하지 않게 된 종료된 자식은 바로 회수되고, 살아 있는 자식은 끝나는 즉시 회수된다. */
     nx_handles_close_all(&proc->handles);
 
+    /* 콘솔을 raw 모드로 두고 끝났으면 되돌린다 (셸이 먹통이 되지 않도록) */
+    tty_process_terminated(proc->pid);
+
     /* 이 프로세스를 기다리던 모두를 깨운다 (NxProcessWait) */
     (void)waitq_wake_all(&proc->exit_waiters);
+
+    /* 부모에게 SIGCHLD (기본 동작은 무시: 처리기를 둔 부모만 알게 된다) */
+    if (proc->parent_pid != 0) {
+        process_t *parent;
+
+        for (parent = process_list; parent; parent = parent->next) {
+            if (parent->in_use && parent->pid == proc->parent_pid && parent->state != PROCESS_TERMINATED) {
+                signal_post(parent, NX_SIGCHLD, NX_SI_CHILD, proc->pid);
+                break;
+            }
+        }
+    }
 
     if (proc == current_process) {
         /* 자기 자신을 종료: 다른 프로세스로 전환하며 반환하지 않는다 */
@@ -395,6 +489,22 @@ Nstatus process_kill(process_t *proc, i32 code)
     return status;
 }
 
+bool process_group_owned_by(u32 pgid, u32 uid)
+{
+    process_t *proc;
+    bool ok = true;
+    u64 flags = irq_save();
+
+    for (proc = process_list; proc; proc = proc->next) {
+        if (proc->in_use && proc->pgid == pgid && proc->state != PROCESS_TERMINATED && proc->uid != uid) {
+            ok = false;
+            break;
+        }
+    }
+    irq_restore(flags);
+    return ok;
+}
+
 void process_exit_with_code(i32 code)
 {
     if (!current_process || current_process->pid == 0)
@@ -424,12 +534,23 @@ Nstatus process_sleep_ticks(u64 ticks)
         return Npermission;
 
     flags = irq_save();
+    if (signal_deliverable(self)) {
+        irq_restore(flags);
+        return Ninterrupted;
+    }
+    self->sig_woken = false;
 
     /* 최소 1 tick 은 잔다 (tick 경계 때문에 0 tick 이면 즉시 깨어나는 것과 같아진다) */
     self->wake_tick = timer_get_tick() + (ticks ? ticks : 1UL);
     self->state = PROCESS_BLOCKED;
 
     schedule();      /* 시간이 되면 스케줄러가 READY 로 바꾸고 다시 이 프로세스를 골라 여기로 돌아온다 */
+
+    if (self->sig_woken) {
+        self->sig_woken = false;
+        irq_restore(flags);
+        return Ninterrupted;                 /* 신호가 일찍 깨웠다 */
+    }
 
     if (self->state == PROCESS_BLOCKED) {
         /* 아무도 실행할 수 없어서 전환이 일어나지 않았다 (idle 이 항상 있으므로 정상이라면 도달하지 않음) */

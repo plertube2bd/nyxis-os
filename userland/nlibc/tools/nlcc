@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""
+nlcc / nlld - nlibc 컴파일러 드라이버 (호스트의 gcc/ld 로 Nyxis 실행 파일을 만든다)
+
+  nlcc [옵션] 파일...          .c/.s/.S 를 컴파일하고 nlibc 와 링크해 실행 파일(.run)을 만든다
+  nlcc -c|-S|-E [옵션] 파일...  컴파일만 (nlibc 헤더로)
+  nlld [옵션] 파일.o/.a...      링크만
+
+  링크 순서: nlcrt0.o <사용자 오브젝트> <-l 라이브러리> libnlibc.a libgcc.a  (링커 스크립트 lib/nlibc.ld)
+
+옵션 (나머지는 그대로 gcc 에 넘긴다):
+  -o <파일>          출력 (링크 기본값 a.run)
+  -l<이름> -L<경로>   추가 라이브러리 (lib<이름>.a, 정적만)
+  -Wl,<a>,<b>        링커에 그대로
+  -nostartfiles      nlcrt0.o 를 링크하지 않는다 (_start 를 직접 제공할 때)
+  -nostdlib          nlcrt0.o, libnlibc.a, libgcc.a 모두 링크하지 않는다
+  -v                 실행하는 명령을 보여 준다
+  --nlibc-sysroot=<경로>  SDK 위치 (기본: 이 스크립트의 ../, 또는 환경 변수 NLIBC_SYSROOT)
+
+SDK 구조 (make nlibc-sdk 가 만든다):  bin/nlcc bin/nlld  include/*.h  lib/libnlibc.a lib/nlcrt0.o lib/nlibc.ld
+기본 컴파일 옵션: -std=c89 (사용자가 -std= 를 주면 그것), -nostdinc + nlibc 헤더, 정적 비-PIE x86_64.
+환경 변수 NLCC_CC / NLCC_LD 로 호스트 gcc / ld 를 바꿀 수 있다.
+"""
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+COMPILE_FLAGS = [
+    "-m64", "-nostdinc", "-fno-pie", "-fno-pic", "-fno-plt", "-fno-stack-protector",
+    "-fcf-protection=none", "-fno-asynchronous-unwind-tables", "-fno-unwind-tables",
+]
+LINK_FLAGS = [
+    "-m", "elf_x86_64", "-static", "-nostdlib", "-z", "max-page-size=0x1000", "-z", "noexecstack",
+    "--no-warn-rwx-segments", "--gc-sections",
+]
+SOURCE_EXTS = (".c", ".s", ".S")
+
+
+def die(msg):
+    sys.stderr.write("%s: %s\n" % (os.path.basename(sys.argv[0]), msg))
+    sys.exit(1)
+
+
+def run(cmd, verbose):
+    if verbose:
+        sys.stderr.write(" ".join(cmd) + "\n")
+    r = subprocess.call(cmd)
+    if r != 0:
+        sys.exit(r)
+
+
+def main(argv):
+    link_only = os.path.basename(argv[0]).startswith("nlld")
+    sysroot = os.environ.get("NLIBC_SYSROOT") or os.path.dirname(os.path.dirname(os.path.realpath(argv[0])))
+    cc = os.environ.get("NLCC_CC", "gcc")
+    ld = os.environ.get("NLCC_LD", "ld")
+
+    mode = None            # None = 링크까지, 'c' 'S' 'E'
+    output = None
+    verbose = False
+    nostart = False
+    nostdlib = False
+    has_std = False
+    cflags = []            # gcc 에 넘길 옵션
+    ldflags = []           # ld 에 넘길 옵션
+    libs = []              # -l, -L (입력 순서 유지)
+    inputs = []
+
+    args = argv[1:]
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-c", "-S", "-E"):
+            mode = a[1]
+        elif a == "-o":
+            i += 1
+            if i >= len(args):
+                die("-o needs an argument")
+            output = args[i]
+        elif a.startswith("-o") and len(a) > 2:
+            output = a[2:]
+        elif a == "-v":
+            verbose = True
+        elif a == "-nostartfiles":
+            nostart = True
+        elif a == "-nostdlib":
+            nostdlib = True
+        elif a.startswith("--nlibc-sysroot="):
+            sysroot = a.split("=", 1)[1]
+        elif a.startswith("-l") or a.startswith("-L"):
+            if len(a) == 2:
+                i += 1
+                if i >= len(args):
+                    die("%s needs an argument" % a)
+                a = a + args[i]
+            libs.append(a)
+        elif a.startswith("-Wl,"):
+            ldflags.extend(x for x in a[4:].split(",") if x)
+        elif a in ("-I", "-D", "-U", "-include", "-isystem", "-x"):
+            i += 1
+            if i >= len(args):
+                die("%s needs an argument" % a)
+            cflags.extend([a, args[i]])
+        elif a.startswith("-"):
+            if a.startswith("-std="):
+                has_std = True
+            if a in ("-static", "-shared", "-pie", "-fpie", "-fPIE", "-fpic", "-fPIC"):
+                if a == "-static":
+                    i += 1
+                    continue
+                die("%s is not supported (Nyxis runs static, non-PIE executables only)" % a)
+            cflags.append(a)
+        else:
+            inputs.append(a)
+        i += 1
+
+    if not inputs:
+        die("no input files")
+
+    inc = os.path.join(sysroot, "include")
+    lib = os.path.join(sysroot, "lib")
+    for need in (os.path.join(inc, "stdio.h"), os.path.join(lib, "libnlibc.a")):
+        if not os.path.exists(need):
+            die("nlibc SDK not found at %s (build it with 'make nlibc-sdk' or set NLIBC_SYSROOT)" % sysroot)
+
+    base_cflags = COMPILE_FLAGS + ["-isystem", inc]
+    if not has_std:
+        base_cflags.append("-std=c89")
+
+    if link_only and mode:
+        die("-%s cannot be used with nlld" % mode)
+
+    # 컴파일만
+    if mode:
+        if output and len(inputs) > 1:
+            die("cannot specify -o with -%s and multiple files" % mode)
+        cmd = [cc] + base_cflags + cflags + ["-" + mode] + inputs
+        if output:
+            cmd += ["-o", output]
+        run(cmd, verbose)
+        return 0
+
+    # 컴파일 + 링크
+    tmp = tempfile.mkdtemp(prefix="nlcc-")
+    try:
+        objs = []
+        for n, src in enumerate(inputs):
+            if src.endswith(SOURCE_EXTS) and not link_only:
+                obj = os.path.join(tmp, "%d_%s.o" % (n, os.path.splitext(os.path.basename(src))[0]))
+                run([cc] + base_cflags + cflags + ["-c", src, "-o", obj], verbose)
+                objs.append(obj)
+            elif src.endswith(SOURCE_EXTS):
+                die("%s: nlld links objects only (use nlcc to compile)" % src)
+            else:
+                objs.append(src)
+
+        cmd = [ld] + LINK_FLAGS + ["-T", os.path.join(lib, "nlibc.ld")] + ldflags
+        cmd += ["-o", output or "a.run"]
+        if not nostart and not nostdlib:
+            cmd.append(os.path.join(lib, "nlcrt0.o"))
+        cmd += objs
+        cmd += ["-L" + lib] + libs
+        if not nostdlib:
+            cmd.append(os.path.join(lib, "libnlibc.a"))
+            libgcc = subprocess.run([cc, "-m64", "-print-libgcc-file-name"],
+                                    capture_output=True, text=True).stdout.strip()
+            if libgcc and os.path.exists(libgcc):
+                cmd.append(libgcc)          # 컴파일러 보조 함수 (128비트 나눗셈 등). 시스템 콜을 쓰지 않는다
+        run(cmd, verbose)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

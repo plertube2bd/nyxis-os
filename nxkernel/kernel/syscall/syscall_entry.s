@@ -61,6 +61,8 @@ syscall_entry:
     cld
     movq %rsp, %rdi                 /* 인자: struct trap_frame * */
     call syscall_handle
+    testq %rax, %rax
+    jnz syscall_iret_exit           /* NxSignalReturn: 모든 레지스터(rcx/r11 포함)를 그대로 되돌린다 */
 
     /* 복귀 RIP 검사: 사용자 영역(< 0x0000800000000000)이어야 한다 (정규성도 함께 보장됨) */
     movq 136(%rsp), %rax
@@ -89,6 +91,28 @@ syscall_entry:
     movq 40(%rsp), %rsp             /* 사용자 rsp */
     sysretq
 
+/* iretq 로 복귀: 프레임 전체 복원 (signal.c 가 rip/rsp 는 사용자 영역, cs/ss 는 사용자 셀렉터로 맞춰 두었다) */
+syscall_iret_exit:
+    movq 136(%rsp), %rax
+    shrq $47, %rax
+    jnz syscall_bad_return_stub
+    popq %r15
+    popq %r14
+    popq %r13
+    popq %r12
+    popq %r11
+    popq %r10
+    popq %r9
+    popq %r8
+    popq %rbp
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    popq %rcx
+    popq %rbx
+    popq %rax
+    addq $16, %rsp                  /* vector, error_code */
+    iretq
 syscall_bad_return_stub:
     call syscall_bad_return
 1:  hlt

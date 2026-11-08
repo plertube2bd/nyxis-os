@@ -38,6 +38,7 @@ long nx_stat(long h, struct nx_stat *out);
 long nx_dup(long h, unsigned long rights);
 long nx_sleep(unsigned long ms);
 long nx_identity(struct nx_identity *out);
+long nx_token_identity(long token, struct nx_identity *out);   /* 토큰이 담은 신원 (소모하지 않음) */
 long nx_authenticate(const char *name, const char *password);
 long nx_spawn(const char *path, const char *const *argv, const char *const *envp, long token);
 long nx_wait(long h, unsigned long timeout_ms, int *code);
@@ -74,5 +75,9 @@ void nx_puti(long v);
 /* stdin 에서 한 줄 읽기. 개행은 떼고 NUL 로 끝낸다. 반환: 길이, EOF 면 -1, 오류면 음수 Nstatus.
  * 줄이 buf 보다 길면 잘린다 (나머지는 버린다) */
 long nx_readline(char *buf, unsigned long max);
+
+/* 작은 파일(roi:/ 값, info:/ 항목)을 통째로 읽는다. 끝의 '\n' 하나는 떼고 NUL 로 끝낸다.
+ * 반환: 길이, 파일이 max-1 보다 길면 NX_E_BUF_OVERFLOW, 그 밖의 오류는 음수 Nstatus */
+long nx_read_value(const char *path, char *buf, unsigned long max);
 
 #endif /* NYX_USER_H */

@@ -1,0 +1,10 @@
+kilo — 수정하지 않은 upstream 사본
+
+출처:   https://github.com/antirez/kilo
+커밋:   323d93b29bd89a2cb446de90c4ed4fea1764176e (master)
+파일:   kilo.c (sha256 4a44dd0e41670a9e49ecccb338ee199334f0dd472fc7f86467569cf99c391abe), LICENSE
+라이선스: BSD 2-Clause (LICENSE)
+
+Nyxis 용 수정은 이 디렉터리에 하지 않는다. 빌드할 때 사본에 userland/kilo/kilo-nyxis.patch 를 적용한다
+(nxkernel/Makefile 의 kilo 규칙). 새 upstream 으로 올릴 때는 이 디렉터리를 통째로 바꾸고 이 파일의 커밋을 고친 뒤,
+패치가 적용되는지 확인한다.

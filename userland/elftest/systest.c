@@ -231,6 +231,157 @@ static int channel_tests(void)
     return 0;
 }
 
+/* ---------------- 레지스트리 (roi:/) / info:/ ---------------- */
+
+/* path 의 값(끝 '\n' 제외)이 want 와 같은가 */
+/* "주.부" (info:/abi 의 기대값, nyx_abi.h 에서 만든다: 버전을 올릴 때 이 검사를 고칠 필요가 없도록) */
+static const char *abi_string(void)
+{
+    static char out[24];
+    unsigned long parts[2];
+    unsigned long n = 0;
+    int i;
+
+    parts[0] = NX_ABI_MAJOR;
+    parts[1] = NX_ABI_MINOR;
+    for (i = 0; i < 2; i++) {
+        char tmp[12];
+        unsigned long v = parts[i];
+        int k = 0;
+
+        do {
+            tmp[k++] = (char)('0' + v % 10UL);
+            v /= 10UL;
+        } while (v);
+        while (k > 0)
+            out[n++] = tmp[--k];
+        if (i == 0)
+            out[n++] = '.';
+    }
+    out[n] = '\0';
+    return out;
+}
+
+static int value_is(const char *path, const char *want)
+{
+    char buf[128];
+
+    return nx_read_value(path, buf, sizeof(buf)) >= 0 && nx_strcmp(buf, want) == 0;
+}
+
+/* 파일을 새로 만들어(있으면 지우고) data 를 쓴다 */
+static int put_file(const char *path, const char *data, unsigned long mode)
+{
+    long h;
+    long n;
+
+    (void)nx_remove_node(path);
+    if (nx_create_node(path, NX_NODE_FILE, mode) != 0)
+        return 0;
+    h = nx_open(path, NX_O_WRITE);
+    if (h < 0)
+        return 0;
+    n = nx_write(h, data, nx_strlen(data));
+    (void)nx_close(h);
+    return n == (long)nx_strlen(data);
+}
+
+static unsigned long parse_ul(const char *s)
+{
+    unsigned long v = 0;
+
+    while (*s >= '0' && *s <= '9')
+        v = v * 10 + (unsigned long)(*s++ - '0');
+    return v;
+}
+
+/* root(uid 0)로 실행. 실패 코드 500~ */
+static int registry_tests(void)
+{
+    struct nx_dirent de;
+    struct nx_stat st;
+    char buf[64];
+    char buf2[64];
+    unsigned long t0;
+    unsigned long t1;
+    unsigned long total;
+    unsigned long avail;
+    long h;
+    long h2;
+
+    /* info:/ 값 */
+    CHECK(value_is("roi:/hostname", "nyxis") && value_is("info:/hostname", "nyxis"), 500);
+    CHECK(value_is("info:/version", "0.1") && value_is("info:/abi", abi_string()), 501);
+    CHECK(value_is("roi:/timezone", "Europe/London") && value_is("info:/timezone", "Europe/London"), 536);
+    CHECK(value_is("info:/utc_offset", "+00:00"), 541);
+    CHECK(nx_open("info:/hostname", NX_O_WRITE) == NX_E_PERMISSION &&
+          nx_open("info:/hostname", NX_O_READ | NX_O_WRITE) == NX_E_PERMISSION, 502);
+    CHECK(nx_create_node("info:/x", NX_NODE_FILE, 0644) == NX_E_PERMISSION &&
+          nx_remove_node("info:/hostname") == NX_E_PERMISSION &&
+          nx_rename_node("info:/hostname", "tmp:/h") == NX_E_PERMISSION, 503);
+    CHECK(nx_open("info:/nope", NX_O_READ) == NX_E_NOT_FOUND && nx_open("info:/memory/nope", NX_O_READ) == NX_E_NOT_FOUND, 504);
+
+    /* 나열: info:/ 와 info:/memory */
+    CHECK(nx_read_dir("info:/", 0, &de) == 0 && nx_strcmp(de.name, "hostname") == 0 && de.type == NX_TYPE_FILE, 505);
+    CHECK(nx_read_dir("info:/", 6, &de) == 0 && nx_strcmp(de.name, "memory") == 0 && de.type == NX_TYPE_DIR, 506);
+    CHECK(nx_read_dir("info:/", 7, &de) == NX_E_NOT_FOUND, 507);
+    CHECK(nx_read_dir("info:/memory", 0, &de) == 0 && nx_strcmp(de.name, "total_kib") == 0 &&
+          nx_read_dir("info:/memory", 1, &de) == 0 && nx_strcmp(de.name, "free_kib") == 0 &&
+          nx_read_dir("info:/memory", 2, &de) == NX_E_NOT_FOUND, 508);
+    CHECK(nx_read_dir("info:/hostname", 0, &de) == NX_E_INVALID_ARG, 509);
+
+    /* 스냅샷: 열 때 만든 값은 그대로, 다시 열면 새 값 */
+    CHECK(nx_read_value("info:/uptime_ms", buf, sizeof(buf)) > 0, 510);
+    t0 = parse_ul(buf);
+    h = nx_open("info:/uptime_ms", NX_O_READ);
+    CHECK(h >= 0, 511);
+    (void)nx_sleep(30);
+    CHECK(nx_read(h, buf2, sizeof(buf2)) > 0, 512);
+    t1 = parse_ul(buf2);
+    CHECK(t1 >= t0 && t1 - t0 < 30, 513);                                     /* 연 시점의 값 */
+    CHECK(nx_read_value("info:/uptime_ms", buf, sizeof(buf)) > 0 && parse_ul(buf) >= t0 + 30, 514);
+    CHECK(nx_stat(h, &st) == 0 && st.type == NX_TYPE_FILE && st.size > 0, 515);
+    CHECK(nx_seek(h, 0, NX_SEEK_SET) == 0, 516);
+    h2 = nx_dup(h, NX_RIGHT_ALL);
+    CHECK(h2 >= 0, 517);
+    CHECK(nx_read(h2, buf, sizeof(buf)) == (long)st.size && nx_memcmp(buf, buf2, st.size) == 0, 518);   /* 같은 스냅샷 */
+    CHECK(nx_read(h, buf, 1) == 1 && nx_read(h2, buf, 1) == 0, 519);         /* 오프셋은 따로 */
+    CHECK(nx_write(h, "x", 1) == NX_E_PERMISSION, 520);
+    (void)nx_close(h2);
+    (void)nx_close(h);
+
+    CHECK(nx_read_value("info:/memory/total_kib", buf, sizeof(buf)) > 0, 521);
+    total = parse_ul(buf);
+    CHECK(nx_read_value("info:/memory/free_kib", buf, sizeof(buf)) > 0, 522);
+    avail = parse_ul(buf);
+    CHECK(total > 0 && avail > 0 && avail <= total, 523);
+
+    h = nx_open("info:/memory", NX_O_READ);                                   /* 디렉터리도 열 수는 있다 */
+    CHECK(h >= 0 && nx_stat(h, &st) == 0 && st.type == NX_TYPE_DIR && nx_read(h, buf, 1) == NX_E_INVALID_ARG, 524);
+    (void)nx_close(h);
+
+    /* roi:/hostname 은 원본: root 가 바꾸면 info:/ 에 반영, 형식이 틀리면 기본값 */
+    CHECK(put_file("roi:/hostname", "testbox\n", 0644) && value_is("info:/hostname", "testbox"), 525);
+    CHECK(put_file("roi:/hostname", "Bad_Host\n", 0644) && value_is("info:/hostname", "nyxis"), 526);
+    CHECK(put_file("roi:/hostname", "-x", 0644) && value_is("info:/hostname", "nyxis"), 527);
+    CHECK(put_file("roi:/hostname", "edge\n", 0600) && value_is("info:/hostname", "edge"), 528);   /* 모드와 무관 (커널 권한) */
+    CHECK(nx_remove_node("roi:/hostname") == 0 && value_is("info:/hostname", "nyxis"), 529);
+    CHECK(put_file("roi:/hostname", "nyxis\n", 0644) && value_is("info:/hostname", "nyxis"), 530);
+
+    /* roi:/timezone 도 같은 규칙 (기본값 Europe/London) */
+    CHECK(put_file("roi:/timezone", "Asia/Seoul\n", 0644) && value_is("info:/timezone", "Asia/Seoul"), 537);
+    CHECK(value_is("info:/utc_offset", "+00:00"), 542);                   /* 이름이 바뀌어도 오프셋은 그대로 (계산 없음) */
+    CHECK(put_file("roi:/timezone", "../etc\n", 0644) && value_is("info:/timezone", "Europe/London"), 538);
+    CHECK(nx_remove_node("roi:/timezone") == 0 && value_is("info:/timezone", "Europe/London"), 539);
+    CHECK(put_file("roi:/timezone", "Europe/London\n", 0644) && value_is("info:/timezone", "Europe/London"), 540);
+
+    /* 틀과 사용자 공간 (빌드 때 mkrootfs 가 복사) */
+    CHECK(value_is("roi:/default/shell", "app:/nysh.run") && value_is("roi:/1000/shell", "app:/nysh.run") &&
+          value_is("roi:/0/shell", "app:/nysh.run"), 531);
+    CHECK(nx_read_dir("roi:/default/app", 0, &de) == NX_E_NOT_FOUND, 532);  /* 빈 디렉터리 (.keep 은 안 들어간다) */
+    return 0;
+}
+
 /* ---------------- 인증 / 토큰 / 신원 ---------------- */
 
 static int read_test_password(char *pw, unsigned long max)
@@ -276,6 +427,7 @@ static int auth_tests(void)
     char buf[64];
     struct nx_stat st;
     struct nx_msginfo info;
+    struct nx_identity id;
     long tok;
     long priv;
     long pub;
@@ -290,6 +442,10 @@ static int auth_tests(void)
     CHECK(tok >= 0, 403);
     CHECK(nx_stat(tok, &st) == 0 && st.type == NX_TYPE_TOKEN, 404);
     CHECK(nx_dup(tok, NX_RIGHT_ALL) == NX_E_PERMISSION, 405);                  /* 일회용: DUP 권한이 없다 */
+    CHECK(nx_token_identity(tok, &id) == 0 && id.uid == 1000 && id.gid == 1000 && nx_strcmp(id.name, "test") == 0, 414);
+    CHECK(nx_stat(tok, &st) == 0, 415);                                        /* 조회는 토큰을 소모하지 않는다 */
+    CHECK(nx_token_identity(NX_HANDLE_STDOUT, &id) == NX_E_INVALID_ARG, 416);  /* 토큰이 아니다 (0 = stdin = NX_NO_TOKEN) */
+    CHECK(nx_identity(&id) == 0 && id.uid == 0, 417);                          /* 자신은 그대로 root */
 
     priv = nx_channel_create("svc:/sys/elftest-priv", 0);                     /* root 만 보낼 수 있음 */
     pub = nx_channel_create("svc:/sys/elftest-pub", NX_CHAN_PUBLIC);
@@ -351,6 +507,40 @@ int elftest_user_mode(void)
     (void)nx_close(h);
 
     CHECK(nx_power_off() == NX_E_PERMISSION, 16);                             /* 끄는 건 root(init)만 */
+
+    /* roi:/<자기 uid>/ 만 */
+    {
+        struct nx_dirent de;
+        char buf[64];
+        int saw_app = 0;
+        int saw_shell = 0;
+        unsigned long i;
+
+        CHECK(value_is("roi:/1000/shell", "app:/nysh.run"), 17);                /* 관리자 값: 읽기 */
+        CHECK(nx_open("roi:/1000/shell", NX_O_WRITE) == NX_E_PERMISSION, 18);  /* 0444 root: 못 고침 */
+        CHECK(nx_remove_node("roi:/1000/shell") == NX_E_PERMISSION &&
+              nx_rename_node("roi:/1000/shell", "roi:/1000/app/shell") == NX_E_PERMISSION, 19);
+        CHECK(nx_create_node("roi:/1000/mine", NX_NODE_FILE, 0644) == NX_E_PERMISSION, 20);   /* 0500 */
+        CHECK(put_file("roi:/1000/app/editor", "dark\n", 0600) && value_is("roi:/1000/app/editor", "dark"), 21);
+        CHECK(nx_create_node("roi:/1000/app/sub", NX_NODE_DIR, 0700) == 0 && nx_remove_node("roi:/1000/app/sub") == 0, 22);
+        CHECK(nx_remove_node("roi:/1000/app/editor") == 0, 23);
+        for (i = 0; i < 8 && nx_read_dir("roi:/1000", i, &de) == 0; i++) {
+            if (nx_strcmp(de.name, "app") == 0 && de.type == NX_TYPE_DIR)
+                saw_app = 1;
+            if (nx_strcmp(de.name, "shell") == 0)
+                saw_shell = 1;
+        }
+        CHECK(saw_app && saw_shell, 24);
+        CHECK(nx_open("roi:/hostname", NX_O_READ) == NX_E_PERMISSION &&
+              nx_open("roi:/default/shell", NX_O_READ) == NX_E_PERMISSION &&
+              nx_open("roi:/0/shell", NX_O_READ) == NX_E_PERMISSION, 25);
+        CHECK(nx_read_dir("roi:/", 0, &de) == NX_E_PERMISSION &&
+              nx_open("roi:/1000/../0/shell", NX_O_READ) == NX_E_PERMISSION &&
+              nx_open("roi:/01000/shell", NX_O_READ) == NX_E_PERMISSION, 26);
+        CHECK(nx_create_node("roi:/1001", NX_NODE_DIR, 0700) == NX_E_PERMISSION, 27);
+        CHECK(value_is("info:/hostname", "nyxis") && nx_read_value("info:/uptime_ms", buf, sizeof(buf)) > 0, 28);
+        CHECK(nx_open("info:/hostname", NX_O_WRITE) == NX_E_PERMISSION, 29);
+    }
     return 0;
 }
 
@@ -375,6 +565,9 @@ int elftest_system_tests(void)
     if (r)
         return r;
     r = channel_tests();
+    if (r)
+        return r;
+    r = registry_tests();
     if (r)
         return r;
     return auth_tests();

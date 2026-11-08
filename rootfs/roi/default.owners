@@ -1,0 +1,7 @@
+# roi:/default/ 틀의 모드와 소유자 (tools/mkrootfs.py 가 읽는다)
+#   <틀 안의 경로> <모드(8진수)> <root|user>
+#   user = 새 사용자 소유 (이미지의 roi:/default/ 에는 NX_UID_TEMPLATE 으로, roi:/<uid>/ 에는 그 uid/gid 로)
+#   표에 없는 항목: 파일 0644 user, 디렉터리 0700 user.  "." 는 틀 디렉터리 자체 (= roi:/<uid>/)
+.       0500 user
+app     0700 user
+shell   0444 root

@@ -84,6 +84,8 @@ static utf8 translate(u8 sc)
     /* Ctrl+문자 -> 제어 문자 (Ctrl-D = 0x04, Ctrl-U = 0x15 ...) */
     if (ctrl && ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')))
         c = (utf8)(c & 0x1F);
+    else if (ctrl && c == '\\')
+        c = (utf8)0x1C;                  /* Ctrl-\ (SIGQUIT) */
 
     return c;
 }
@@ -129,9 +131,26 @@ static utf8 handle_scancode(u8 sc)
         }
     }
 
-    /* ===== 일반 키 (확장키는 아직 문자로 바꾸지 않는다: 방향키 등) ===== */
-    c = extended ? 0 : translate(sc);
-    extended = 0;
+    /* ===== 확장키: 편집 키는 줄 편집기로, 나머지는 무시 ===== */
+    if (extended) {
+        extended = 0;
+        switch (sc) {
+        case 0x48: tty_input_key(TTY_KEY_UP); break;
+        case 0x50: tty_input_key(TTY_KEY_DOWN); break;
+        case 0x4B: tty_input_key(TTY_KEY_LEFT); break;
+        case 0x4D: tty_input_key(TTY_KEY_RIGHT); break;
+        case 0x47: tty_input_key(TTY_KEY_HOME); break;
+        case 0x4F: tty_input_key(TTY_KEY_END); break;
+        case 0x53: tty_input_key(TTY_KEY_DELETE); break;
+        case 0x49: tty_input_key(TTY_KEY_PGUP); break;
+        case 0x51: tty_input_key(TTY_KEY_PGDN); break;
+        default: break;
+        }
+        return 0;
+    }
+
+    /* ===== 일반 키 ===== */
+    c = translate(sc);
     return c;
 }
 

@@ -47,10 +47,12 @@
 #define KERNEL_PROCESS_H
 
 #include "nyxis.h"
+#include "nyx_abi.h"
 #include "kernel/process/schedule.h"   /* schedule(): 다음 READY 프로세스로 양보 */
 #include "kernel/syscall/handles.h"      /* 프로세스별 핸들 테이블 */
 #include "kernel/paging/paging.h"        /* addr_space_t */
 #include "kernel/process/waitq.h"        /* waitq_t */
+#include "interrupt.h"                   /* struct trap_frame */
 
 #define PROCESS_MAX          16U
 #define PROCESS_KSTACK_SIZE  16384U
@@ -67,6 +69,8 @@ typedef enum {
 
 /* 스레드 진입 함수: 인자로 process_create 의 stack 값이 전달된다 */
 typedef void (*process_entry_t)(void *arg);
+
+#define PROCESS_FPU_STATE_SIZE 512   /* FXSAVE 영역 */
 
 typedef struct process {
     u32   pid;
@@ -96,10 +100,17 @@ typedef struct process {
     i32   exit_code;      /* 종료 코드 (NxProcessExit 인자, 예외로 죽으면 -1) */
 
     u32   parent_pid;     /* 생성한 프로세스의 pid (idle/부트 스레드가 만들었으면 0). 정보용 */
+    u32   pgid;           /* 프로세스 그룹 (Ctrl-C 가 함께 끝내는 묶음, NxProcessGroup). 만든 프로세스에게서
+                           * 물려받는다. 커널이 만든 프로세스는 자기 pid */
     u32   refs;           /* 이 슬롯을 참조하는 수 (프로세스 핸들 등). 0 이고 종료되었으면 슬롯 회수 */
     u32   slice_ticks;    /* 남은 타임슬라이스 (사용자 모드 선점, schedule.h) */
     u16   io_base;        /* ring3 에서 직접 in/out 할 수 있는 포트 범위 (dev:/com1 의 NX_DEVCMD_IOPERM). */
     u16   io_count;       /* 0 이면 없음. 전환할 때마다 TSS I/O 비트맵에 반영된다 */
+    u32   umask;          /* NxCreateNode 의 mode 에서 지울 비트 (NxSetUmask). fork/생성 시 물려준다 */
+
+    /* 실행 계층 (kernel/exec/exec.h) */
+    struct trap_frame *uframe;      /* 지금 처리 중인 시스템 콜의 사용자 레지스터 (syscall_handle 이 설정) */
+    struct trap_frame fork_frame;   /* fork 로 만든 자식: 처음 사용자 모드로 돌아갈 레지스터 (rax = 0) */
 
     waitq_t exit_waiters;          /* 이 프로세스의 종료를 기다리는 프로세스들 */
     waitq_entry_t *wait_entries;   /* 지금 매달려 있는 대기 항목들 (여러 큐 가능, NxPoll). 없으면 NULL */
@@ -107,8 +118,31 @@ typedef struct process {
 
     nx_handle_table_t handles;   /* 이 프로세스의 핸들 테이블 (stdin/stdout/stderr + 열린 파일) */
 
+    /* 신호 (kernel/process/signal.h). 집합은 비트 (sig - 1) */
+    struct {
+        u64 handler;             /* NX_SIG_DFL / NX_SIG_IGN / 사용자 주소 */
+        u64 restorer;
+        u32 mask;
+        u32 flags;
+    } sig_action[NX_SIG_MAX];
+    u32   sig_pending;           /* 와서 아직 처리하지 않은 신호 */
+    u32   sig_mask;              /* 막은 신호 */
+    u32   sig_suspend_mask;      /* NxSignalSuspend 직전의 막은 집합 (sig_suspended 일 때) */
+    u32   sig_sender[NX_SIG_MAX];  /* 대기 중인 신호를 보낸 pid (nx_siginfo) */
+    bool  sig_suspended;
+    bool  sig_woken;             /* 잠든 동안 신호가 깨웠다 (waitq_sleep 이 Ninterrupted 를 돌려준다) */
+    bool  sig_hold;              /* 신호로 깨우지 않는 잠 (로그인 실패 지연) */
+    bool  sig_iret;              /* NxSignalReturn: sysret 대신 iretq 로 돌아간다 (rcx/r11 까지 되돌리려고) */
+
     bool  in_use;
     struct process *next;
+
+    /* 사용자 FPU/x87/SSE 상태 (FXSAVE64 형식). process_switch 가 전환할 때마다 저장/복원한다
+     * (즉시 방식: CR0.TS 지연 전환을 쓰지 않는다). 커널 코드는 -mgeneral-regs-only 로 빌드되어
+     * 이 레지스터들을 건드리지 않으므로, 인터럽트/시스템 콜 경로에서는 따로 저장할 필요가 없다.
+     * 새 프로세스는 FNINIT 직후와 같은 상태(FCW 0x037F, MXCSR 0x1F80)로 시작한다 — 다른
+     * 프로세스의 레지스터 값이 새어 나가지 않는다. */
+    u8    fpu_state[PROCESS_FPU_STATE_SIZE] __attribute__((aligned(16)));
 } process_t;
 
 /* Global process state */
@@ -147,6 +181,9 @@ Nstatus process_terminate(u32 pid);
 
 /* proc 를 종료 코드 code 로 종료한다 (이미 끝났으면 아무것도 하지 않고 성공). 자기 자신이면 반환하지 않는다. */
 Nstatus process_kill(process_t *proc, i32 code);
+
+/* 그룹 pgid 의 살아 있는 프로세스가 모두 uid 이면 true (비어 있어도 true) */
+bool process_group_owned_by(u32 pgid, u32 uid);
 
 /* 참조 카운트. 참조를 가진 동안 proc 포인터는 유효하다(슬롯이 재사용되지 않는다). */
 void process_retain(process_t *proc);
@@ -189,6 +226,19 @@ void process_thread_exit(void) __attribute__((noreturn));
 
 /* switch.s */
 void cpu_switch_context(u64 *save_rsp, u64 new_rsp);
+
+/* 부팅 시 한 번: CR0/CR4 에서 x87/SSE 를 사용자 모드가 쓸 수 있게 켠다 (OSFXSR, OSXMMEXCPT, NE, MP) */
+void cpu_fpu_init(void);
+
+/*
+ * fork 의 자식 프로세스를 만든다 (READY). as 는 이미 복사된 사용자 주소 공간(소유권이 넘어간다),
+ * frame 은 부모가 시스템 콜에 들어온 순간의 사용자 레지스터. 신원/umask/힙 경계/FPU 상태는 부모(current)에서.
+ * 핸들 테이블은 호출자가 채운다 (nx_handles_inherit). 성공하면 *out_proc 에 참조 1 개.
+ */
+Nstatus process_create_forked(addr_space_t as, const struct trap_frame *frame, process_t **out_proc);
+
+/* kernel/exec/fork_return.s: frame 의 레지스터로 사용자 모드에 돌아간다 */
+void fork_return_to_user(struct trap_frame *frame) __attribute__((noreturn));
 void process_entry_trampoline(void);
 
 #endif /* KERNEL_PROCESS_H */

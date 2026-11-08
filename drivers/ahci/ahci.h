@@ -17,7 +17,15 @@
 
 #define SATA_SIG_ATA 0x00000101U
 
-#define ATA_CMD_READ_DMA_EX 0x25
+#define ATA_CMD_READ_DMA_EX    0x25
+#define ATA_CMD_WRITE_DMA_EX   0x35
+#define ATA_CMD_FLUSH_CACHE_EX 0xEA
+
+/* 명령 헤더 flags 의 W 비트: 호스트 -> 장치 (쓰기) */
+#define AHCI_CMD_HDR_WRITE (1U << 6)
+
+/* 파일시스템 콜백의 디스크 번호 = AHCI_DISKNO_BASE + 디스크 순번 (램디스크 0, 1 과 겹치지 않게) */
+#define AHCI_DISKNO_BASE 16U
 
 #define HBA_PX_CMD_ST   (1U << 0)
 #define HBA_PX_CMD_FRE  (1U << 4)
@@ -133,12 +141,20 @@ NX_STATIC_ASSERT(hba_port_size, sizeof(HBA_PORT) == 0x80);
 NX_STATIC_ASSERT(hba_mem_size, sizeof(HBA_MEM) == 0x100 + 32 * 0x80);
 
 Nstatus ahci_init(void);
-HBA_PORT *ahci_find_port(void);
-Nstatus ahci_read(
-    HBA_PORT *Port,
-    u64 StartLba,
-    u32 SectorCount,
-    void *Buffer
-);
+
+/* 섹터 단위 (Buffer 는 커널 이미지/HHDM 안의 연속 메모리, 2바이트 정렬) */
+Nstatus ahci_read(HBA_PORT *Port, u64 StartLba, u32 SectorCount, void *Buffer);
+Nstatus ahci_write(HBA_PORT *Port, u64 StartLba, u32 SectorCount, const void *Buffer);
+Nstatus ahci_flush(HBA_PORT *Port);
+
+/* 찾은 디스크 수. 디스크 번호는 AHCI_DISKNO_BASE .. AHCI_DISKNO_BASE + count - 1 */
+u32 ahci_disk_count(void);
+
+/* 바이트 단위 (nyfs 의 read/write 콜백 형식). 정렬 제약 없음 */
+Nstatus ahci_disk_read(u32 diskno, usize offset, void *buffer, usize size, NTBLI *info);
+Nstatus ahci_disk_write(u32 diskno, usize offset, const void *buffer, usize size, NTBLI *info);
+
+/* 모든 디스크의 쓰기 캐시를 매체로 (전원 끄기 전) */
+Nstatus ahci_flush_all(void);
 
 #endif /* AHCI_H */

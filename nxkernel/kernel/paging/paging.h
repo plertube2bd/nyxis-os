@@ -103,6 +103,14 @@ addr_space_t paging_kernel_addrspace(void);
 void paging_addrspace_destroy(addr_space_t *as);
 
 /*
+ * fork: src 의 사용자 영역에 매핑된 모든 페이지를 새 프레임에 복사해 dst(빈 주소 공간)의 같은 주소에
+ * 같은 권한으로 매핑한다. PAGE_NOFREE 매핑(장치 MMIO, 커널 소유 페이지)은 복사하지 않는다 —
+ * 그 소유권은 자식에게 넘어가지 않는다. 실패하면(메모리 부족) dst 에 일부만 남는다: 호출자가 dst 를 파기한다.
+ * 쓰기 시 복사(COW)가 아니라 즉시 복사다.
+ */
+Nstatus paging_addrspace_clone_user(const addr_space_t *src, addr_space_t *dst);
+
+/*
  * 4KiB 페이지 하나를 as 의 사용자 영역에 매핑한다. phys(물리 주소)/virt 는 4KiB 정렬이어야 한다.
  * virt 는 사용자 공간(< USER_SPACE_END)이어야 한다.
  * 정책: 쓰기 가능(PAGE_RW)이면서 실행 가능(NX 없음)인 매핑은 거부한다 (W^X).

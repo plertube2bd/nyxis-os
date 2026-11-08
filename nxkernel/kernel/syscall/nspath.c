@@ -34,6 +34,7 @@ Nstatus nsp_translate(const char *user_path, char *out, usize out_max, u32 *out_
     u32 depth = 0;
     u32 kind = NSP_KIND_VFS;
     bool root_only = false;
+    bool roi = false;                   /* roi:/ - 일반 사용자는 자기 uid 공간만 */
     process_t *self = current_process;
     usize len = 0;
     usize i;
@@ -62,15 +63,19 @@ Nstatus nsp_translate(const char *user_path, char *out, usize out_max, u32 *out_
         base = "fs:/usr";
     } else if (strcmp(prefix, "roi") == 0) {
         base = "fs:/roi";
-        root_only = true;
+        roi = true;
+    } else if (strcmp(prefix, "info") == 0) {
+        base = "";
+        kind = NSP_KIND_INFO;
     } else if (strcmp(prefix, "face") == 0) {
         base = nNULL;                    /* 아래에서 사용자 이름으로 만든다 */
     } else if (strcmp(prefix, "tmp") == 0) {
         base = "tmp:";
+    } else if (strcmp(prefix, "disk") == 0) {
+        base = "disk:";
     } else if (strcmp(prefix, "dev") == 0) {
         base = "";
-        kind = NSP_KIND_DEV;
-        root_only = true;
+        kind = NSP_KIND_DEV;            /* uid 0 만 (표준 스트림 이름은 예외: 아래 nsp_dev_is_public) */
     } else if (strcmp(prefix, "svc") == 0) {
         base = "";
         kind = NSP_KIND_SVC;
@@ -115,6 +120,29 @@ Nstatus nsp_translate(const char *user_path, char *out, usize out_max, u32 *out_
         depth++;
     }
 
+    /*
+     * roi:/ 의 사용자 경계: uid 0 이 아니면 첫 구성요소가 자기 uid(10진수)인 경로만 허용한다
+     * (roi:/ 자체, roi:/default, roi:/hostname, 남의 uid 공간은 Npermission). 정규화가 끝난 구성요소로
+     * 검사하므로 roi:/1000/../0 같은 경로도 막힌다. 공간 안의 세부 권한은 nyfs 모드/소유자가 정한다.
+     */
+    if (roi && self->uid != 0) {
+        char want[11];
+        u32 v = self->uid;
+        usize wn = 0;
+        usize k;
+
+        do {
+            want[wn++] = (char)('0' + (v % 10U));
+            v /= 10U;
+        } while (v);
+        if (depth == 0 || lens[0] != wn)
+            return Npermission;
+        for (k = 0; k < wn; k++) {
+            if (starts[0][k] != want[wn - 1U - k])
+                return Npermission;
+        }
+    }
+
     out[0] = '\0';
     if (kind != NSP_KIND_VFS) {
         /* 장치/서비스 이름: 구성요소를 '/' 로 잇는다 (앞에 '/' 없음) */
@@ -124,8 +152,11 @@ Nstatus nsp_translate(const char *user_path, char *out, usize out_max, u32 *out_
             if (NSTATUS_IS_ERR(status = append(out, out_max, &len, starts[i], lens[i])))
                 return status;
         }
-        if (depth == 0)
+        if (depth == 0 && kind != NSP_KIND_INFO && kind != NSP_KIND_DEV)
             return NnotFound;
+        /* dev:/ 자체(이름 "")는 누구나 나열할 수 있다: 목록에는 그 사용자가 열 수 있는 것만 나온다 */
+        if (kind == NSP_KIND_DEV && self->uid != 0 && depth != 0 && !nsp_dev_is_public(out))
+            return Npermission;
         *out_kind = kind;
         return NSTATUS_OK;
     }
@@ -153,6 +184,12 @@ Nstatus nsp_translate(const char *user_path, char *out, usize out_max, u32 *out_
 
     *out_kind = NSP_KIND_VFS;
     return NSTATUS_OK;
+}
+
+bool nsp_dev_is_public(const char *name)
+{
+    return name && (strcmp(name, "stdin") == 0 || strcmp(name, "stdout") == 0 ||
+                    strcmp(name, "stderr") == 0 || strcmp(name, "tty") == 0);
 }
 
 Nstatus nsp_check_protected(const char *vfs_path, u32 op)

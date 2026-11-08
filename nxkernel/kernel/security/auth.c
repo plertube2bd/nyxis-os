@@ -3,6 +3,7 @@
  */
 
 #include "kernel/security/auth.h"
+#include "nyx_abi.h"
 #include "kernel/crypto/sha256.h"
 #include "kernel/mm/kheap.h"
 #include "drivers/filesystem/vfs.h"
@@ -112,6 +113,9 @@ static bool parse_line(const char *line, usize len, auth_user_t *u)
     memcpy(u->id.name, f[0], fl[0]);
     if (!parse_u32(f[1], fl[1], &u->id.uid) || !parse_u32(f[2], fl[2], &u->id.gid) ||
         !parse_u32(f[3], fl[3], &u->iterations))
+        return false;
+    /* uid/gid 의 위쪽 절반(2^31 이상)은 예약 (NX_UID_TEMPLATE 등): 그런 신원으로 로그인할 수 없다 */
+    if (u->id.uid >= NX_UID_RESERVED_MIN || u->id.gid >= NX_UID_RESERVED_MIN)
         return false;
     if (u->iterations < AUTH_MIN_ITERATIONS || u->iterations > AUTH_MAX_ITERATIONS)
         return false;

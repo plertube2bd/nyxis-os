@@ -18,6 +18,8 @@ $ cd nyxis
 $ echo "This operating system is incomplete."
 ```
 
+To build and run Nyxis OS on Linux (QEMU), see the [Linux build & install guide](docs/INSTALL.md) (Korean).
+
 ---
 
 ## ❓ Why should I use Nyxis OS?

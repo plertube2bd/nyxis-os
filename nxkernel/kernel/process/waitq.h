@@ -53,7 +53,7 @@ void waitq_init(waitq_t *q);
 /*
  * 현재 프로세스를 q 에 매달고 깨워질 때까지 재운다. 인터럽트가 꺼진 상태에서 불러야 한다.
  *   timeout_ticks: 0 이면 무기한, 아니면 그 tick 수가 지나면 Ntimeout 으로 돌아온다.
- * 반환: NSTATUS_OK(깨워짐) / Ntimeout / Npermission(idle) / Ninterrupted(전환할 대상이 없었음)
+ * 반환: NSTATUS_OK(깨워짐) / Ntimeout / Npermission(idle) / Ninterrupted(신호가 왔다, 또는 전환할 대상이 없었음)
  */
 Nstatus waitq_sleep_locked(waitq_t *q, u64 timeout_ticks);
 

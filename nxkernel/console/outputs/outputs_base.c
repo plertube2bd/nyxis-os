@@ -1,5 +1,5 @@
 /*
- * outputs_base.c - 16x16 비트맵 폰트와 프레임버퍼 글자 그리기
+ * outputs_base.c - 16x16 비트맵 폰트 / TrueType 8x16(CONFIG_FONT_8x16) 과 프레임버퍼 글자 그리기
  *
  * 폰트 형식: 글자 1개 = 32바이트. 한 행(row) = 2바이트(왼쪽 8픽셀, 오른쪽 8픽셀),
  * MSB 가 가장 왼쪽 픽셀. ASCII 0x20(space) ~ 0x7E(tilde) 까지 95글자.
@@ -134,29 +134,183 @@ const u8 *GetFont(char c)
 }
 
 /* ===================== */
+/* TrueType (8x16)        */
+/* ===================== */
+
+static bool g_font_inited = false;
+
+#ifdef CONFIG_FONT_8x16
+#include "console/fonts/ttf.h"
+
+#define TTF_CELL_W 8U
+#define TTF_CELL_H 16U
+
+/* console/fonts/font_blob.s 가 .rodata 에 넣은 폰트 파일 */
+extern const u8 nx_console_ttf_start[];
+extern const u8 nx_console_ttf_end[];
+
+/* ASCII 0x20..0x7E 를 미리 래스터화한 알파 비트맵 (0..255) */
+static u8   g_ttf_glyphs[FONT_CHAR_COUNT][TTF_CELL_H * TTF_CELL_W];
+static bool g_use_ttf = false;
+
+/* 고정폭 셀에 맞는 변환: 셀 높이(ascender-descender)와 셀 폭(진행 폭) 중 더 빡빡한 쪽에 맞추고 가운데 정렬 */
+static void ttf_cell_transform(const ttf_font *f, u16 advance, ttf_transform *xf)
+{
+    i32 units_h = (i32)f->ascender - (i32)f->descender;
+    i32 adv = advance ? (i32)advance : (i32)f->units_per_em / 2;
+    i32 content_w;
+    i32 content_h;
+
+    if ((i64)TTF_CELL_W * units_h < (i64)TTF_CELL_H * adv) {
+        xf->scale_num = (i32)TTF_CELL_W;
+        xf->scale_den = adv;
+    } else {
+        xf->scale_num = (i32)TTF_CELL_H;
+        xf->scale_den = units_h;
+    }
+
+    /* 1/256 px */
+    content_w = (i32)((i64)adv * xf->scale_num * 256 / xf->scale_den);
+    content_h = (i32)((i64)units_h * xf->scale_num * 256 / xf->scale_den);
+    xf->origin_x = ((i32)TTF_CELL_W * 256 - content_w) / 2;
+    xf->baseline_y = ((i32)TTF_CELL_H * 256 - content_h) / 2
+                   + (i32)((i64)f->ascender * xf->scale_num * 256 / xf->scale_den);
+}
+
+static Nstatus ttf_font_init(void)
+{
+    ttf_font font;
+    ttf_transform xf;
+    Nstatus st;
+    u32 i;
+
+    st = ttf_init(&font, nx_console_ttf_start,
+                  (usize)(nx_console_ttf_end - nx_console_ttf_start));
+    if (NSTATUS_IS_ERR(st))
+        return st;
+
+    /* 고정폭 폰트 가정: '0' 의 진행 폭을 셀 폭으로 본다 */
+    ttf_cell_transform(&font, ttf_advance_width(&font, ttf_glyph_index(&font, '0')), &xf);
+
+    for (i = 0; i < FONT_CHAR_COUNT; i++) {
+        u16 g = ttf_glyph_index(&font, FONT_FIRST_CHAR + i);
+
+        st = ttf_render_glyph(&font, g, &xf, g_ttf_glyphs[i], TTF_CELL_W, TTF_CELL_H);
+        if (NSTATUS_IS_ERR(st))
+            return st;
+    }
+
+    g_use_ttf = true;
+    return NSTATUS_OK;
+}
+
+/* 채널별 선형 혼합 (RGB/BGR 어느 쪽이든 fg/bg 가 같은 형식이면 맞다) */
+static u32 blend_px(u32 fg, u32 bg, u32 a)
+{
+    u32 out = 0;
+    u32 shift;
+
+    if (a == 0)
+        return bg;
+    if (a >= 255)
+        return fg;
+
+    for (shift = 0; shift < 24; shift += 8) {
+        u32 f = (fg >> shift) & 0xFFU;
+        u32 b = (bg >> shift) & 0xFFU;
+
+        out |= ((f * a + b * (255U - a) + 127U) / 255U) << shift;
+    }
+    return out;
+}
+
+/* (fg, bg) 쌍의 알파 0..255 혼합표. 색이 바뀔 때만 다시 만든다 (픽셀마다 나눗셈을 하지 않도록) */
+static u32  g_blend_lut[256];
+static u32  g_blend_fg = 0;
+static u32  g_blend_bg = 0;
+static bool g_blend_valid = false;
+
+static void draw_ttf_cell(u32 *fb, u32 stride, u32 x, u32 y, utf8 c, u32 fg, u32 bg)
+{
+    const u8 *alpha;
+    u32 row;
+    u32 col;
+
+    if (!g_blend_valid || fg != g_blend_fg || bg != g_blend_bg) {
+        u32 a;
+
+        for (a = 0; a < 256U; a++)
+            g_blend_lut[a] = blend_px(fg, bg, a);
+        g_blend_fg = fg;
+        g_blend_bg = bg;
+        g_blend_valid = true;
+    }
+
+    if (c < FONT_FIRST_CHAR || c > FONT_LAST_CHAR)
+        c = FONT_FIRST_CHAR;   /* 범위 밖 문자는 공백 */
+    alpha = g_ttf_glyphs[c - FONT_FIRST_CHAR];
+
+    for (row = 0; row < TTF_CELL_H; row++) {
+        u32 *line = &fb[(usize)(y + row) * stride + x];
+
+        for (col = 0; col < TTF_CELL_W; col++)
+            line[col] = g_blend_lut[alpha[row * TTF_CELL_W + col]];
+    }
+}
+#endif /* CONFIG_FONT_8x16 */
+
+Nstatus font_init(void)
+{
+    static Nstatus result = NSTATUS_OK;
+
+    if (g_font_inited)
+        return result;
+    g_font_inited = true;
+
+#ifdef CONFIG_FONT_8x16
+    result = ttf_font_init();
+#endif
+    return result;
+}
+
+bool font_is_ttf(void)
+{
+#ifdef CONFIG_FONT_8x16
+    return g_use_ttf;
+#else
+    return false;
+#endif
+}
+
+u32 font_cell_width(void)
+{
+#ifdef CONFIG_FONT_8x16
+    if (g_use_ttf)
+        return TTF_CELL_W;
+#endif
+    return FONT_WIDTH;
+}
+
+u32 font_cell_height(void)
+{
+#ifdef CONFIG_FONT_8x16
+    if (g_use_ttf)
+        return TTF_CELL_H;
+#endif
+    return FONT_HEIGHT;
+}
+
+/* ===================== */
 /* Fast Char Drawing      */
 /* ===================== */
 
-/*
- * (x, y) 를 좌상단으로 16x16 글자 하나를 그린다.
- * 주의: 범위 검사를 하지 않는다. 호출자가 (x+16, y+16) 이 프레임버퍼 안임을 보장해야 한다.
- */
-Nstatus draw_char_fast(
-    u32 *fb,
-    u32  pixels_per_scanline,
-    u32  x,
-    u32  y,
-    utf8 c,
-    u32  fg,
-    u32  bg
-) {
+/* 16x16 비트맵 글자 하나 */
+static void draw_bitmap_cell(u32 *fb, u32 pixels_per_scanline, u32 x, u32 y, utf8 c, u32 fg, u32 bg)
+{
     const u8 *glyph;
     u32 line_buffer[16]; /* 16px 폭 */
     u32 row;
     u32 bit;
-
-    if (!fb || !pixels_per_scanline)
-        return NinvalidArg;
 
     glyph = GetFont((char)c);
 
@@ -178,13 +332,37 @@ Nstatus draw_char_fast(
             sizeof(line_buffer)
         );
     }
+}
 
+/*
+ * (x, y) 를 좌상단으로 글자 셀 하나(font_cell_width() x font_cell_height())를 그린다.
+ * 주의: 범위 검사를 하지 않는다. 호출자가 셀 전체가 프레임버퍼 안임을 보장해야 한다.
+ */
+Nstatus draw_char_fast(
+    u32 *fb,
+    u32  pixels_per_scanline,
+    u32  x,
+    u32  y,
+    utf8 c,
+    u32  fg,
+    u32  bg
+) {
+    if (!fb || !pixels_per_scanline)
+        return NinvalidArg;
+
+#ifdef CONFIG_FONT_8x16
+    if (g_use_ttf) {
+        draw_ttf_cell(fb, pixels_per_scanline, x, y, c, fg, bg);
+        return NSTATUS_OK;
+    }
+#endif
+    draw_bitmap_cell(fb, pixels_per_scanline, x, y, c, fg, bg);
     return NSTATUS_OK;
 }
 
 /*
  * 화면 크기(width x height)와 스캔라인 폭을 받아 경계를 검사한 뒤 그린다.
- * 글자 전체가 화면 안에 들어오지 않으면 아무것도 그리지 않고 NinvalidArg 를 반환한다.
+ * 글자 셀 전체가 화면 안에 들어오지 않으면 아무것도 그리지 않고 NinvalidArg 를 반환한다.
  */
 Nstatus draw_char_bounded(
     u32 *fb,
@@ -203,7 +381,7 @@ Nstatus draw_char_bounded(
     /* 뺄셈 전에 먼저 비교하여 u32 언더플로/오버플로를 원천 차단 */
     if (x > width || y > height)
         return NinvalidArg;
-    if (width - x < FONT_WIDTH || height - y < FONT_HEIGHT)
+    if (width - x < font_cell_width() || height - y < font_cell_height())
         return NinvalidArg;
 
     return draw_char_fast(fb, pixels_per_scanline, x, y, c, fg, bg);

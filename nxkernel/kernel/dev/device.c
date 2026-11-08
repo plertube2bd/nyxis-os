@@ -7,6 +7,7 @@
 #include "kernel/process/umem.h"
 #include "kernel/paging/paging.h"
 #include "console/outputs/printk.h"
+#include "console/outputs/conout.h"
 #include "console/outputs/serial.h"
 #include "console/inputs/tty.h"
 #include "drivers/ramdisk/ramdisk.h"
@@ -93,6 +94,11 @@ static nx_device_t *find_device(const char *name)
     return nNULL;
 }
 
+const char *device_name_at(u32 index)
+{
+    return index < g_device_count ? g_devices[index].name : nNULL;
+}
+
 Nstatus device_open(const char *name, bool write, nx_device_t **out)
 {
     nx_device_t *d;
@@ -127,9 +133,9 @@ Nstatus device_open(const char *name, bool write, nx_device_t **out)
             d->owner = current_process;
             /* 커널이 비켜 준다 */
             if (d->kind == NX_DEV_FRAMEBUFFER) {
-                printk_set_fb_enabled(false);
+                conout_set_fb_enabled(false);
             } else {
-                printk_set_serial_enabled(false);
+                conout_set_serial_enabled(false);
                 tty_set_serial_rx(false);
             }
         }
@@ -170,7 +176,7 @@ void device_close(nx_device_t *dev, struct process *owner, bool write)
                 (void)paging_unmap_page(&owner->addrspace, (void *)(usize)(dev->mapped_va + off));
         }
         dev->mapped_va = 0;
-        printk_set_fb_enabled(true);
+        conout_set_fb_enabled(true);
     } else {
         if (owner->io_count) {
             owner->io_base = 0;
@@ -178,7 +184,7 @@ void device_close(nx_device_t *dev, struct process *owner, bool write)
             if (owner == current_process)
                 gdt_set_io_permission(0, 0);
         }
-        printk_set_serial_enabled(true);
+        conout_set_serial_enabled(true);
         tty_set_serial_rx(true);
     }
     dev->owner = nNULL;

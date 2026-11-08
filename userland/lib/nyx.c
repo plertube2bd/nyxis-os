@@ -34,7 +34,8 @@ long nx_seek(long h, long offset, unsigned long whence) { return SC3(NX_SYS_SEEK
 long nx_stat(long h, struct nx_stat *out) { return SC2(NX_SYS_STAT, h, out); }
 long nx_dup(long h, unsigned long rights) { return SC2(NX_SYS_DUPLICATE_HANDLE, h, rights); }
 long nx_sleep(unsigned long ms) { return SC1(NX_SYS_SLEEP, ms); }
-long nx_identity(struct nx_identity *out) { return SC1(NX_SYS_GET_IDENTITY, out); }
+long nx_identity(struct nx_identity *out) { return SC2(NX_SYS_GET_IDENTITY, out, NX_NO_TOKEN); }
+long nx_token_identity(long token, struct nx_identity *out) { return SC2(NX_SYS_GET_IDENTITY, out, token); }
 long nx_authenticate(const char *name, const char *password) { return SC2(NX_SYS_AUTHENTICATE, name, password); }
 long nx_kill(long h) { return SC1(NX_SYS_PROCESS_KILL, h); }
 long nx_process_info(long h, struct nx_procinfo *out) { return SC2(NX_SYS_PROCESS_INFO, h, out); }
@@ -201,4 +202,36 @@ long nx_readline(char *buf, unsigned long max)
         nx_wipe(tmp, sizeof(tmp));
         return (long)len;
     }
+}
+
+long nx_read_value(const char *path, char *buf, unsigned long max)
+{
+    long h;
+    long total = 0;
+    long n;
+    char extra;
+
+    if (max == 0)
+        return NX_E_INVALID_ARG;
+    h = nx_open(path, NX_O_READ);
+    if (h < 0)
+        return h;
+    while ((unsigned long)total < max - 1) {
+        n = nx_read(h, buf + total, max - 1 - (unsigned long)total);
+        if (n < 0) {
+            (void)nx_close(h);
+            return n;
+        }
+        if (n == 0)
+            break;
+        total += n;
+    }
+    n = ((unsigned long)total == max - 1) ? nx_read(h, &extra, 1) : 0;
+    (void)nx_close(h);
+    if (n > 0)
+        return NX_E_BUF_OVERFLOW;
+    if (total > 0 && buf[total - 1] == '\n')
+        total--;
+    buf[total] = '\0';
+    return total;
 }

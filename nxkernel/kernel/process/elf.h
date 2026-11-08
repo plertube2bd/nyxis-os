@@ -8,8 +8,9 @@
  *
  * 제약 (지금 버전, 문서화된 한계):
  *  - ET_EXEC, x86_64, 리틀 엔디언만 지원한다 (동적 링크/PIE 는 지원하지 않는다).
- *  - 모든 PT_LOAD 세그먼트의 p_vaddr 는 4KiB 정렬이어야 한다 (표준 링커가 만드는
- *    파일은 대부분 이 조건을 만족한다). 아니면 NinvalidFormat.
+ *  - PT_LOAD 세그먼트는 ELF 규칙대로 p_vaddr % 4KiB == p_offset % 4KiB 이어야 한다 (페이지 중간에서
+ *    시작해도 된다: tcc 가 이렇게 만든다). 세그먼트끼리 같은 페이지를 나눠 쓰면 거부한다 (W^X).
+ *    아니면 NinvalidFormat.
  *  - 세그먼트가 쓰기 가능하면서 실행 가능하면 거부한다 (W^X, paging_map_page 가 강제).
  */
 #ifndef KERNEL_PROCESS_ELF_H

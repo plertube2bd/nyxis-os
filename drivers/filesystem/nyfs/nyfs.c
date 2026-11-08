@@ -49,7 +49,7 @@
 #include "nyxis.h"
 
 #define NYFS_MAX_VOLUMES              8U
-#define NYFS_MAX_VNODE_DATA           256U
+#define NYFS_MAX_VNODE_DATA           640U   /* VFS 의 vnode 수(VFS_MAX_VNODES) 보다 넉넉히 */
 #define NYFS_MAX_HANDLES              128U
 #define NYFS_DIRHASH_DEFAULT_BUCKETS  16U
 
@@ -1515,11 +1515,24 @@ static Nstatus nyfs_open(vnode_t *vnode, u32 flags, handle_t *out_handle)
     if (flags & NX_O_WRITE) {
         requested |= NYFS_ACE_WRITE_DATA;
     }
+    if (flags & VFS_O_EXEC) {
+        /* 실행: 일반 파일이어야 하고 EXECUTE 권한이 있어야 한다 */
+        if (inode.type == NYFS_INO_TYPE_DIR) {
+            return Npermission;
+        }
+        requested |= NYFS_ACE_EXECUTE;
+    }
 
     nyfs_current_cred(&cred);
     status = nyfs_check_access(data->vol, &inode, &cred, requested);
     if (NSTATUS_IS_ERR(status)) {
         return status;
+    }
+    /* root 는 모든 검사를 우회하지만, 실행만은 UNIX 관례대로 실행 비트가 하나라도 있어야 한다
+     * (실행 파일이 아닌 것을 root 가 실수로 실행하지 않도록) */
+    if ((flags & VFS_O_EXEC) && cred.uid == 0 && inode.ace_count == 0 && inode.acl_overflow_count == 0
+        && (inode.unix_mode & (NYFS_MODE_IXUSR | NYFS_MODE_IXGRP | NYFS_MODE_IXOTH)) == 0) {
+        return Npermission;
     }
 
     if ((flags & NX_O_WRITE) && !data->vol->write) {
@@ -1616,6 +1629,11 @@ static Nstatus nyfs_write(handle_t *handle, const void *buffer, usize size, usiz
     return Nok;
 }
 
+static void nyfs_release(vnode_t *vnode)
+{
+    nyfs_free_vnode_data((nyfs_vnode_data_t *)vfs_get_vnode_private(vnode));
+}
+
 static Nstatus nyfs_close(handle_t *handle)
 {
     if (!handle) {
@@ -1649,7 +1667,44 @@ static Nstatus nyfs_stat(vnode_t *vnode, vfs_stat_t *out)
     out->size = inode.size;
     out->type = (inode.type == NYFS_INO_TYPE_DIR) ? 2U : 1U;
     out->reserved = 0;
+    out->mode = (u32)inode.unix_mode & 0777U;
+    out->uid = inode.uid;
+    out->gid = inode.gid;
     return Nok;
+}
+
+/*
+ * 권한 비트 바꾸기 (chmod). 소유자 또는 root 만 할 수 있다 (UNIX 관례: 권한이 없는 파일이라도 소유자는
+ * 바꿀 수 있다). setuid/setgid/sticky 는 지원하지 않으므로 0777 만 바꾼다.
+ * ACL 이 있는 항목은 ACL 이 권한을 정하므로(nyfs_check_access) 모드 비트는 정보로만 남는다.
+ */
+static Nstatus nyfs_chmod(vnode_t *vnode, u32 mode)
+{
+    nyfs_vnode_data_t *data;
+    nyfs_inode_t inode;
+    nyfs_cred_t cred;
+    Nstatus status;
+
+    if (!vnode || (mode & ~0777U) != 0) {
+        return NinvalidArg;
+    }
+    data = (nyfs_vnode_data_t *)vfs_get_vnode_private(vnode);
+    if (!data || !data->vol) {
+        return NinvalidArg;
+    }
+    status = nyfs_read_inode(data->vol, data->ino, &inode);
+    if (NSTATUS_IS_ERR(status)) {
+        return status;
+    }
+    nyfs_current_cred(&cred);
+    if (cred.uid != 0 && cred.uid != inode.uid) {
+        return Npermission;
+    }
+    if (!data->vol->write) {
+        return NreadOnly;
+    }
+    inode.unix_mode = (u16)((inode.unix_mode & ~0777U) | (mode & 0777U));
+    return nyfs_write_inode(data->vol, data->ino, &inode);
 }
 
 static Nstatus nyfs_create(vnode_t *dir, const char *name, u32 mode, vnode_t **out_vnode)
@@ -2502,6 +2557,8 @@ Nstatus nyfs_register(void)
     g_nyfs_ops.unlink = nyfs_unlink;
     g_nyfs_ops.readdir = nyfs_readdir;
     g_nyfs_ops.rename = nyfs_rename;
+    g_nyfs_ops.chmod = nyfs_chmod;
+    g_nyfs_ops.release = nyfs_release;
 
     ops.mount = nyfs_mount;
     ops.unmount = nyfs_unmount;

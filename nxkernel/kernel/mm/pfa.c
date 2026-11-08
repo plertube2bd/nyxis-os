@@ -13,8 +13,11 @@
 
 static u64 g_free_head = 0;      /* 자유 리스트 머리 (물리 주소), 0 = 비어 있음 */
 static u64 g_free_count = 0;
+static u64 g_total_count = 0;    /* 초기화 직후 자유 프레임 수 (info:/memory/total_kib) */
 static bool g_initialized = false;
 static spinlock_t g_pfa_lock;
+static u64 g_reserve_size = 0;    /* pfa_set_boot_reserve: 떼어 둘 크기 (페이지 정렬) */
+static u64 g_reserve_phys = 0;    /* 떼어 둔 곳 (0 = 없음) */
 
 static u64 align_up(u64 v, u64 a)
 {
@@ -42,6 +45,22 @@ static void push_free_locked(u64 phys)
     *node = g_free_head;
     g_free_head = phys;
     g_free_count++;
+}
+
+void pfa_set_boot_reserve(u64 bytes)
+{
+    if (!g_initialized)
+        g_reserve_size = (bytes + PFA_PAGE_SIZE - 1) & ~(PFA_PAGE_SIZE - 1);
+}
+
+Nstatus pfa_boot_reserve(u64 *out_phys)
+{
+    if (!out_phys)
+        return NinvalidArg;
+    if (g_reserve_phys == 0)
+        return NoutOfMemory;
+    *out_phys = g_reserve_phys;
+    return NSTATUS_OK;
 }
 
 Nstatus pfa_init(
@@ -91,8 +110,19 @@ Nstatus pfa_init(
         start = align_up(start, PFA_PAGE_SIZE);
         end = align_down(end, PFA_PAGE_SIZE);
 
+        /* 연속 영역 떼어 두기: 이 구간의 끝에서, 커널/initrd/낮은 영역과 겹치지 않으면 */
+        if (g_reserve_size && !g_reserve_phys && end - start >= g_reserve_size) {
+            u64 w = end - g_reserve_size;
+
+            if (w >= PFA_LOW_RESERVED && !ranges_overlap(w, end, kernel_phys_start, kernel_phys_end) &&
+                !(initrd_phys_start < initrd_phys_end && ranges_overlap(w, end, initrd_phys_start, initrd_phys_end)))
+                g_reserve_phys = w;
+        }
+
         for (; start < end; start += PFA_PAGE_SIZE) {
             if (start < PFA_LOW_RESERVED)
+                continue;
+            if (g_reserve_phys && start >= g_reserve_phys && start < g_reserve_phys + g_reserve_size)
                 continue;
             if (ranges_overlap(start, start + PFA_PAGE_SIZE, kernel_phys_start, kernel_phys_end))
                 continue;
@@ -104,6 +134,7 @@ Nstatus pfa_init(
         }
     }
 
+    g_total_count = g_free_count;
     g_initialized = true;
     return NSTATUS_OK;
 }
@@ -152,4 +183,9 @@ Nstatus pfa_free(u64 phys)
 u64 pfa_free_count(void)
 {
     return g_free_count;
+}
+
+u64 pfa_total_count(void)
+{
+    return g_total_count;
 }

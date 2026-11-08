@@ -11,6 +11,7 @@
 #include "nyxis.h"
 #include "lowlevel.h"
 #include "console/outputs/printk.h"
+#include "console/outputs/conout.h"
 #include "kernel/error_handling/panic.h"
 
 void kernel_panic_simple(const char *Message, Nstatus error)
@@ -18,12 +19,12 @@ void kernel_panic_simple(const char *Message, Nstatus error)
     cli();
 
     /* 장치 소유권(dev:/fb0, dev:/com1)과 무관하게 모든 출력으로 쓴다: 죽은 이유는 항상 보여야 한다 */
-    printk_force_all_outputs();
+    conout_force_all_outputs();
 
     printk("\n");
-    printk("=========================================\n");
-    printk("             KERNEL PANIC!\n");
-    printk("=========================================\n");
+    printk(KC_BOLD KC_RED "=========================================\n");
+    printk(KC_BOLD KC_RED "             KERNEL PANIC!\n");
+    printk(KC_BOLD KC_RED "=========================================\n");
     printk("%s\n", Message ? Message : "(no message)");
     printk("status: %r\n", error);
     printk("System halted.\n");

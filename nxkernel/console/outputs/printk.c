@@ -1,5 +1,5 @@
 /*
- * printk.c - 커널 로그 출력
+ * printk.c - 커널 로그 출력 (서식 처리만. 글자는 console/outputs/conout.c 장치로 보낸다)
  *
  * [수정 이력 요약]
  *  - 512바이트 스택 버퍼에 먼저 포맷하던 구조를 "글자 단위 스트리밍" 으로 변경.
@@ -18,156 +18,32 @@
 
 #include "nyxis.h"
 #include "memory.h"
-#include "console/outputs/outputs_base.h"
-#include "console/outputs/serial.h"
+#include "console/outputs/conout.h"
 #include <stdarg.h>
 
 #include "console/outputs/printk.h"
+#include "console/outputs/ansi.h"
+#include "lowlevel.h"
 
-/* 프레임버퍼 콘솔 상태 */
-static u32 *g_fb = nNULL;
-static u32  g_stride = 0;          /* 한 줄의 픽셀 수 (pixels_per_scan_line) */
-static u32  g_screen_width = 0;
-static u32  g_screen_height = 0;
-static u32  g_cursor_x = 0;        /* 픽셀 단위 */
-static u32  g_cursor_y = 0;
-
-#define CONSOLE_FG  0xFFFFFFU
-#define CONSOLE_BG  0x000000U
-
-/* 비정상적으로 큰 해상도를 거부 (산술 오버플로/오설정 방지) */
-#define CONSOLE_MAX_DIM 16384U
-
-Nstatus printk_init(u32 *framebuffer, u32 pixels_per_scanline, u32 screen_width, u32 screen_height)
+/*
+ * 출력 경로 두 가지:
+ *   kput           서식 문자열(커널 코드의 리터럴)과 숫자: 커널용 터미널 해석기를 거친다 -> ANSI 색 사용 가능
+ *   kput_untrusted %s / %c 로 들어온 내용: 출력 가능한 ASCII 와 \n \r \t 만, 나머지는 '?'.
+ *                  외부에서 온 문자열(파일 이름, 사용자 이름 ...)이 이스케이프 시퀀스를 주입하지 못한다.
+ */
+static void kput(char c)
 {
-    usize row;
-
-    if (!framebuffer || !pixels_per_scanline || !screen_width || !screen_height)
-        return NinvalidArg;
-
-    if (screen_width > CONSOLE_MAX_DIM || screen_height > CONSOLE_MAX_DIM)
-        return NinvalidArg;
-
-    if (pixels_per_scanline < screen_width || pixels_per_scanline > CONSOLE_MAX_DIM * 2U)
-        return NinvalidArg;
-
-    if (screen_width < FONT_W || screen_height < FONT_H)
-        return NinvalidArg;
-
-    g_fb = framebuffer;
-    g_stride = pixels_per_scanline;
-    g_screen_width = screen_width;
-    g_screen_height = screen_height;
-    g_cursor_x = 0;
-    g_cursor_y = 0;
-
-    /* 화면 전체를 배경색으로 지운다 (부트로더가 남긴 텍스트/테스트 패턴 제거) */
-    for (row = 0; row < screen_height; row++) {
-        u32 col;
-        u32 *line = &g_fb[row * pixels_per_scanline];
-
-        for (col = 0; col < screen_width; col++)
-            line[col] = CONSOLE_BG;
-    }
-
-    return NSTATUS_OK;
+    ansi_kernel_feed((u8)c);
 }
 
-/* 한 줄(FONT_H 픽셀) 위로 스크롤하고 맨 아래 줄을 지운다 */
-static void console_scroll(void)
+static void kput_untrusted(char c)
 {
-    usize row;
-    usize rows_to_move = (usize)g_screen_height - FONT_H;
+    u8 uc = (u8)c;
 
-    memmove(g_fb,
-            &g_fb[(usize)FONT_H * g_stride],
-            rows_to_move * g_stride * sizeof(u32));
-
-    for (row = rows_to_move; row < g_screen_height; row++) {
-        u32 col;
-        u32 *line = &g_fb[row * g_stride];
-
-        for (col = 0; col < g_screen_width; col++)
-            line[col] = CONSOLE_BG;
-    }
-}
-
-static void console_newline(void)
-{
-    g_cursor_x = 0;
-    g_cursor_y += FONT_H;
-
-    /* 다음 글자 줄이 화면에 온전히 들어오지 않으면 스크롤 */
-    while (g_cursor_y + FONT_H > g_screen_height) {
-        console_scroll();
-        g_cursor_y -= FONT_H;
-    }
-}
-
-/* 프레임버퍼에 한 글자 출력 */
-static void fb_putc(char c)
-{
-    if (!g_fb)
-        return;
-
-    if (c == '\n') {
-        console_newline();
-        return;
-    }
-
-    if (c == '\r') {
-        g_cursor_x = 0;
-        return;
-    }
-
-    if (c == '\t') {
-        /* 4글자 단위 탭 */
-        u32 tab = FONT_W * 4U;
-        g_cursor_x = ((g_cursor_x / tab) + 1U) * tab;
-        if (g_cursor_x + FONT_W > g_screen_width)
-            console_newline();
-        return;
-    }
-
-    if (g_cursor_x + FONT_W > g_screen_width)
-        console_newline();
-
-    (void)draw_char_bounded(g_fb, g_stride, g_screen_width, g_screen_height,
-                            g_cursor_x, g_cursor_y, (utf8)c,
-                            CONSOLE_FG, CONSOLE_BG);
-    g_cursor_x += FONT_W;
-}
-
-/* 출력 싱크 사용 여부: 사용자 프로세스가 장치(dev:/fb0, dev:/com1)를 배타적으로 가져가면 꺼진다 */
-static volatile bool g_out_fb = true;
-static volatile bool g_out_serial = true;
-
-void printk_set_fb_enabled(bool on)
-{
-    g_out_fb = on;
-}
-
-void printk_set_serial_enabled(bool on)
-{
-    g_out_serial = on;
-}
-
-void printk_force_all_outputs(void)
-{
-    g_out_fb = true;
-    g_out_serial = true;
-}
-
-/* 모든 출력 싱크로 한 글자 보내기 */
-static void printk_putc(char c)
-{
-    if (g_out_serial) {
-        if (c == '\n')
-            serial_putc('\r');   /* 터미널에서 줄 맨 앞으로 */
-        serial_putc(c);
-    }
-    if (g_out_fb)
-        fb_putc(c);
+    if (uc == '\n' || uc == '\r' || uc == '\t' || (uc >= 0x20 && uc <= 0x7E))
+        conout_putc(c);
+    else
+        conout_putc('?');
 }
 
 /* 문자열 출력. width 가 문자열 길이보다 크면 왼쪽을 공백으로 채운다. */
@@ -182,12 +58,12 @@ static void print_string(const char *s, u32 width)
         len++;
 
     while (width > len) {
-        printk_putc(' ');
+        kput(' ');
         width--;
     }
 
     while (*s)
-        printk_putc(*s++);
+        kput_untrusted(*s++);
 }
 
 /*
@@ -215,18 +91,18 @@ static void print_number(u64 value, u32 base, bool upper, u32 width, bool pad_ze
     total = len + (neg ? 1U : 0U);
 
     if (neg && pad_zero)
-        printk_putc('-');
+        kput('-');
 
     while (width > total) {
-        printk_putc(pad_zero ? '0' : ' ');
+        kput(pad_zero ? '0' : ' ');
         width--;
     }
 
     if (neg && !pad_zero)
-        printk_putc('-');
+        kput('-');
 
     while (len > 0)
-        printk_putc(tmp[--len]);
+        kput(tmp[--len]);
 }
 
 static void print_unsigned(u64 value, u32 base, bool upper, u32 width, bool pad_zero)
@@ -256,7 +132,7 @@ static Nstatus printk_vformat(const char *format, va_list args)
         char spec;
 
         if (*format != '%') {
-            printk_putc(*format++);
+            kput(*format++);
             continue;
         }
 
@@ -284,18 +160,18 @@ static Nstatus printk_vformat(const char *format, va_list args)
 
         spec = *format;
         if (spec == '\0') {
-            printk_putc('%');
+            kput('%');
             break;
         }
         format++;
 
         switch (spec) {
         case '%':
-            printk_putc('%');
+            kput('%');
             break;
 
         case 'c':
-            printk_putc((char)va_arg(args, int));
+            kput_untrusted((char)va_arg(args, int));
             break;
 
         case 's':
@@ -326,42 +202,26 @@ static Nstatus printk_vformat(const char *format, va_list args)
             break;
 
         case 'p':
-            printk_putc('0');
-            printk_putc('x');
+            kput('0');
+            kput('x');
             print_unsigned((u64)(usize)va_arg(args, void *), 16, false, 16, true);
             break;
 
         case 'r':
-            printk_putc('0');
-            printk_putc('x');
+            kput('0');
+            kput('x');
             print_unsigned((u64)(u32)va_arg(args, Nstatus), 16, false, 8, true);
             break;
 
         default:
             /* 알 수 없는 서식은 그대로 출력 (인자는 소비하지 않음) */
-            printk_putc('%');
-            printk_putc(spec);
+            kput('%');
+            kput(spec);
             break;
         }
     }
 
     return NSTATUS_OK;
-}
-
-void printk_backspace(void)
-{
-    if (g_out_serial) {
-        serial_putc('\b');
-        serial_putc(' ');
-        serial_putc('\b');
-    }
-
-    if (g_out_fb && g_fb && g_cursor_x >= FONT_W) {
-        g_cursor_x -= FONT_W;
-        (void)draw_char_bounded(g_fb, g_stride, g_screen_width, g_screen_height,
-                                g_cursor_x, g_cursor_y, (utf8)' ',
-                                CONSOLE_FG, CONSOLE_BG);
-    }
 }
 
 void printk_write(const char *buf, usize len)
@@ -375,10 +235,25 @@ void printk_write(const char *buf, usize len)
         u8 c = (u8)buf[i];
 
         if (c == '\n' || c == '\r' || c == '\t' || (c >= 0x20 && c <= 0x7E))
-            printk_putc((char)c);
+            conout_putc((char)c);
         else
-            printk_putc('?');
+            conout_putc('?');
     }
+}
+
+/* 한 메시지를 통째로: 인터럽트(키보드 에코 등)가 중간에 끼어 색/커서 상태가 섞이지 않도록 막는다 */
+static Nstatus printk_locked(const char *format, va_list args)
+{
+    u64 flags = irq_save();
+    Nstatus status;
+
+    conout_batch_begin();
+    ansi_kernel_begin();
+    status = printk_vformat(format, args);
+    ansi_kernel_end();
+    conout_batch_end();
+    irq_restore(flags);
+    return status;
 }
 
 Nstatus printk(const char *format, ...)
@@ -387,8 +262,59 @@ Nstatus printk(const char *format, ...)
     Nstatus status;
 
     va_start(args, format);
-    status = printk_vformat(format, args);
+    status = printk_locked(format, args);
     va_end(args);
 
+    return status;
+}
+
+/* 태그 붙은 로그: "[  OK  ] ..." (초록), "[ WARN ] ..." (노랑), "[FAILED] ..." (빨강) */
+static Nstatus printk_tagged(const char *tag, const char *format, va_list args)
+{
+    u64 flags = irq_save();
+    Nstatus status;
+    const char *t;
+
+    conout_batch_begin();
+    ansi_kernel_begin();
+    for (t = tag; *t; t++)
+        kput(*t);
+    status = printk_vformat(format, args);
+    ansi_kernel_end();
+    conout_batch_end();
+    irq_restore(flags);
+    return status;
+}
+
+Nstatus printk_ok(const char *format, ...)
+{
+    va_list args;
+    Nstatus status;
+
+    va_start(args, format);
+    status = printk_tagged(KC_RESET "[  " KC_GREEN "OK" KC_RESET "  ] ", format, args);
+    va_end(args);
+    return status;
+}
+
+Nstatus printk_warn(const char *format, ...)
+{
+    va_list args;
+    Nstatus status;
+
+    va_start(args, format);
+    status = printk_tagged(KC_RESET "[ " KC_YELLOW "WARN" KC_RESET " ] ", format, args);
+    va_end(args);
+    return status;
+}
+
+Nstatus printk_err(const char *format, ...)
+{
+    va_list args;
+    Nstatus status;
+
+    va_start(args, format);
+    status = printk_tagged(KC_RESET "[" KC_RED "FAILED" KC_RESET "] ", format, args);
+    va_end(args);
     return status;
 }

@@ -8,6 +8,7 @@
 
 #include "kernel/process/waitq.h"
 #include "kernel/process/process.h"
+#include "kernel/process/signal.h"
 #include "kernel/timer/pit/pit_base.h"
 #include "lowlevel.h"
 
@@ -62,6 +63,8 @@ Nstatus waitq_sleep_multi_locked(waitq_t **qs, u32 n, u64 timeout_ticks)
         return NinvalidArg;
     if (!self || self->pid == 0)
         return Npermission;
+    if (signal_deliverable(self))
+        return Ninterrupted;                 /* 이미 신호가 와 있다: 잠들면 놓친다 (signal.h) */
 
     for (i = 0; i < n; i++) {
         u32 j;
@@ -90,6 +93,7 @@ Nstatus waitq_sleep_multi_locked(waitq_t **qs, u32 n, u64 timeout_ticks)
     }
 
     self->wait_woken = false;
+    self->sig_woken = false;
     self->state = PROCESS_BLOCKED;
     self->wake_tick = timeout_ticks ? timer_get_tick() + timeout_ticks : 0;
 
@@ -100,6 +104,12 @@ Nstatus waitq_sleep_multi_locked(waitq_t **qs, u32 n, u64 timeout_ticks)
         waitq_cancel_locked(self);
         self->state = PROCESS_RUNNING;
         self->wake_tick = 0;
+        return Ninterrupted;
+    }
+
+    if (self->sig_woken) {
+        /* 신호가 깨웠다 (signal.c 가 이미 모든 항목을 떼어 냈다) */
+        self->sig_woken = false;
         return Ninterrupted;
     }
 

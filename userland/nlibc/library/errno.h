@@ -14,14 +14,13 @@
  * 더해, 커널이 실제로 돌려주는 Nstatus 코드들과 자연스럽게 대응되는 흔한 POSIX 이름들도
  * 함께 제공한다 — 나중에 어떤 nlibc 함수가 필요로 하든 즉시 쓸 수 있게 하기 위해서다.
  *
- * 사용법: 시스템 콜 래퍼(nyxstd.h)가 음수를 돌려주면, 그 값을 다시 양의 Nstatus 코드로
- * 바꾼 뒤 nx_errno_from_status() 에 넘기고 결과를 전역 변수 errno 에 저장한다. 이 변환은
- * nlibc 의 syscall 래퍼 계층(아직 작성되지 않음)이 담당할 일이며, 이 헤더 자신은 그 계층을
- * 강제하지 않는다 (헤더만 먼저 정해 두는 것 — 아직 "libc 를 만들 때가 아니다" 라는 이전
- * 결정과 일치한다).
+ * 변환은 nlibc 의 시스템 콜 계층(src/nxsys.c 의 __nl_errno_from_status)이 맡는다:
+ * 시스템 콜이 음수 Nstatus 를 돌려주면 가장 가까운 errno 로 바꿔 errno 에 넣고 -1 을 돌려준다.
+ * 대응이 애매한 Nyxis 고유 코드는 EIO 로 뭉뚱그린다 — 정확한 원인이 필요하면 nlibc 를 거치지
+ * 않고 Nstatus 를 직접 확인한다.
  */
-#ifndef NX_ERRNO_H
-#define NX_ERRNO_H
+#ifndef _NL_ERRNO_H
+#define _NL_ERRNO_H
 
 /* C89 이 요구하는 최소 집합 */
 #define EDOM   1    /* 수학 함수의 정의역 오류 */
@@ -45,40 +44,20 @@
 #define ENOSYS       17   /* 구현되지 않은 시스템 콜 (NsyscallFailed) */
 #define ETIMEDOUT    18   /* 시간 초과 (Ntimeout) */
 #define ENOTSUP      19   /* 지원하지 않음 (Nunsupported) */
+#define EMFILE       20   /* 열 수 있는 스트림/핸들이 모자람 (FOPEN_MAX, NX_MAX_HANDLES) */
+#define ESRCH        21   /* 그런 프로세스 없음 (kill: 이 프로세스의 자식이 아님) */
+#define ECHILD       22   /* 기다릴 자식 없음 */
+#define ENAMETOOLONG 23   /* 경로가 너무 김 (NpathTooLong, NX_PATH_MAX) */
+#define ENOTEMPTY    24   /* 디렉터리가 비어 있지 않음 */
+#define ESPIPE       25   /* 위치를 옮길 수 없는 핸들 (콘솔 등) */
+#define E2BIG        26   /* 인자/환경이 너무 큼 (NX_ARG_MAX) */
+#define EINTR        27   /* 신호가 잠든 호출을 깨웠다 (signal.h) */
+#define EBUSY        28   /* 사용 중 (장치) */
+#define EPIPE        29   /* 읽는 쪽이 없는 파이프에 쓰기 (Ndisconnected). 신호(SIGPIPE)는 없다 */
+#define ENOTTY       30   /* 터미널이 아님 (isatty, tcgetattr, ioctl) */
 
-/*
- * 커널이 돌려준 "양의" Nstatus 오류 코드(즉, 시스템 콜의 음수 반환값에 -1 을 곱한 값)를
- * 가장 가까운 errno 값으로 바꾼다. 대응이 애매하거나 이 표에 없는 Nyxis 고유 코드는 뭉뚱그려
- * EIO 로 돌려준다(무엇이 잘못됐는지는 알 수 없지만 "그냥 성공은 아니다"는 알려줘야 하므로) —
- * 정확한 원인을 알아야 한다면 nlibc 를 거치지 않고 Nstatus 자체를 직접 확인하면 된다.
- *
- * 이 함수는 값 하나짜리 조회이므로 일부러 인라인 함수로 헤더에 둔다 (nlibc 정적 라이브러리가
- * 아직 없으므로, .c 파일 없이도 이 헤더 하나만 넣으면 바로 쓸 수 있게 하기 위해서다).
- */
-static __inline__ int nx_errno_from_status(unsigned int nstatus_code)
-{
-    switch (nstatus_code) {
-    case 1:  return ENOENT;      /* NnotFound */
-    case 2:  return EINVAL;      /* NinvalidArg */
-    case 3:  return ENOMEM;      /* NoutOfMemory */
-    case 4:  return EPERM;       /* Npermission */
-    case 5:  return ETIMEDOUT;   /* Ntimeout */
-    case 6:  return EAGAIN;      /* Nbusy */
-    case 7:  return EEXIST;      /* NalreadyExists */
-    case 10: return EIO;         /* Nio */
-    case 12: return ENOTSUP;     /* Nunsupported */
-    case 21: return EFAULT;      /* NnullPointer */
-    case 22: return EFAULT;      /* NinvalidPointer */
-    case 29: return ENOENT;      /* NfileNotFound */
-    case 30: return ENOENT;      /* NpathTooLong (경로 관련이므로 가장 가까운 값) */
-    case 31: return EROFS;       /* NreadOnly */
-    case 32: return ENOSPC;      /* NdiskFull */
-    case 44: return EACCES;      /* Nunauthorized */
-    case 45: return EACCES;      /* Nauthentication */
-    case 47: return EINVAL;      /* NinvalidFormat */
-    case 58: return ENOSYS;      /* NsyscallFailed */
-    default: return EIO;
-    }
-}
+/* C89 7.1.4: errno 는 int 형의 수정 가능한 lvalue. 성공한 호출은 errno 를 0 으로 되돌리지 않는다. */
+extern int errno;
+#define errno errno
 
-#endif /* NX_ERRNO_H */
+#endif /* _NL_ERRNO_H */

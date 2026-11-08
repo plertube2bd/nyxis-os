@@ -1,5 +1,7 @@
 /*
- * ahci.c - AHCI(SATA) 읽기 전용 최소 드라이버 (폴링, 포트 1개)
+ * ahci.c - AHCI(SATA) 최소 드라이버 (폴링, DMA 읽기/쓰기/FLUSH, 연결된 디스크 전부)
+ *
+ * 디스크 i (포트 번호 순) 는 디스크 번호 AHCI_DISKNO_BASE + i 로 파일시스템 콜백(ahci_disk_read/write)에 쓰인다.
  *
  * [수정 이력 요약]  (기존 코드의 실제 버그들)
  *  - PCI 버스 순회 루프가 'for (u8 bus = 0; bus < 256; bus++)' 였다.
@@ -241,24 +243,6 @@ static bool ahci_probe_port(HBA_PORT *Port, i32 PortNo)
     return (Port->sig == SATA_SIG_ATA) ? true : false;
 }
 
-HBA_PORT *ahci_find_port(void)
-{
-    u32 pi;
-    i32 i;
-
-    if (!ahci_base)
-        return nNULL;
-
-    pi = ahci_base->pi;
-    for (i = 0; i < AHCI_MAX_PORTS; i++) {
-        if ((pi & 1U) && ahci_probe_port((HBA_PORT *)&ahci_base->ports[i], i))
-            return (HBA_PORT *)&ahci_base->ports[i];
-        pi >>= 1;
-    }
-
-    return nNULL;
-}
-
 static i32 ahci_find_cmdslot(HBA_PORT *Port)
 {
     u32 slots = Port->sact | Port->ci;
@@ -315,45 +299,52 @@ static Nstatus ahci_port_rebase(HBA_PORT *Port, i32 PortNo)
 }
 
 /* ------------------------------------------------------------------ */
-/* 읽기 (DMA)                                                          */
+/* 명령 실행 (DMA, 폴링)                                               */
 /* ------------------------------------------------------------------ */
 
-Nstatus ahci_read(
-    HBA_PORT *Port,
-    u64 StartLba,
-    u32 SectorCount,
-    void *Buffer
-) {
+/*
+ * 명령 하나를 보내고 끝날 때까지 기다린다.
+ *   command: ATA_CMD_READ_DMA_EX / ATA_CMD_WRITE_DMA_EX / ATA_CMD_FLUSH_CACHE_EX
+ *   데이터 없는 명령(FLUSH)은 SectorCount = 0, Buffer = NULL.
+ */
+static Nstatus ahci_issue(HBA_PORT *Port, u8 command, u64 StartLba, u32 SectorCount, void *Buffer)
+{
+    bool has_data = (SectorCount != 0) ? true : false;
+    bool is_write = (command == ATA_CMD_WRITE_DMA_EX) ? true : false;
     i32 slot;
     i32 port_no;
     HBA_CMD_HEADER *CmdHeader;
     HBA_CMD_TBL *CmdTbl;
     HBA_PRDT_ENTRY *Prdt;
     FIS_REG_H2D *Fis;
-    u64 buffer_addr;
+    u64 buffer_addr = 0;
     u32 timeout;
 
-    if (!Port || !Buffer || SectorCount == 0)
+    if (!Port || !ahci_base)
         return NinvalidArg;
 
-    /* PRDT 하나로 전송 가능한 크기(4MiB) 및 48비트 LBA 범위 검사 */
-    if (SectorCount > AHCI_MAX_SECTORS_PER_READ)
-        return NinvalidArg;
-    if (StartLba >= (1UL << 48) || (StartLba + SectorCount) > (1UL << 48))
-        return NinvalidArg;
+    if (has_data) {
+        if (!Buffer)
+            return NinvalidArg;
+        /* PRDT 하나로 전송 가능한 크기(4MiB) 및 48비트 LBA 범위 검사 */
+        if (SectorCount > AHCI_MAX_SECTORS_PER_READ)
+            return NinvalidArg;
+        if (StartLba >= (1UL << 48) || (StartLba + SectorCount) > (1UL << 48))
+            return NinvalidArg;
 
-    /* DMA 는 물리 주소가 필요하다. 커널 이미지/HHDM 안의 (물리적으로 연속인) 버퍼만 허용한다 */
-    if (!virt_is_direct(Buffer))
-        return NinvalidPointer;
-    buffer_addr = virt_to_phys(Buffer);
+        /* DMA 는 물리 주소가 필요하다. 커널 이미지/HHDM 안의 (물리적으로 연속인) 버퍼만 허용한다 */
+        if (!virt_is_direct(Buffer))
+            return NinvalidPointer;
+        buffer_addr = virt_to_phys(Buffer);
 
-    /* DMA 버퍼는 2바이트 정렬이어야 한다 (dba bit0 = 0) */
-    if (buffer_addr & 1UL)
-        return NinvalidArg;
+        /* DMA 버퍼는 2바이트 정렬이어야 한다 (dba bit0 = 0) */
+        if (buffer_addr & 1UL)
+            return NinvalidArg;
 
-    /* 64비트 DMA 를 지원하지 않는 컨트롤러는 4GiB 이내 버퍼만 접근 가능 */
-    if (!ahci_dma64 && (buffer_addr + ((u64)SectorCount << 9)) > 0x100000000UL)
-        return NinvalidPointer;
+        /* 64비트 DMA 를 지원하지 않는 컨트롤러는 4GiB 이내 버퍼만 접근 가능 */
+        if (!ahci_dma64 && (buffer_addr + ((u64)SectorCount << 9)) > 0x100000000UL)
+            return NinvalidPointer;
+    }
 
     slot = ahci_find_cmdslot(Port);
     if (slot < 0)
@@ -366,33 +357,37 @@ Nstatus ahci_read(
 
     CmdHeader = (HBA_CMD_HEADER *)(void *)ahci_command_list[port_no];
     CmdHeader += slot;
-    CmdHeader->prdtl = 1;
+    CmdHeader->prdtl = has_data ? 1 : 0;
     CmdHeader->prdbc = 0;
-    CmdHeader->flags = (u16)(sizeof(FIS_REG_H2D) / sizeof(u32));
+    CmdHeader->flags = (u16)((sizeof(FIS_REG_H2D) / sizeof(u32)) | (is_write ? AHCI_CMD_HDR_WRITE : 0U));
 
     CmdTbl = (HBA_CMD_TBL *)(void *)ahci_cmd_tables[port_no][slot];
     memset(CmdTbl, 0, 256);
 
-    Prdt = (HBA_PRDT_ENTRY *)((u8 *)CmdTbl + 0x80);
-    Prdt[0].dba = (u32)buffer_addr;
-    Prdt[0].dbau = (u32)(buffer_addr >> 32);
-    Prdt[0].rsv0 = 0;
-    Prdt[0].dbc = (SectorCount << 9) - 1;    /* 최대 4MiB - 1 (22비트) */
+    if (has_data) {
+        Prdt = (HBA_PRDT_ENTRY *)((u8 *)CmdTbl + 0x80);
+        Prdt[0].dba = (u32)buffer_addr;
+        Prdt[0].dbau = (u32)(buffer_addr >> 32);
+        Prdt[0].rsv0 = 0;
+        Prdt[0].dbc = (SectorCount << 9) - 1;    /* 최대 4MiB - 1 (22비트) */
+    }
 
     Fis = (FIS_REG_H2D *)(void *)&CmdTbl->cfis;
     memset(Fis, 0, sizeof(FIS_REG_H2D));
     Fis->fis_type = FIS_TYPE_REG_H2D;
     Fis->pmport_c = FIS_H2D_C;
-    Fis->command = ATA_CMD_READ_DMA_EX;
-    Fis->lba0 = (u8)StartLba;
-    Fis->lba1 = (u8)(StartLba >> 8);
-    Fis->lba2 = (u8)(StartLba >> 16);
-    Fis->lba3 = (u8)(StartLba >> 24);
-    Fis->lba4 = (u8)(StartLba >> 32);
-    Fis->lba5 = (u8)(StartLba >> 40);
+    Fis->command = command;
     Fis->device = (u8)(1U << 6);              /* LBA 모드 */
-    Fis->countl = (u8)(SectorCount & 0xFFU);
-    Fis->counth = (u8)((SectorCount >> 8) & 0xFFU);
+    if (has_data) {
+        Fis->lba0 = (u8)StartLba;
+        Fis->lba1 = (u8)(StartLba >> 8);
+        Fis->lba2 = (u8)(StartLba >> 16);
+        Fis->lba3 = (u8)(StartLba >> 24);
+        Fis->lba4 = (u8)(StartLba >> 32);
+        Fis->lba5 = (u8)(StartLba >> 40);
+        Fis->countl = (u8)(SectorCount & 0xFFU);
+        Fis->counth = (u8)((SectorCount >> 8) & 0xFFU);
+    }
 
     Port->is = 0xFFFFFFFFU;
 
@@ -407,7 +402,8 @@ Nstatus ahci_read(
 
     Port->ci = 1U << slot;
 
-    for (timeout = 0; timeout < AHCI_SPIN_LIMIT; timeout++) {
+    /* 쓰기와 FLUSH 는 읽기보다 오래 걸릴 수 있다 (실제 디스크의 캐시 비우기). 상한을 넉넉히 */
+    for (timeout = 0; timeout < AHCI_SPIN_LIMIT * 8UL; timeout++) {
         if (!(Port->ci & (1U << slot)))
             break;
         if (Port->is & (1U << 30))          /* Task File Error */
@@ -424,16 +420,134 @@ Nstatus ahci_read(
     return NSTATUS_OK;
 }
 
+Nstatus ahci_read(HBA_PORT *Port, u64 StartLba, u32 SectorCount, void *Buffer)
+{
+    if (SectorCount == 0)
+        return NinvalidArg;
+    return ahci_issue(Port, ATA_CMD_READ_DMA_EX, StartLba, SectorCount, Buffer);
+}
+
+Nstatus ahci_write(HBA_PORT *Port, u64 StartLba, u32 SectorCount, const void *Buffer)
+{
+    if (SectorCount == 0)
+        return NinvalidArg;
+    return ahci_issue(Port, ATA_CMD_WRITE_DMA_EX, StartLba, SectorCount, (void *)(usize)Buffer);
+}
+
+Nstatus ahci_flush(HBA_PORT *Port)
+{
+    return ahci_issue(Port, ATA_CMD_FLUSH_CACHE_EX, 0, 0, nNULL);
+}
+
+/* ------------------------------------------------------------------ */
+/* 디스크 번호 + 바이트 단위 접근 (파일시스템 콜백)                     */
+/* ------------------------------------------------------------------ */
+
+static HBA_PORT *g_disks[AHCI_MAX_PORTS];
+static u32 g_disk_count = 0;
+
+/*
+ * 섹터 단위 DMA 와 임의의 (offset, size) 사이의 중간 버퍼. 커널 이미지 안에 있으므로 물리적으로 연속이고
+ * DMA 가능하다 (호출자 버퍼는 kmalloc 영역일 수도 있어 직접 DMA 하지 않는다). 커널은 비선점이고 시스템
+ * 콜 안은 인터럽트가 꺼져 있으므로 버퍼 하나를 함께 써도 된다.
+ */
+#define AHCI_BOUNCE_SIZE (64U * 1024U)
+static u8 g_bounce[AHCI_BOUNCE_SIZE] __attribute__((aligned(4096)));
+
+u32 ahci_disk_count(void)
+{
+    return g_disk_count;
+}
+
+static HBA_PORT *disk_port(u32 diskno)
+{
+    if (diskno < AHCI_DISKNO_BASE || diskno - AHCI_DISKNO_BASE >= g_disk_count)
+        return nNULL;
+    return g_disks[diskno - AHCI_DISKNO_BASE];
+}
+
+/*
+ * 한 번에 중간 버퍼만큼씩: 시작 섹터부터 필요한 섹터 수를 덮어 읽거나 쓴다.
+ * 쓰기에서 첫/끝 섹터가 일부만 바뀌면 먼저 읽어 와서 나머지를 보존한다 (read-modify-write).
+ */
+static Nstatus disk_rw(u32 diskno, usize offset, u8 *buf, usize size, bool write)
+{
+    HBA_PORT *Port = disk_port(diskno);
+    Nstatus status;
+
+    if (!Port)
+        return NdeviceMissing;
+    if (!buf && size)
+        return NinvalidArg;
+
+    while (size > 0) {
+        u64 lba = (u64)offset >> 9;
+        usize head = offset & 511U;
+        usize span = head + size;
+        usize n;
+        u32 nsec;
+
+        if (span > AHCI_BOUNCE_SIZE)
+            span = AHCI_BOUNCE_SIZE;
+        n = span - head;
+        nsec = (u32)((span + 511U) >> 9);
+
+        if (!write || head != 0 || (span & 511U) != 0) {
+            status = ahci_read(Port, lba, nsec, g_bounce);
+            if (NSTATUS_IS_ERR(status))
+                return status;
+        }
+        if (write) {
+            memcpy(g_bounce + head, buf, n);
+            status = ahci_write(Port, lba, nsec, g_bounce);
+            if (NSTATUS_IS_ERR(status))
+                return status;
+        } else {
+            memcpy(buf, g_bounce + head, n);
+        }
+
+        offset += n;
+        buf += n;
+        size -= n;
+    }
+    return NSTATUS_OK;
+}
+
+Nstatus ahci_disk_read(u32 diskno, usize offset, void *buffer, usize size, NTBLI *info)
+{
+    (void)info;
+    return disk_rw(diskno, offset, (u8 *)buffer, size, false);
+}
+
+Nstatus ahci_disk_write(u32 diskno, usize offset, const void *buffer, usize size, NTBLI *info)
+{
+    (void)info;
+    return disk_rw(diskno, offset, (u8 *)(usize)buffer, size, true);
+}
+
+Nstatus ahci_flush_all(void)
+{
+    Nstatus result = NSTATUS_OK;
+    u32 i;
+
+    for (i = 0; i < g_disk_count; i++) {
+        Nstatus status = ahci_flush(g_disks[i]);
+
+        if (NSTATUS_IS_ERR(status))
+            result = status;
+    }
+    return result;
+}
+
 Nstatus ahci_init(void)
 {
-    static u8 Buffer[512];
-    HBA_PORT *Port;
+    u32 pi;
     i32 i;
     Nstatus status;
 
     status = ahci_find_controller();
     if (NSTATUS_IS_ERR(status)) {
-        printk("AHCI controller not found\n");
+        printk_warn("AHCI controller not found\n");
         return status;
     }
 
@@ -443,27 +557,24 @@ Nstatus ahci_init(void)
         return NdeviceMissing;
     }
 
-    printk("AHCI controller found\n");
-
     ahci_base->ghc |= HBA_GHC_AE;
     ahci_dma64 = (ahci_base->cap & HBA_CAP_S64A) ? true : false;
 
-    Port = ahci_find_port();
-    if (!Port) {
-        printk("No SATA device found\n");
+    /* 연결된 SATA 디스크를 모두 준비해 디스크 번호를 붙인다 (포트 번호 순) */
+    g_disk_count = 0;
+    pi = ahci_base->pi;
+    for (i = 0; i < AHCI_MAX_PORTS; i++, pi >>= 1) {
+        HBA_PORT *Port = (HBA_PORT *)&ahci_base->ports[i];
+
+        if ((pi & 1U) && ahci_probe_port(Port, i))
+            g_disks[g_disk_count++] = Port;
+    }
+
+    if (g_disk_count == 0) {
+        printk_warn("AHCI: no SATA disk found\n");
         return NdeviceMissing;
     }
 
-    status = ahci_read(Port, 0, 1, Buffer);
-    if (NSTATUS_IS_ERR(status)) {
-        printk("AHCI read failed: %r\n", status);
-        return status;
-    }
-
-    printk("AHCI read success\n");
-    for (i = 0; i < 16; i++)
-        printk("%02x ", (unsigned int)Buffer[i]);
-    printk("\n");
-
+    printk_ok("AHCI: %u SATA disk(s)\n", g_disk_count);
     return Nok;
 }

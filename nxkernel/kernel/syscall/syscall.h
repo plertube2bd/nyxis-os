@@ -38,7 +38,8 @@ void syscall_entry(void);
 void syscall_bad_return(void) __attribute__((noreturn));
 
 /* 트랩 프레임에서 인자를 꺼내 처리하고 결과를 frame->rax 에 쓴다 */
-void syscall_handle(struct trap_frame *frame);
+/* 반환: 0 이 아니면 sysret 대신 iretq 로 돌아가야 한다 (NxSignalReturn 이 rcx/r11 까지 되돌렸다) */
+u64 syscall_handle(struct trap_frame *frame);
 
 /* 실제 처리 함수 (호스트 테스트/재사용을 위해 분리). 반환값은 부호 확장된 Nstatus. */
 i64 syscall_dispatch(

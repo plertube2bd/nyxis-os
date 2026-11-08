@@ -1,0 +1,78 @@
+diff --git a/libtcc.c b/libtcc.c
+index 44ea25f..e9dcc38 100644
+--- a/libtcc.c
++++ b/libtcc.c
+@@ -885,6 +885,9 @@ LIBTCCAPI TCCState *tcc_new(void)
+     s->warn_discarded_qualifiers = 1;
+     s->ms_extensions = 1;
+     s->unwind_tables = 1;
++#ifdef TARGETOS_Nyxis
++    s->static_link = 1;
++#endif
+ 
+ #ifdef CHAR_IS_UNSIGNED
+     s->char_is_unsigned = 1;
+diff --git a/tcc.c b/tcc.c
+index c2274fb..b1e42af 100644
+--- a/tcc.c
++++ b/tcc.c
+@@ -203,6 +203,8 @@ static const char version[] =
+         " OpenBSD"
+ #elif TARGETOS_NetBSD
+         " NetBSD"
++#elif TARGETOS_Nyxis
++        " Nyxis"
+ #else
+         " Linux"
+ #endif
+diff --git a/tcc.h b/tcc.h
+index 864a4e3..5127b58 100644
+--- a/tcc.h
++++ b/tcc.h
+@@ -126,7 +126,22 @@ extern long double strtold (const char *__nptr, char **__endptr);
+ # define PRINTF_LIKE(x,y) __attribute__ ((format (printf, (x), (y))))
+ #endif
+ 
+-#ifdef _WIN32
++#if defined TARGETOS_Nyxis
++/* Nyxis: 경로는 "이름공간:/..." (예: app:/lib/tcc). 목록 구분자는 ':' 와 겹치지 않게 ';' */
++# define IS_DIRSEP(c) (c == '/')
++# define IS_ABSPATH(p) (IS_DIRSEP(p[0]) || tcc_nyxis_has_ns(p))
++# define PATHCMP strcmp
++# define PATHSEP ";"
++static inline int tcc_nyxis_has_ns(const char *p)
++{
++    while (*p && *p != '/') {
++        if (*p == ':')
++            return 1;
++        p++;
++    }
++    return 0;
++}
++#elif defined _WIN32
+ # define IS_DIRSEP(c) (c == '/' || c == '\\')
+ # define IS_ABSPATH(p) (IS_DIRSEP(p[0]) || (p[0] && p[1] == ':' && IS_DIRSEP(p[2])))
+ # define PATHCMP stricmp
+@@ -187,7 +202,8 @@ extern long double strtold (const char *__nptr, char **__endptr);
+ 
+ /* only native compiler supports -run */
+ #if defined _WIN32 == defined TCC_TARGET_PE \
+-    && defined __APPLE__ == defined TCC_TARGET_MACHO
++    && defined __APPLE__ == defined TCC_TARGET_MACHO \
++    && !defined TARGETOS_Nyxis
+ # if defined __i386__ && defined TCC_TARGET_I386
+ #  define TCC_IS_NATIVE
+ # elif defined __x86_64__ && defined TCC_TARGET_X86_64
+diff --git a/tccpp.c b/tccpp.c
+index 214e9cd..e94b8df 100644
+--- a/tccpp.c
++++ b/tccpp.c
+@@ -3559,6 +3559,8 @@ static const char * const target_os_defs =
+     "__NetBSD__\0"
+ # elif TARGETOS_OpenBSD
+     "__OpenBSD__\0"
++# elif TARGETOS_Nyxis
++    "__nyxis__\0"
+ # else
+     "__linux__\0"
+     "__linux\0"

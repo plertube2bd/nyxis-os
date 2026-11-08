@@ -66,3 +66,6 @@ nxkernel/esp.img
 nxkernel/esp_test.img
 nxkernel/serial.log
 userland/initrd/initrd.img
+
+# disk:/ 영구 디스크 이미지 (make disk)
+/disk.img

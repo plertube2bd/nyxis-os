@@ -23,7 +23,15 @@ typedef struct vfs_stat {
     u64 size;
     u32 type;
     u32 reserved;
+    u32 mode;       /* 권한 비트 (0777 이하). 모르는 파일시스템은 0 */
+    u32 uid;        /* 소유자. 모르면 0 */
+    u32 gid;
+    u32 reserved2;
 } vfs_stat_t;
+
+/* vfs_open 의 flags 에 더할 수 있는 커널 전용 비트: 실행하려고 연다 (실행 권한 x 를 요구한다).
+ * NX_O_READ(1)/NX_O_WRITE(2) 와 겹치지 않는다. 사용자는 NxOpen 으로 이 비트를 줄 수 없다 */
+#define VFS_O_EXEC 0x100U
 
 typedef struct vfs_ops {
     Nstatus (*lookup)(vnode_t *dir, const char *name, vnode_t **out_vnode);
@@ -46,6 +54,13 @@ typedef struct vfs_ops {
      * 속해야 한다 - 드라이버가 이를 검사한다). new_name 이 이미 있으면 거부한다
      * (v1 은 덮어쓰기 rename 을 지원하지 않는다 - 필요하면 먼저 unlink 한다). */
     Nstatus (*rename)(vnode_t *old_dir, const char *old_name, vnode_t *new_dir, const char *new_name);
+
+    /* 권한 비트를 바꾼다 (선택 사항). 누가 바꿀 수 있는지는 드라이버가 판정한다 (소유자 또는 root) */
+    Nstatus (*chmod)(vnode_t *vnode, u32 mode);
+
+    /* vnode 를 해제하기 직전에 파일시스템의 vnode 데이터(fs_private)를 돌려준다 (선택 사항).
+     * VFS 가 캐시에서 거두거나 지운 파일의 마지막 핸들이 닫힐 때 부른다 */
+    void (*release)(vnode_t *vnode);
 } vfs_ops_t;
 
 struct vfs_filesystem {
@@ -76,6 +91,12 @@ Nstatus vfs_close(handle_t *handle);
 
 /* 열린 핸들이 가리키는 파일의 정보를 얻는다 (경로가 아니라 핸들 기준이라 경로 경쟁이 없다) */
 Nstatus vfs_fstat(handle_t *handle, vfs_stat_t *out);
+
+/* 경로의 정보를 연다 없이 얻는다 (경로를 따라가는 디렉터리 순회 권한만 필요: lookup 이 검사한다) */
+Nstatus vfs_stat_path(const char *path, vfs_stat_t *out);
+
+/* 경로의 권한 비트를 바꾼다 (파일시스템이 chmod 를 지원하지 않으면 Nunsupported) */
+Nstatus vfs_chmod(const char *path, u32 mode);
 
 /*
  * path 의 부모 디렉터리 아래에 새 파일/디렉터리를 만든다. 부모까지의 경로는 이미

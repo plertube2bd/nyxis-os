@@ -26,10 +26,17 @@
 #include "kernel/syscall/nspath.h"
 #include "kernel/security/auth.h"
 #include "kernel/ipc/channel.h"
+#include "kernel/ipc/pipe.h"
+#include "kernel/security/perm.h"
+#include "kernel/syscall/syscall_internal.h"
 #include "kernel/dev/device.h"
 #include "kernel/acpi/acpi.h"
+#include "drivers/ahci/ahci.h"
+#include "kernel/process/signal.h"
+#include "kernel/info/info.h"
 #include "kernel/crypto/sha256.h"
 #include "kernel/timer/pit/pit_base.h"
+#include "kernel/timer/rtc/rtc.h"
 #include "console/outputs/printk.h"
 #include "drivers/filesystem/vfs.h"
 #include "boot_info.h"
@@ -55,7 +62,7 @@ NX_STATIC_ASSERT(nx_devinfo_size, sizeof(struct nx_devinfo) == 40);
 typedef i64 (*syscall_fn)(const u64 *a);
 
 /* 현재 프로세스의 핸들 테이블 (현재 프로세스가 없으면 NULL) */
-static nx_handle_table_t *cur_handles(void)
+nx_handle_table_t *cur_handles(void)
 {
     return current_process ? &current_process->handles : (nx_handle_table_t *)0;
 }
@@ -73,10 +80,15 @@ static i64 sys_get_version(const u64 *a)
 /* NxGetTime(clock_id) -> 나노초 */
 static i64 sys_get_time(const u64 *a)
 {
-    if (a[0] != NX_CLOCK_MONOTONIC)
-        return (i64)Nunsupported;      /* 실시간(RTC) 시계는 아직 없다 */
+    if (a[0] == NX_CLOCK_MONOTONIC)
+        return (i64)timer_get_ns();
+    if (a[0] == NX_CLOCK_REALTIME) {
+        u64 ns;
+        Nstatus st = rtc_realtime_ns(&ns);
 
-    return (i64)timer_get_ns();
+        return NSTATUS_IS_ERR(st) ? (i64)st : (i64)ns;
+    }
+    return (i64)NinvalidArg;
 }
 
 /* NxSleep(milliseconds) */
@@ -135,16 +147,68 @@ static Nstatus user_path(u64 uptr, char *kpath, usize kmax, u32 *kind)
 }
 
 /* 사용자 경로 -> VFS 경로 (장치/서비스 경로는 거부) + 커널 전용 경로 검사 */
-static Nstatus user_vfs_path(u64 uptr, char *kpath, usize kmax, u32 op)
+Nstatus user_vfs_path(u64 uptr, char *kpath, usize kmax, u32 op)
 {
     u32 kind = 0;
     Nstatus status = user_path(uptr, kpath, kmax, &kind);
 
     if (NSTATUS_IS_ERR(status))
         return status;
+    if (kind == NSP_KIND_INFO)
+        return Npermission;                 /* info:/ 는 읽기 전용 (만들기/지우기/실행 불가) */
     if (kind != NSP_KIND_VFS)
         return Nunsupported;
     return nsp_check_protected(kpath, op);
+}
+
+/*
+ * 표준 스트림 장치 (누구나 연다):
+ *   dev:/tty                    콘솔 터미널 자체. 새 콘솔 핸들 (리디렉션과 무관하게 화면/키보드)
+ *   dev:/stdin|stdout|stderr    호출자의 0/1/2 번 핸들이 가리키는 객체. 열린 파일/파이프를 공유하는
+ *                               새 핸들이다 (dup 와 같다: 파일이면 오프셋도 공유). 리디렉션된 프로세스는
+ *                               파일/파이프를 받는다. 그 번호가 닫혀 있으면 NnotFound.
+ * 요청한 읽기/쓰기는 원래 핸들에 그 권한이 있어야 한다 (없으면 Npermission). close-on-exec 는 물려받지 않는다.
+ */
+static i64 open_stream(const char *name, u64 flags, nx_handle_table_t *table)
+{
+    nx_handle_t *src;
+    nx_handle_t *slot;
+    u64 handle;
+    u32 want = 0;
+    u32 index;
+    Nstatus status;
+
+    if (flags & NX_O_READ)
+        want |= (u32)NX_RIGHT_READ;
+    if (flags & NX_O_WRITE)
+        want |= (u32)NX_RIGHT_WRITE;
+
+    if (strcmp(name, "tty") == 0) {
+        status = nx_handle_alloc(table, NX_HANDLE_CONSOLE, want | (u32)(NX_RIGHT_STAT | NX_RIGHT_DUP), &handle, &slot);
+        if (NSTATUS_IS_ERR(status))
+            return (i64)status;
+        slot->console_fd = (flags & NX_O_READ) ? 0U : 1U;     /* 0 = 입력을 받는 콘솔 핸들 (poll, 에코 설정) */
+        return (i64)handle;
+    }
+
+    index = (strcmp(name, "stdin") == 0) ? 0U : (strcmp(name, "stdout") == 0) ? 1U : 2U;
+    src = &table->slots[index];
+    if (src->type == NX_HANDLE_FREE)
+        return (i64)NnotFound;
+    if ((src->rights & want) != want)
+        return (i64)Npermission;
+
+    /* 읽기/쓰기는 요청한 것만, 나머지 권한(STAT/SEEK/DUP 등)은 원래 핸들 그대로 */
+    status = nx_handle_alloc(table, src->type,
+                             src->rights & ~((u32)(NX_RIGHT_READ | NX_RIGHT_WRITE) & ~want), &handle, &slot);
+    if (NSTATUS_IS_ERR(status))
+        return (i64)status;
+    status = nx_handle_share(src, slot, true);
+    if (NSTATUS_IS_ERR(status)) {
+        nx_handle_discard(slot);
+        return (i64)status;
+    }
+    return (i64)handle;
 }
 
 static i64 open_device(const char *name, u64 flags, nx_handle_table_t *table)
@@ -160,6 +224,9 @@ static i64 open_device(const char *name, u64 flags, nx_handle_table_t *table)
         rights |= (u32)NX_RIGHT_READ;
     if (write)
         rights |= (u32)NX_RIGHT_WRITE;
+
+    if (nsp_dev_is_public(name))
+        return open_stream(name, flags, table);
 
     status = device_open(name, write, &dev);
     if (NSTATUS_IS_ERR(status))
@@ -201,6 +268,35 @@ static i64 open_service(const char *name, u64 flags, nx_handle_table_t *table)
     return (i64)handle;
 }
 
+/* info:/ 가상 파일: 열 때 내용을 만들어 핸들에 보관한다 (info.h) */
+static i64 open_info(const char *name, u64 flags, nx_handle_table_t *table)
+{
+    nx_handle_t *slot;
+    char *buf = nNULL;
+    usize len = 0;
+    u32 type = 0;
+    u64 handle;
+    Nstatus status;
+
+    if (flags & NX_O_WRITE)
+        return (i64)Npermission;
+    status = info_open(name, &type, &buf, &len);
+    if (NSTATUS_IS_ERR(status))
+        return (i64)status;
+
+    status = nx_handle_alloc(table, NX_HANDLE_INFO,
+                             (u32)(NX_RIGHT_READ | NX_RIGHT_SEEK | NX_RIGHT_STAT | NX_RIGHT_DUP), &handle, &slot);
+    if (NSTATUS_IS_ERR(status)) {
+        kfree(buf);
+        return (i64)status;
+    }
+    slot->info_buf = buf;
+    slot->info_len = len;
+    slot->info_offset = 0;
+    slot->info_dir = (type == INFO_NODE_DIR);
+    return (i64)handle;
+}
+
 /* NxOpen(const char *path, flags) -> 핸들 */
 static i64 sys_open(const u64 *a)
 {
@@ -226,12 +322,14 @@ static i64 sys_open(const u64 *a)
         return open_device(kpath, flags, table);
     if (kind == NSP_KIND_SVC)
         return open_service(kpath, flags, table);
+    if (kind == NSP_KIND_INFO)
+        return open_info(kpath, flags, table);
 
     status = nsp_check_protected(kpath, NSP_OP_OPEN);
     if (NSTATUS_IS_ERR(status))
         return (i64)status;
 
-    status = vfs_open(kpath, (u32)flags, &file);
+    status = vfs_open(kpath, (u32)(flags & (NX_O_READ | NX_O_WRITE)), &file);
     if (NSTATUS_IS_ERR(status))
         return (i64)status;
 
@@ -262,7 +360,13 @@ static i64 sys_open(const u64 *a)
         return (i64)status;
     }
 
-    slot->file = file;
+    slot->of = nx_ofile_new(&file);
+    if (!slot->of) {
+        nx_handle_discard(slot);
+        (void)vfs_close(&file);
+        return (i64)NoutOfMemory;
+    }
+    slot->of->append = (flags & NX_O_APPEND) ? true : false;
     return (i64)handle;
 }
 
@@ -334,6 +438,29 @@ static i64 sys_read(const u64 *a)
         return (i64)total;
     }
 
+    if (slot->type == NX_HANDLE_INFO) {
+        u64 n;
+
+        if (slot->info_dir)
+            return (i64)NinvalidArg;        /* 디렉터리는 NxReadDir 로 */
+        if (slot->info_offset >= slot->info_len)
+            return 0;
+        n = slot->info_len - slot->info_offset;
+        if (n > len)
+            n = len;
+        status = copy_to_user(buf, slot->info_buf + slot->info_offset, (usize)n);
+        if (NSTATUS_IS_ERR(status))
+            return (i64)status;
+        slot->info_offset += n;
+        return (i64)n;
+    }
+
+    if (slot->type == NX_HANDLE_PIPE) {
+        if (slot->pipe_write)
+            return (i64)Npermission;
+        return pipe_read_user(slot->pipe, buf, len);
+    }
+
     if (slot->type != NX_HANDLE_FILE)
         return (i64)Nunsupported;
 
@@ -341,7 +468,7 @@ static i64 sys_read(const u64 *a)
         usize want = (usize)((len - total) < IO_CHUNK ? (len - total) : IO_CHUNK);
         usize got = 0;
 
-        status = vfs_read(&slot->file, chunk, want, &got);
+        status = vfs_read(&slot->of->file, chunk, want, &got);
         if (NSTATUS_IS_ERR(status))
             return total ? (i64)total : (i64)status;
         if (got == 0)
@@ -349,7 +476,7 @@ static i64 sys_read(const u64 *a)
 
         status = copy_to_user(buf + total, chunk, got);
         if (NSTATUS_IS_ERR(status)) {
-            slot->file.offset -= got;       /* 사용자에게 전달하지 못한 바이트는 읽지 않은 것으로 되돌린다 */
+            slot->of->file.offset -= got;       /* 사용자에게 전달하지 못한 바이트는 읽지 않은 것으로 되돌린다 */
             return total ? (i64)total : (i64)status;
         }
 
@@ -385,6 +512,20 @@ static i64 sys_write(const u64 *a)
         len = NX_IO_MAX;
     if (slot->type == NX_HANDLE_DEVICE && slot->dev->kind == NX_DEV_BLOCK && (len % NX_BLOCK_SECTOR) != 0)
         return (i64)NinvalidArg;
+    if (slot->type == NX_HANDLE_PIPE) {
+        if (!slot->pipe_write)
+            return (i64)Npermission;
+        return pipe_write_user(slot->pipe, buf, len);
+    }
+    if (slot->type == NX_HANDLE_FILE && slot->of->append) {
+        /* 끝으로 옮기고 바로 쓴다: 커널 안에서는 선점되지 않으므로 다른 쓰기가 끼어들지 않는다 */
+        vfs_stat_t st;
+
+        status = vfs_fstat(&slot->of->file, &st);
+        if (NSTATUS_IS_ERR(status))
+            return (i64)status;
+        slot->of->file.offset = st.size;
+    }
 
     while (total < len) {
         usize n = (usize)((len - total) < IO_CHUNK ? (len - total) : IO_CHUNK);
@@ -394,7 +535,7 @@ static i64 sys_write(const u64 *a)
             return total ? (i64)total : (i64)status;
 
         if (slot->type == NX_HANDLE_CONSOLE) {
-            printk_write((const char *)chunk, n);
+            tty_write((const char *)chunk, n);   /* 터미널 장치로 바로 (printk 를 거치지 않는다) */
         } else if (slot->type == NX_HANDLE_DEVICE) {
             usize done = 0;
 
@@ -408,7 +549,7 @@ static i64 sys_write(const u64 *a)
         } else if (slot->type == NX_HANDLE_FILE) {
             usize written = 0;
 
-            status = vfs_write(&slot->file, chunk, n, &written);
+            status = vfs_write(&slot->of->file, chunk, n, &written);
             if (NSTATUS_IS_ERR(status))
                 return total ? (i64)total : (i64)status;
             if (written < n) {
@@ -444,9 +585,11 @@ static i64 sys_seek(const u64 *a)
     if (NSTATUS_IS_ERR(status))
         return (i64)status;
     if (slot->type == NX_HANDLE_FILE)
-        pos = &slot->file.offset;
+        pos = &slot->of->file.offset;
     else if (slot->type == NX_HANDLE_DEVICE && slot->dev->kind == NX_DEV_BLOCK)
         pos = &slot->dev_offset;
+    else if (slot->type == NX_HANDLE_INFO && !slot->info_dir)
+        pos = &slot->info_offset;
     else
         return (i64)Nunsupported;
 
@@ -460,8 +603,10 @@ static i64 sys_seek(const u64 *a)
     case NX_SEEK_END:
         if (slot->type == NX_HANDLE_DEVICE) {
             base = (i64)slot->dev->size;
+        } else if (slot->type == NX_HANDLE_INFO) {
+            base = (i64)slot->info_len;
         } else {
-            status = vfs_fstat(&slot->file, &st);
+            status = vfs_fstat(&slot->of->file, &st);
             if (NSTATUS_IS_ERR(status))
                 return (i64)status;
             base = (i64)st.size;
@@ -515,14 +660,23 @@ static i64 sys_stat(const u64 *a)
     } else if (slot->type == NX_HANDLE_DEVICE) {
         st.type = NX_TYPE_DEVICE;
         st.size = slot->dev->size;
+    } else if (slot->type == NX_HANDLE_INFO) {
+        st.type = slot->info_dir ? NX_TYPE_DIR : NX_TYPE_FILE;
+        st.size = slot->info_len;
+        st.mode = slot->info_dir ? 0555U : 0444U;   /* 누구나 읽기만 */
+    } else if (slot->type == NX_HANDLE_PIPE) {
+        st.type = NX_TYPE_PIPE;
+        st.size = slot->pipe->count;
+        st.mode = slot->pipe_write ? 0200U : 0400U;
+        st.uid = current_process ? current_process->uid : 0;
+        st.gid = current_process ? current_process->gid : 0;
     } else {
         vfs_stat_t vs;
 
-        status = vfs_fstat(&slot->file, &vs);
+        status = vfs_fstat(&slot->of->file, &vs);
         if (NSTATUS_IS_ERR(status))
             return (i64)status;
-        st.size = vs.size;
-        st.type = (vs.type == 2U) ? NX_TYPE_DIR : NX_TYPE_FILE;
+        perm_fill_stat(&vs, &st);
     }
 
     return (i64)copy_to_user(a[1], &st, sizeof(st));
@@ -556,22 +710,11 @@ static i64 sys_duplicate_handle(const u64 *a)
     if (NSTATUS_IS_ERR(status))
         return (i64)status;
 
-    if (slot->type == NX_HANDLE_CONSOLE) {
-        dup->console_fd = slot->console_fd;
-    } else if (slot->type == NX_HANDLE_PROCESS) {
-        dup->proc = slot->proc;             /* 같은 프로세스를 가리키는 참조를 하나 더 */
-        process_retain(dup->proc);
-    } else if (slot->type == NX_HANDLE_CHANNEL) {
-        dup->chan = slot->chan;
-        dup->chan_receiver = false;
-        channel_retain(dup->chan);
-    } else {
-        /* 드라이버 내부 상태를 공유하지 않도록 파일을 새로 연다 (오프셋은 복사, 이후 독립) */
-        status = vfs_reopen(&slot->file, &dup->file);
-        if (NSTATUS_IS_ERR(status)) {
-            nx_handle_discard(dup);
-            return (i64)status;
-        }
+    /* 예전 의미 그대로: 파일은 새로 열어 오프셋만 복사한다 (공유는 NxDuplicateHandleEx 의 NX_DUP_SHARE) */
+    status = nx_handle_share(slot, dup, false);
+    if (NSTATUS_IS_ERR(status)) {
+        nx_handle_discard(dup);
+        return (i64)status;
     }
 
     return (i64)handle;
@@ -585,7 +728,7 @@ static i64 sys_duplicate_handle(const u64 *a)
  * 사용자 문자열 포인터 배열(NULL 로 끝남)을 blob 에 이어 붙인다. user_vec 이 0 이면 빈 배열.
  * blob 의 사용량(*used, 최대 NX_ARG_MAX)과 항목 수(*count, argv+envp 합계 최대 NX_ARGV_MAX)를 갱신한다.
  */
-static Nstatus collect_user_strings(u64 user_vec, char *blob, usize *used, u32 *count)
+Nstatus collect_user_strings(u64 user_vec, char *blob, usize *used, u32 *count)
 {
     u64 i;
 
@@ -635,6 +778,8 @@ static i64 sys_process_create(const u64 *a)
 
     if (!table)
         return (i64)NnotInitialized;
+    if (a[4] & ~NX_SPAWN_INHERIT)
+        return (i64)NinvalidArg;
 
     status = user_vfs_path(a[0], path, sizeof(path), NSP_OP_OPEN);
     if (NSTATUS_IS_ERR(status))
@@ -694,11 +839,21 @@ static i64 sys_process_create(const u64 *a)
     }
 
     slot->proc = proc;                      /* process_spawn 이 준 참조를 핸들이 소유한다 */
+
+    if (a[4] & NX_SPAWN_INHERIT) {
+        /* 자식은 아직 실행되지 않았다: CLOEXEC 가 아닌 핸들을 같은 슬롯에 물려준다 (세대 0) */
+        status = nx_handles_inherit(&proc->handles, table, false, true);
+        if (NSTATUS_IS_ERR(status)) {
+            (void)process_kill(proc, NX_EXIT_KILLED);
+            (void)nx_handle_close(table, handle);
+            return (i64)status;
+        }
+    }
     return (i64)handle;
 }
 
 /* 프로세스 핸들을 찾아 대상 프로세스를 돌려준다 */
-static Nstatus lookup_process(u64 handle, u32 rights, process_t **out)
+Nstatus lookup_process(u64 handle, u32 rights, process_t **out)
 {
     nx_handle_table_t *table = cur_handles();
     nx_handle_t *slot;
@@ -730,6 +885,31 @@ static i64 sys_process_kill(const u64 *a)
         return (i64)status;
 
     return (i64)process_kill(proc, (i32)NX_EXIT_KILLED);   /* 자기 자신의 핸들은 얻을 수 없다 */
+}
+
+/* NxProcessGroup(NX_PID_SELF 또는 프로세스 핸들, pgid) -> 그룹 번호 (nyx_abi.h) */
+static i64 sys_process_group(const u64 *a)
+{
+    process_t *proc = current_process;
+    u64 flags;
+
+    if (!proc)
+        return (i64)NnotInitialized;
+    if (a[0] != NX_PID_SELF) {
+        Nstatus status = lookup_process(a[0], (u32)NX_RIGHT_KILL, &proc);
+
+        if (NSTATUS_IS_ERR(status))
+            return (i64)status;
+    }
+    if (a[1] == NX_PGID_QUERY)
+        return (i64)proc->pgid;
+    if (a[1] >= NX_PGID_QUERY)
+        return (i64)NinvalidArg;
+
+    flags = irq_save();
+    proc->pgid = a[1] ? (u32)a[1] : proc->pid;
+    irq_restore(flags);
+    return (i64)proc->pgid;
 }
 
 /* NxProcessWait(handle, timeout_ms, i32 *out_code) */
@@ -815,6 +995,7 @@ static i64 sys_process_info(const u64 *a)
     pi.pid = p->pid;
     pi.state = p->state;
     pi.handle_count = nx_handles_count(&p->handles);
+    pi.parent_pid = p->parent_pid;
 
     return (i64)copy_to_user(a[1], &pi, sizeof(pi));
 }
@@ -823,7 +1004,12 @@ static i64 sys_process_info(const u64 *a)
 /* 신원 / 인증 / 전원                                                   */
 /* ------------------------------------------------------------------ */
 
-/* NxGetIdentity(struct nx_identity *out) */
+/*
+ * NxGetIdentity(struct nx_identity *out, token)
+ *   token == NX_NO_TOKEN: 호출한 프로세스의 신원.
+ *   그 외: 토큰 핸들(NX_RIGHT_STAT)이 담은 신원을 조회만 한다 (토큰은 소모되지 않는다).
+ *   login 이 셸을 띄우기 전에 그 사용자의 uid 로 roi:/<uid>/shell 을 읽으려고 쓴다.
+ */
 static i64 sys_get_identity(const u64 *a)
 {
     struct nx_identity id;
@@ -832,9 +1018,27 @@ static i64 sys_get_identity(const u64 *a)
     if (!self)
         return (i64)NnotInitialized;
     memset(&id, 0, sizeof(id));
-    id.uid = self->uid;
-    id.gid = self->gid;
-    memcpy(id.name, self->user_name, sizeof(self->user_name) < sizeof(id.name) ? sizeof(self->user_name) : sizeof(id.name));
+    if (a[1] != NX_NO_TOKEN) {
+        nx_handle_table_t *table = cur_handles();
+        nx_handle_t *slot;
+        Nstatus status = nx_handle_lookup(table, a[1], 0, &slot);
+
+        if (NSTATUS_IS_ERR(status))
+            return (i64)status;
+        if (slot->type != NX_HANDLE_TOKEN || !slot->token)
+            return (i64)NinvalidArg;
+        if (!(slot->rights & (u32)NX_RIGHT_STAT))
+            return (i64)Npermission;
+        id.uid = slot->token->uid;
+        id.gid = slot->token->gid;
+        memcpy(id.name, slot->token->name,
+               sizeof(slot->token->name) < sizeof(id.name) ? sizeof(slot->token->name) : sizeof(id.name));
+    } else {
+        id.uid = self->uid;
+        id.gid = self->gid;
+        memcpy(id.name, self->user_name,
+               sizeof(self->user_name) < sizeof(id.name) ? sizeof(self->user_name) : sizeof(id.name));
+    }
     id.name[sizeof(id.name) - 1] = '\0';
     return (i64)copy_to_user(a[0], &id, sizeof(id));
 }
@@ -847,6 +1051,9 @@ static i64 sys_power_off(const u64 *a)
     (void)a;
     if (!current_process || current_process->uid != 0)
         return (i64)Npermission;
+    /* 디스크의 쓰기 캐시를 매체로 (disk:/ 의 내용을 잃지 않도록) */
+    if (NSTATUS_IS_ERR(ahci_flush_all()))
+        printk_warn("power off: disk cache flush failed\n");
     printk("\nSystem power off.\n");
     return (i64)acpi_power_off(info ? info->Rsdp : nNULL);
 }
@@ -886,8 +1093,12 @@ static i64 sys_authenticate(const u64 *a)
     if (NSTATUS_IS_ERR(status)) {
         u32 hz = timer_get_hz();
 
-        if (status == Nauthentication && hz)
+        if (status == Nauthentication && hz) {
+            /* 신호로 줄일 수 없다 (자기에게 신호를 보내 무차별 대입의 지연을 건너뛰지 못하게) */
+            current_process->sig_hold = true;
             (void)process_sleep_ticks(((u64)NX_AUTH_FAIL_DELAY_MS * hz + 999UL) / 1000UL);
+            current_process->sig_hold = false;
+        }
         return (i64)status;
     }
 
@@ -986,6 +1197,9 @@ static i64 sys_poll(const u64 *a)
             } else if (slot->type == NX_HANDLE_CHANNEL) {
                 bits = channel_poll_bits(slot->chan, slot->chan_receiver);
                 qs[nq++] = slot->chan_receiver ? &slot->chan->recv_q : &slot->chan->send_q;
+            } else if (slot->type == NX_HANDLE_PIPE) {
+                bits = pipe_poll_bits(slot->pipe, slot->pipe_write);
+                qs[nq++] = pipe_waitq(slot->pipe, slot->pipe_write);
             } else if (slot->type == NX_HANDLE_CONSOLE && slot->console_fd == 0) {
                 if (tty_input_ready())
                     bits = NX_POLL_IN;
@@ -1152,10 +1366,11 @@ static i64 sys_create_node(const u64 *a)
     status = user_vfs_path(a[0], kpath, sizeof(kpath), NSP_OP_MODIFY);
     if (NSTATUS_IS_ERR(status))
         return (i64)status;
+    /* 보안 계층: 호출자의 umask 를 적용한다 */
     if (a[1] == NX_NODE_FILE)
-        return (i64)vfs_create(kpath, (u32)a[2]);
+        return (i64)vfs_create(kpath, perm_apply_umask((u32)a[2]));
     if (a[1] == NX_NODE_DIR)
-        return (i64)vfs_mkdir(kpath, (u32)a[2]);
+        return (i64)vfs_mkdir(kpath, perm_apply_umask((u32)a[2]));
     return (i64)NinvalidArg;
 }
 
@@ -1191,13 +1406,45 @@ static i64 sys_read_dir(const u64 *a)
     char kpath[NSP_PATH_MAX];
     struct nx_dirent de;
     u32 type = 0;
-    /* OPEN 규칙: 커널 전용 경로 자체만 막는다 (조상 디렉터리의 목록은 볼 수 있다 - 이름만 보인다) */
-    Nstatus status = user_vfs_path(a[0], kpath, sizeof(kpath), NSP_OP_OPEN);
+    u32 kind = 0;
+    Nstatus status = user_path(a[0], kpath, sizeof(kpath), &kind);
 
     if (NSTATUS_IS_ERR(status))
         return (i64)status;
 
     memset(&de, 0, sizeof(de));
+    if (kind == NSP_KIND_INFO) {
+        status = info_readdir(kpath, a[1], de.name, sizeof(de.name), &type);
+        if (NSTATUS_IS_ERR(status))
+            return (i64)status;
+        de.type = (type == INFO_NODE_DIR) ? NX_TYPE_DIR : NX_TYPE_FILE;
+        return (i64)copy_to_user(a[2], &de, sizeof(de));
+    }
+    if (kind == NSP_KIND_DEV) {
+        /* dev:/ 목록: 누구나 열 수 있는 표준 스트림 장치, 그다음 (root 에게만) 등록된 장치 */
+        static const char *const pub[] = { "stdin", "stdout", "stderr", "tty" };
+        const char *name = nNULL;
+        u64 i = a[1];
+
+        if (kpath[0] != '\0')
+            return (i64)Nunsupported;           /* dev:/ 아래에는 디렉터리가 없다 */
+        if (i < 4U)
+            name = pub[i];
+        else if (current_process && current_process->uid == 0 && i - 4U < 0xFFFFFFFFUL)
+            name = device_name_at((u32)(i - 4U));
+        if (!name)
+            return (i64)NnotFound;
+        memcpy(de.name, name, strlen(name) + 1U);
+        de.type = NX_TYPE_FILE;
+        return (i64)copy_to_user(a[2], &de, sizeof(de));
+    }
+    if (kind != NSP_KIND_VFS)
+        return (i64)Nunsupported;
+    /* OPEN 규칙: 커널 전용 경로 자체만 막는다 (조상 디렉터리의 목록은 볼 수 있다 - 이름만 보인다) */
+    status = nsp_check_protected(kpath, NSP_OP_OPEN);
+    if (NSTATUS_IS_ERR(status))
+        return (i64)status;
+
     status = vfs_readdir(kpath, a[1], de.name, sizeof(de.name), &type);
     if (NSTATUS_IS_ERR(status))
         return (i64)status;
@@ -1223,11 +1470,41 @@ static i64 sys_device_command(const u64 *a)
         return (i64)status;
 
     if (slot->type == NX_HANDLE_CONSOLE) {
-        /* 콘솔(stdin)은 에코 설정만 */
-        if (a[1] != NX_DEVCMD_TTY_ECHO || slot->console_fd != 0)
-            return (i64)Nunsupported;
-        tty_set_echo(a[2] ? true : false);
-        return 0;
+        /* 콘솔: 에코(stdin 만), 입력 모드, 창 크기 */
+        if (a[1] == NX_DEVCMD_TTY_ECHO) {
+            if (slot->console_fd != 0)
+                return (i64)Nunsupported;
+            tty_set_echo(a[2] ? true : false);
+            return 0;
+        }
+        if (a[1] == NX_DEVCMD_TTY_MODE) {
+            if (a[2] != NX_TTY_MODE_COOKED && a[2] != NX_TTY_MODE_RAW)
+                return (i64)NinvalidArg;
+            tty_set_raw(a[2] == NX_TTY_MODE_RAW ? true : false, current_process->pid);
+            return 0;
+        }
+        if (a[1] == NX_DEVCMD_TTY_FOREGROUND) {
+            u32 pgid;
+
+            if (a[2] == NX_PGID_QUERY)
+                return (i64)tty_get_foreground();
+            if (a[2] > 0xFFFFFFFFUL)
+                return (i64)NinvalidArg;
+            pgid = (u32)a[2];
+            /* 다른 사용자의 프로세스가 든 그룹을 Ctrl-C 의 대상으로 만들 수 없다 (root 는 예외) */
+            if (pgid != 0 && current_process->uid != 0 &&
+                !process_group_owned_by(pgid, current_process->uid))
+                return (i64)Npermission;
+            tty_set_foreground(pgid);
+            return 0;
+        }
+        if (a[1] == NX_DEVCMD_TTY_WINSIZE) {
+            struct nx_winsize ws;
+
+            tty_get_winsize(&ws);
+            return (i64)copy_to_user(a[2], &ws, sizeof(ws));
+        }
+        return (i64)Nunsupported;
     }
 
     if (slot->type != NX_HANDLE_DEVICE)
@@ -1317,6 +1594,12 @@ static const struct syscall_entry g_syscalls[] = {
     { NX_SYS_STAT,             sys_stat },
     { NX_SYS_DUPLICATE_HANDLE, sys_duplicate_handle },
     { NX_SYS_POLL,             sys_poll },
+    { NX_SYS_DUPLICATE_HANDLE_EX, sys_duplicate_handle_ex },
+    { NX_SYS_HANDLE_FLAGS,     sys_handle_flags },
+    { NX_SYS_PIPE_CREATE,      sys_pipe_create },
+    { NX_SYS_STAT_PATH,        sys_stat_path },
+    { NX_SYS_SET_MODE,         sys_set_mode },
+    { NX_SYS_SET_UMASK,        sys_set_umask },
 
     { NX_SYS_CHANNEL_CREATE,   sys_channel_create },
     { NX_SYS_CHANNEL_SEND,     sys_channel_send },
@@ -1332,7 +1615,16 @@ static const struct syscall_entry g_syscalls[] = {
 
     { NX_SYS_PROCESS_CREATE,   sys_process_create },
     { NX_SYS_PROCESS_EXIT,     sys_process_exit },
+    { NX_SYS_PROCESS_FORK,     sys_process_fork },
+    { NX_SYS_PROCESS_EXEC,     sys_process_exec },
     { NX_SYS_PROCESS_KILL,     sys_process_kill },
+    { NX_SYS_PROCESS_GROUP,    sys_process_group },
+    { NX_SYS_SIGNAL_ACTION,    sys_signal_action },
+    { NX_SYS_SIGNAL_MASK,      sys_signal_mask },
+    { NX_SYS_SIGNAL_SEND,      sys_signal_send },
+    { NX_SYS_SIGNAL_RETURN,    sys_signal_return },
+    { NX_SYS_SIGNAL_SUSPEND,   sys_signal_suspend },
+    { NX_SYS_SIGNAL_PENDING,   sys_signal_pending },
     { NX_SYS_PROCESS_WAIT,     sys_process_wait },
     { NX_SYS_PROCESS_INFO,     sys_process_info },
 
@@ -1371,9 +1663,14 @@ i64 syscall_dispatch(
     return (i64)NsyscallFailed;      /* 알 수 없는 번호: 커널은 영향받지 않는다 */
 }
 
-void syscall_handle(struct trap_frame *frame)
+u64 syscall_handle(struct trap_frame *frame)
 {
-    i64 result = syscall_dispatch(
+    i64 result;
+    u64 use_iret = 0;
+
+    if (current_process)
+        current_process->uframe = frame;    /* fork/exec 가 사용자 레지스터를 읽고 바꾼다 (kernel/exec/exec.h) */
+    result = syscall_dispatch(
         frame->rax,
         frame->rdi,
         frame->rsi,
@@ -1385,6 +1682,16 @@ void syscall_handle(struct trap_frame *frame)
 
     /* iretq/sysret 후 호출자의 rax 로 전달된다 */
     frame->rax = (u64)result;
+
+    /* 사용자 모드로 돌아가기 직전: 신호 (kernel/process/signal.h) */
+    if (current_process) {
+        signal_deliver(frame);
+        if (current_process->sig_iret) {
+            current_process->sig_iret = false;
+            use_iret = 1;
+        }
+    }
+    return use_iret;
 }
 
 /* ------------------------------------------------------------------ */

@@ -1,0 +1,9 @@
+TinyCC (Tiny C Compiler) — 수정하지 않은 upstream 사본
+
+출처:   https://github.com/TinyCC/tinycc (mob 브랜치)
+커밋:   43c7708b85681a2fd4451c8a541af4494a8919b2 (2026-10-03, "tccelf: Fix static linking with musl")
+라이선스: LGPL 2.1 이상 (COPYING, RELICENSING 참고)
+
+Nyxis 용 수정은 이 디렉터리에 하지 않는다. 빌드할 때 사본에 userland/nlcc/tinycc-nyxis.patch 를 적용하고
+userland/nlcc/config.h 를 더한다 (nxkernel/Makefile 의 nlcc 규칙). 새 upstream 으로 올릴 때는 이 디렉터리를
+통째로 바꾸고 이 파일의 커밋을 고친 뒤, 패치가 적용되는지 확인한다.

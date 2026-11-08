@@ -8,11 +8,8 @@
  *
  * 콜백 시그니처(nyfs_disk_read_fn/write_fn)는 기존 fat16_mount_params_t 와 똑같이
  * "u32 diskno + 바이트 오프셋 + 크기" 형태로 맞췄다. ramdisk_read/ramdisk_write 가
- * 이미 이 모양이라 그대로 꽂아 쓸 수 있다. ATA/AHCI 는 아직 이 시그니처의 읽기/쓰기
- * 쌍을 둘 다 제공하지 않으므로(ahci_read 만 있고 ahci_write 는 없음, ata 는 섹터
- * 단위 LBA28 API 라 모양이 다름) 지금 당장 nyfs 로 실제 쓰기가 되는 백엔드는
- * ramdisk 뿐이다 - 이건 nyfs 의 제약이 아니라 기존 드라이버 계층의 공백이고,
- * fat16 도 이미 같은 이유로 읽기 전용이다.
+ * 이미 이 모양이라 그대로 꽂아 쓸 수 있다. SATA 디스크는 ahci_disk_read/ahci_disk_write 가 같은 모양이다
+ * (disk:/, nxkernel/kernel/kernel.c 의 mount_disk).
  */
 #ifndef NYFS_H
 #define NYFS_H

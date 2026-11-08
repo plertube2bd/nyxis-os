@@ -25,6 +25,7 @@
 #include "console/inputs/tty.h"
 #include "kernel/crypto/sha256.h"
 #include "kernel/syscall/nspath.h"
+#include "kernel/info/info.h"
 #include "kernel/security/auth.h"
 #include "kernel/syscall/syscall.h"
 #include "kernel/timer/pit/pit_base.h"
@@ -45,9 +46,9 @@ static int g_failures = 0;
 static void check(int cond, const char *what)
 {
     if (cond) {
-        printk("  [ OK ] %s\n", what);
+        printk("  [ " KC_GREEN "OK" KC_RESET " ] %s\n", what);
     } else {
-        printk("  [FAIL] %s\n", what);
+        printk("  [" KC_RED "FAIL" KC_RESET "] %s\n", what);
         g_failures++;
     }
 }
@@ -458,6 +459,35 @@ static void namespace_tests(void)
     check(ns_err("face:/..", Npermission) && ns_err("app:/../roi/users", Npermission), ".. above an alias root is refused");
     check(ns_is("fs:", NSP_KIND_VFS, "fs:/") && ns_is("tmp://x//", NSP_KIND_VFS, "tmp:/x"), "fs: root and empty components");
     check(ns_is("roi:/users", NSP_KIND_VFS, "fs:/roi/users"), "roi:/ -> fs:/roi/ (root)");
+    check(ns_is("roi:/1000/shell", NSP_KIND_VFS, "fs:/roi/1000/shell") && ns_is("roi:", NSP_KIND_VFS, "fs:/roi"),
+          "root reaches every roi:/ path");
+    {
+        char *buf = nNULL;
+        usize len = 0;
+        u32 type = 0;
+        char name[32];
+
+        check(info_open("version", &type, &buf, &len) == Nok && type == INFO_NODE_FILE && len == 4 &&
+              memcmp(buf, "0.1\n", 4) == 0, "info_open builds a snapshot (version)");
+        kfree(buf);
+        check(info_open("memory", &type, &buf, &len) == Nok && type == INFO_NODE_DIR && buf == nNULL,
+              "info_open on a directory has no buffer");
+        check(info_open("nope", &type, &buf, &len) == NnotFound && info_open("memory/", &type, &buf, &len) == NnotFound,
+              "unknown info:/ names are not found");
+        check(info_readdir("", 0, name, sizeof(name), &type) == Nok && strcmp(name, "hostname") == 0 &&
+              info_readdir("", 1, name, sizeof(name), &type) == Nok && strcmp(name, "timezone") == 0 &&
+              info_readdir("", 2, name, sizeof(name), &type) == Nok && strcmp(name, "utc_offset") == 0 &&
+              info_readdir("memory", 1, name, sizeof(name), &type) == Nok && strcmp(name, "free_kib") == 0 &&
+              info_readdir("memory", 2, name, sizeof(name), &type) == NnotFound, "info_readdir lists direct children");
+        check(info_hostname_valid("nyxis", 5) && info_hostname_valid("a-1", 3) && !info_hostname_valid("-a", 2) &&
+              !info_hostname_valid("A", 1) && !info_hostname_valid("a b", 3) && !info_hostname_valid("a_b", 3) &&
+              !info_hostname_valid("", 0), "hostname format rule");
+        check(info_timezone_valid("Europe/London", 13) && info_timezone_valid("UTC", 3) &&
+              info_timezone_valid("America/Argentina/Buenos_Aires", 30) && info_timezone_valid("Etc/GMT+1", 9) &&
+              !info_timezone_valid("/UTC", 4) && !info_timezone_valid("Europe//London", 14) &&
+              !info_timezone_valid("Europe/", 7) && !info_timezone_valid("../x", 4) &&
+              !info_timezone_valid("a b", 3) && !info_timezone_valid("", 0), "timezone format rule");
+    }
     check(ns_is("dev:/fb0", NSP_KIND_DEV, "fb0") && ns_is("svc:/sys/init", NSP_KIND_SVC, "sys/init"), "dev:/ and svc:/ names");
     check(ns_err("zz:/a", NnotFound) && ns_err("/abs", NnotFound) && ns_err("app:/a:b", NinvalidArg), "unknown prefix / no prefix / ':' in a component");
     check(nsp_check_protected("fs:/roi/users", NSP_OP_OPEN) == Npermission, "roi:/users is kernel-only (open)");
@@ -474,8 +504,20 @@ static void namespace_tests(void)
     check(ns_is("face:/x", NSP_KIND_VFS, "fs:/home/test/x"), "face:/ is per-user (test -> fs:/home/test)");
     check(ns_err("fs:/usr", Npermission) && ns_err("roi:/users", Npermission) && ns_err("dev:/fb0", Npermission),
           "non-root cannot use fs:/, roi:/ or dev:/");
+    check(ns_is("dev:/stdout", NSP_KIND_DEV, "stdout") && ns_is("dev:/stdin", NSP_KIND_DEV, "stdin") &&
+          ns_is("dev:/stderr", NSP_KIND_DEV, "stderr") && ns_is("dev:/tty", NSP_KIND_DEV, "tty") &&
+          ns_is("dev:/", NSP_KIND_DEV, "") && ns_err("dev:/stdout/x", Npermission) && ns_err("dev:/stdoutx", Npermission),
+          "non-root can open only the standard stream devices (dev:/stdin stdout stderr tty)");
     check(ns_is("app:/nysh.run", NSP_KIND_VFS, "fs:/usr/nysh.run") && ns_is("tmp:/a", NSP_KIND_VFS, "tmp:/a"),
           "non-root can use app:/ and tmp:/");
+    check(ns_is("roi:/1000/app/x", NSP_KIND_VFS, "fs:/roi/1000/app/x") && ns_is("roi:/1000", NSP_KIND_VFS, "fs:/roi/1000"),
+          "non-root reaches its own roi:/<uid>/ space");
+    check(ns_err("roi:/", Npermission) && ns_err("roi:/hostname", Npermission) && ns_err("roi:/default/shell", Npermission) &&
+          ns_err("roi:/1001/x", Npermission) && ns_err("roi:/01000", Npermission) && ns_err("roi:/100", Npermission) &&
+          ns_err("roi:/1000/../0/shell", Npermission) && ns_err("roi:/10000", Npermission),
+          "non-root: other roi:/ paths (root keys, template, other uids, tricks) are refused");
+    check(ns_is("info:/memory/free_kib", NSP_KIND_INFO, "memory/free_kib") && ns_is("info:", NSP_KIND_INFO, "") &&
+          ns_is("info:/./memory/../hostname", NSP_KIND_INFO, "hostname"), "info:/ is open to everyone (normalized names)");
     self->uid = su;
     self->gid = sg;
     memcpy(self->user_name, saved_name, sizeof(saved_name));
@@ -720,9 +762,9 @@ static void functional_tests(void)
     spawn_tests();
 
     if (g_failures == 0)
-        printk("SELFTEST PASSED\n");
+        printk(KC_BOLD KC_GREEN "SELFTEST PASSED" KC_RESET "\n");
     else
-        printk("SELFTEST FAILED (%d failures)\n", g_failures);
+        printk(KC_BOLD KC_RED "SELFTEST FAILED" KC_RESET " (%d failures)\n", g_failures);
 }
 
 void nyx_selftest(void)

@@ -17,6 +17,8 @@
 #include "console/outputs/printk.h"
 #include "kernel/error_handling/panic.h"
 #include "kernel/process/process.h"
+#include "kernel/process/signal.h"
+#include "nyx_abi.h"
 #include "kernel/syscall/syscall.h"
 #include "kernel/syscall/uaccess.h"
 #include "drivers/pic/pic.h"
@@ -182,6 +184,24 @@ static void exception_default(struct trap_frame *f)
 
     if ((f->cs & 3UL) == 3UL) {
         /* 유저 모드 프로세스의 오류: 커널은 살리고 해당 프로세스만 종료한다 */
+        u32 sig = 0;
+
+        switch (f->vector) {
+        case VEC_PAGE_FAULT: case VEC_GENERAL_PROTECTION: case VEC_STACK_FAULT:
+        case VEC_ALIGNMENT_CHECK: case VEC_SEGMENT_NOT_PRESENT:
+            sig = NX_SIGSEGV; break;
+        case VEC_DIVIDE_ERROR: case VEC_X87_FP: case VEC_SIMD_FP: case VEC_OVERFLOW:
+            sig = NX_SIGFPE; break;
+        case VEC_INVALID_OPCODE: case VEC_BOUND_RANGE:
+            sig = NX_SIGILL; break;
+        case VEC_DEBUG: case VEC_BREAKPOINT:
+            sig = NX_SIGTRAP; break;
+        default:
+            break;
+        }
+        /* 처리기가 있으면 가로챈다 (돌아오면 같은 명령을 다시 실행한다) */
+        if (sig && signal_fault(f, sig, f->vector == VEC_PAGE_FAULT ? read_cr2() : f->rip))
+            return;
         printk("\nUser-mode fault, terminating process:\n");
         dump_frame(f);
         process_exit_with_code((i32)NX_EXIT_FAULT);
@@ -226,14 +246,16 @@ void interrupt_dispatch(struct trap_frame *frame)
 
         /* 선점 지점: 사용자 모드로 돌아가는 IRQ 에서만 (EOI 이후여야 한다 — 다른 프로세스로 전환한 동안
          * 이 IRQ 가 미완료로 남으면 그 라인의 다음 인터럽트가 막힌다). 커널 코드는 선점하지 않는다. */
-        if ((frame->cs & 3UL) == 3UL)
+        if ((frame->cs & 3UL) == 3UL) {
             sched_preempt_point();
+            signal_deliver(frame);          /* 선점에서 돌아온 뒤에도: 그 사이에 온 신호 (signal.h) */
+        }
         return;
     }
 
     /* 시스템 콜 */
     if (v == VEC_SYSCALL) {
-        syscall_handle(frame);
+        (void)syscall_handle(frame);        /* int 0x80 은 늘 iretq 로 돌아간다 */
         return;
     }
 

@@ -31,4 +31,19 @@ typedef struct spawn_args {
  */
 Nstatus process_spawn(const char *path, const spawn_args_t *args, process_t **out_proc);
 
+/* 실행 파일로 만든 새 프로그램 이미지 (아직 어떤 프로세스에도 붙지 않은 주소 공간) */
+typedef struct spawn_image {
+    addr_space_t as;
+    u64 entry;          /* 진입점 (ELF e_entry) */
+    u64 stack;          /* 초기 rsp (argv/envp 를 쓴 System V 스택) */
+    u64 image_end;      /* 힙(brk) 시작 */
+} spawn_image_t;
+
+/*
+ * process_spawn 의 앞부분: path 를 실행 권한으로 열어 새 주소 공간에 적재하고 스택을 만든다.
+ * NxProcessExec 도 이것으로 새 이미지를 끝까지 만든 뒤에야 옛 이미지를 버린다.
+ * 실패하면 만든 것을 모두 되돌린다. 성공하면 out->as 의 소유권은 호출자에게 있다.
+ */
+Nstatus spawn_build_image(const char *path, const spawn_args_t *args, spawn_image_t *out);
+
 #endif /* KERNEL_PROCESS_SPAWN_H */

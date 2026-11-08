@@ -24,7 +24,7 @@
 #define NX_SYS_SLEEP            4U
 #define NX_SYS_YIELD            5U
 #define NX_SYS_SYSINFO          7U
-#define NX_SYS_GET_IDENTITY     8U    /* NxGetIdentity(struct nx_identity *out) */
+#define NX_SYS_GET_IDENTITY     8U    /* NxGetIdentity(struct nx_identity *out, token) token=NX_NO_TOKEN 이면 자신 */
 #define NX_SYS_POWER_OFF        9U    /* NxPowerOff() - uid 0 만. 성공하면 돌아오지 않는다 */
 /*
  * NxAuthenticate(const char *name, const char *password) -> 토큰 핸들 (NX_RIGHT_SPAWN)
@@ -49,6 +49,20 @@
  *   프로세스 핸들 NX_POLL_EXIT(종료됨), stdin NX_POLL_IN(완성된 줄 또는 EOF).
  */
 #define NX_SYS_POLL             42U
+/*
+ * NxDuplicateHandleEx(handle, rights_mask, flags, target_slot) -> 새 핸들 (POSIX dup/dup2 의 바탕)
+ *   NX_DUP_SHARE   : 파일이면 "열린 파일" 을 공유한다 (오프셋을 함께 쓴다 - POSIX dup). 없으면 NxDuplicateHandle
+ *                    처럼 새로 열어 오프셋만 복사한다. 콘솔/파이프/채널 송신 끝은 원래 공유 객체다.
+ *   NX_DUP_TO_SLOT : target_slot(0 ~ NX_MAX_HANDLES-1) 번 슬롯에 만든다. 그 슬롯이 열려 있으면 먼저 닫는다 (dup2).
+ *                    handle 이 이미 그 슬롯이면 아무것도 하지 않고 handle 을 돌려준다. 없으면 가장 낮은 빈 슬롯.
+ *   NX_DUP_MIN_SLOT: target_slot 이상인 가장 낮은 빈 슬롯에 만든다 (fcntl F_DUPFD). NX_DUP_TO_SLOT 과 함께 쓸 수 없다.
+ *   NX_DUP_CLOEXEC : 새 핸들에 NX_HFLAG_CLOEXEC 를 켠다.
+ *   토큰/장치/채널 수신 끝은 복제할 수 없다 (Nunsupported). NX_RIGHT_DUP 이 필요하다.
+ *
+ * NxHandleFlags(handle, set, clear) -> 바뀐 뒤의 플래그. 플래그: NX_HFLAG_CLOEXEC (NxProcessExec 때 닫힌다)
+ */
+#define NX_SYS_DUPLICATE_HANDLE_EX 43U
+#define NX_SYS_HANDLE_FLAGS     44U
 
 /*
  * NxProcessCreate(const char *path, const char *const *argv, const char *const *envp) -> 프로세스 핸들
@@ -77,6 +91,106 @@
 #define NX_SYS_PROCESS_KILL     66U
 #define NX_SYS_PROCESS_WAIT     67U
 #define NX_SYS_PROCESS_INFO     68U
+/*
+ * NxProcessFork() -> 부모에게는 자식 프로세스 핸들(NxProcessCreate 와 같은 권한), 자식에게는 0.
+ *   자식은 부모 사용자 메모리의 복사본(지금은 즉시 복사; 쓰기 시 복사는 아직 없다), 같은 레지스터,
+ *   같은 FPU 상태, 같은 신원과 umask 로 시작한다. 핸들 테이블은 슬롯 번호와 세대까지 그대로 물려받는다
+ *   (그래서 메모리에 저장된 핸들 값이 자식에서도 유효하다). 열린 파일은 오프셋을 공유한다.
+ *   물려받지 않는 것: 프로세스 핸들(부모의 자식은 자식의 자식이 아니다), 토큰(일회용 비밀), 장치(독점),
+ *   채널 수신 끝(받는 쪽은 하나). 그 슬롯은 자식에서 닫힌 상태다.
+ *
+ * NxProcessExec(const char *path, argv, envp) -> 성공하면 돌아오지 않는다 (새 프로그램이 시작된다).
+ *   현재 프로세스(pid, 신원, umask, 부모 관계, 핸들)는 그대로 두고 프로그램 이미지만 바꾼다.
+ *   새 이미지를 다 만든 뒤에 옛 이미지를 버리므로, 실패하면 옛 프로그램이 오류를 받고 계속 실행된다.
+ *   NX_HFLAG_CLOEXEC 핸들은 닫힌다. 남은 핸들의 세대는 0 으로 돌아간다: 새 프로그램에서 핸들 값 = 슬롯 번호.
+ *   실행 파일에는 실행 권한(x 비트)이 있어야 한다 (NxProcessCreate 도 같다).
+ */
+#define NX_SYS_PROCESS_FORK     73U
+#define NX_SYS_PROCESS_EXEC     74U
+
+/*
+ * NxProcessGroup(NX_PID_SELF 또는 프로세스 핸들, pgid) -> 그 프로세스의 (바뀐) 프로세스 그룹 번호.
+ *   프로세스 그룹 = 콘솔의 Ctrl-C 가 함께 끝내는 묶음 (셸의 "작업" 하나). 새 프로세스는 만든 프로세스의 그룹을
+ *   물려받는다 (커널이 만든 init 은 자기 pid). 핸들이면 NX_RIGHT_KILL 필요 (자기 자식만 옮길 수 있다).
+ *   pgid: 0 = 대상의 pid 로 새 그룹, NX_PGID_QUERY = 바꾸지 않고 조회만, 그 밖 = 그 그룹으로 옮긴다.
+ */
+#define NX_SYS_PROCESS_GROUP    75U
+#define NX_PGID_QUERY           0xFFFFFFFFUL
+
+/*
+ * 신호 (kernel/process/signal.h). 번호 1..31 (NX_SIG*), 집합(mask)은 비트 (sig - 1).
+ *
+ * NxSignalAction(sig, const struct nx_sigaction *act 또는 NULL, struct nx_sigaction *old 또는 NULL) -> 0.
+ *   handler: NX_SIG_DFL(기본 동작) / NX_SIG_IGN(무시) / 사용자 함수 주소. 함수면 restorer(처리기가 돌아갈 곳,
+ *   NxSignalReturn 을 부르는 코드)가 꼭 있어야 한다. SIGKILL 과 SIGSTOP 은 바꿀 수 없다 (NinvalidArg).
+ *   무시로 바꾸면 그 신호의 대기 중인 것은 버린다. fork 는 물려주고, exec 는 함수 처리기만 기본으로 되돌린다.
+ * NxSignalMask(how, set) -> 바꾸기 전의 막은 집합. how: NX_SIG_BLOCK / UNBLOCK / SETMASK. SIGKILL/SIGSTOP 은 막히지 않는다.
+ * NxSignalSend(NX_PID_SELF 또는 프로세스 핸들, sig) -> 0. 핸들이면 NX_RIGHT_KILL. sig 0 은 확인만.
+ *   SIGKILL 은 NxProcessKill 과 같다 (바로 종료, 종료 코드 NX_EXIT_KILLED).
+ * NxSignalReturn() -> 처리기에서 돌아온다 (restorer 가 부른다). 사용자 스택의 struct nx_sigcontext 로 처리기 직전의
+ *   레지스터/FPU/막은 집합을 되돌린다 (rip/rsp 는 사용자 영역, rflags 는 사용자 비트만 받는다). 돌아오지 않는다.
+ * NxSignalSuspend(set) -> 막은 집합을 잠시 set 으로 바꾸고 신호가 올 때까지 잔다. 늘 Ninterrupted.
+ *   처리기가 끝나면 원래 집합으로 돌아간다 (sigsuspend/pause).
+ * NxSignalPending() -> 막혀서 대기 중인 신호 집합.
+ *
+ * 전달: 사용자 모드로 돌아가기 직전(시스템 콜, 인터럽트, 예외)에 막히지 않은 대기 신호를 하나씩 처리한다.
+ *   기본 동작은 무시(SIGCHLD SIGCONT SIGURG SIGWINCH, 그리고 멈춤을 지원하지 않아 SIGTSTP SIGTTIN SIGTTOU)
+ *   또는 종료(종료 코드 NX_EXIT_SIGNAL(sig)). 처리기는 사용자 스택(red zone 128 바이트 아래)에 struct nx_sigframe 을
+ *   쌓고 handler(sig, struct nx_siginfo *, struct nx_sigcontext *) 로 불린다. 처리 중에는 그 신호와 act.mask 가 막힌다
+ *   (NX_SA_NODEFER 면 그 신호는 빼고, NX_SA_RESETHAND 면 처리기를 기본으로 되돌린다).
+ *   잠든 시스템 콜(읽기, 대기, NxSleep, NxPoll, 파이프/채널)은 깨어나 Ninterrupted 를 돌려준다 (다시 시작하지 않는다).
+ * 보내는 곳: NxSignalSend, 콘솔(Ctrl-C = SIGINT, Ctrl-\ = SIGQUIT -> 포그라운드 그룹), CPU 예외(처리기가 있고 막히지 않았을
+ *   때만: #PF #GP #SS #AC -> SIGSEGV, #DE #MF #XM -> SIGFPE, #UD -> SIGILL, #DB #BP -> SIGTRAP. 아니면 NX_EXIT_FAULT 로 종료),
+ *   자식의 종료(부모에게 SIGCHLD).
+ */
+#define NX_SYS_SIGNAL_ACTION    76U
+#define NX_SYS_SIGNAL_MASK      77U
+#define NX_SYS_SIGNAL_SEND      78U
+#define NX_SYS_SIGNAL_RETURN    79U
+#define NX_SYS_SIGNAL_SUSPEND   80U
+#define NX_SYS_SIGNAL_PENDING   81U
+
+#define NX_SIG_MAX      32U          /* 신호 번호 < NX_SIG_MAX */
+#define NX_SIGHUP       1U
+#define NX_SIGINT       2U
+#define NX_SIGQUIT      3U
+#define NX_SIGILL       4U
+#define NX_SIGTRAP      5U
+#define NX_SIGABRT      6U
+#define NX_SIGBUS       7U
+#define NX_SIGFPE       8U
+#define NX_SIGKILL      9U
+#define NX_SIGUSR1      10U
+#define NX_SIGSEGV      11U
+#define NX_SIGUSR2      12U
+#define NX_SIGPIPE      13U
+#define NX_SIGALRM      14U
+#define NX_SIGTERM      15U
+#define NX_SIGCHLD      17U
+#define NX_SIGCONT      18U
+#define NX_SIGSTOP      19U
+#define NX_SIGTSTP      20U
+#define NX_SIGTTIN      21U
+#define NX_SIGTTOU      22U
+#define NX_SIGURG       23U
+#define NX_SIGWINCH     28U
+
+#define NX_SIG_DFL      0UL
+#define NX_SIG_IGN      1UL
+
+#define NX_SA_SIGINFO   0x1U         /* 정보용 (처리기는 늘 세 인자로 불린다) */
+#define NX_SA_NODEFER   0x2U
+#define NX_SA_RESETHAND 0x4U
+
+#define NX_SIG_BLOCK    0UL
+#define NX_SIG_UNBLOCK  1UL
+#define NX_SIG_SETMASK  2UL
+
+/* nx_siginfo.code */
+#define NX_SI_USER      0            /* NxSignalSend: pid = 보낸 프로세스 */
+#define NX_SI_FAULT     1            /* CPU 예외: addr = 잘못된 주소 (#PF 의 CR2) 또는 명령 주소 */
+#define NX_SI_CHILD     1            /* SIGCHLD: pid = 끝난 자식 */
+#define NX_SI_KERNEL    0x80         /* 콘솔(Ctrl-C 등) */
 
 /*
  * NxVirtualAlloc(increment) -> 새 brk 가상 주소 (u64, 항상 >= 0 이므로 오류와 헷갈리지 않는다)
@@ -100,6 +214,13 @@
  *     메시지가 없으면 잠든다(timeout_ms 규칙은 NxPoll 과 같다). buf 가 작으면 NbufferOverflow 이고
  *     메시지는 큐에 남는다 (info->length 로 필요한 크기를 알려준다).
  */
+/*
+ * NxPipeCreate(u64 out[2], flags) -> 0. out[0] = 읽기 끝(READ|STAT|DUP), out[1] = 쓰기 끝(WRITE|STAT|DUP).
+ *   flags: NX_DUP_CLOEXEC 이면 두 핸들 모두 NX_HFLAG_CLOEXEC. 의미는 kernel/ipc/pipe.h (POSIX 파이프와 같다):
+ *   빈 파이프 읽기는 잠들고 쓰는 쪽이 모두 닫히면 0(EOF), 읽는 쪽이 모두 닫힌 뒤의 쓰기는 Ndisconnected.
+ *   NX_PIPE_ATOMIC 이하의 쓰기는 다른 쓰기와 섞이지 않는다. NxPoll 지원 (IN/OUT/HUP).
+ */
+#define NX_SYS_PIPE_CREATE      128U
 #define NX_SYS_CHANNEL_CREATE   129U
 #define NX_SYS_CHANNEL_SEND     130U
 #define NX_SYS_CHANNEL_RECEIVE  131U
@@ -115,6 +236,15 @@
 #define NX_SYS_REMOVE_NODE      163U
 #define NX_SYS_RENAME_NODE      164U
 #define NX_SYS_READ_DIR         165U
+/*
+ * 보안 계층 (파일 권한)
+ *   NxStatPath(path, struct nx_stat *out)  열지 않고 정보만 (경로의 디렉터리 순회 권한만 필요). rights 는 0
+ *   NxSetMode(path, mode)                  권한 비트 바꾸기 (chmod). 소유자 또는 uid 0 만. mode <= 0777
+ *   NxSetUmask(mask) -> 이전 마스크         NxCreateNode 의 mode 에서 지울 비트 (기본 022). fork/생성 시 물려준다
+ */
+#define NX_SYS_STAT_PATH        166U
+#define NX_SYS_SET_MODE         167U
+#define NX_SYS_SET_UMASK        168U
 
 /*
  * 장치 (NxOpen("dev:/...") 으로 연다. uid 0 만. 장치는 배타적으로 소유된다 - 다른 프로세스가 쓰는 중이면 Nbusy.
@@ -124,6 +254,11 @@
  *                 소유 중에는 커널 로그/stdin 이 COM1 을 쓰지 않는다
  *   dev:/rd0      비어 있는 RAM 블록 장치 (마운트되지 않음). NxRead/NxWrite/NxSeek, 512바이트 단위
  *   dev:/rootdisk fs:/ 가 올라간 RAM 디스크. 마운트되어 있으므로 읽기만 된다 (쓰기 열기는 Nbusy)
+ * 표준 스트림 장치 (누구나 연다. 독점이 아니다):
+ *   dev:/tty      콘솔 터미널 자체 (리디렉션과 무관하게 화면/키보드). 쓰기는 커널 로그를 거치지 않는다
+ *   dev:/stdin    호출자의 0/1/2 번 핸들이 가리키는 객체를 공유하는 새 핸들 (dup 와 같다: 파일이면 오프셋도
+ *   dev:/stdout   공유). 리디렉션되어 있으면 그 파일/파이프. 그 번호가 닫혀 있으면 NnotFound,
+ *   dev:/stderr   원래 핸들에 없는 읽기/쓰기 권한을 요청하면 Npermission. close-on-exec 는 이어지지 않는다
  *   NxDeviceCommand(h, cmd, arg)     NX_DEVCMD_*
  *   NxDeviceMapMMIO(h, u64 *out_addr) 장치 메모리를 매핑하고 사용자 가상 주소를 돌려준다
  */
@@ -138,9 +273,16 @@
 /* 2.0: NxProcessCreate 가 pid 대신 프로세스 핸들을 돌려주고 argv/envp 를 받는다 (호환되지 않는 변경).
  *      NxProcessKill/NxProcessWait 추가, NxRead(stdin) 이 콘솔 입력을 읽는다.
  * 2.1: 신원/인증(NxGetIdentity, NxAuthenticate, NxProcessCreate 의 token 인자), 이름공간(fs:/ app:/ face:/
- *      roi:/ tmp:/ dev:/ svc:/), 파일 노드 호출, 장치, 채널, NxPoll, NxPowerOff. */
+ *      roi:/ tmp:/ dev:/ svc:/), 파일 노드 호출, 장치, 채널, NxPoll, NxPowerOff.
+ * 2.2: info:/ 이름공간, roi:/<uid>/ 사용자 공간, NxGetIdentity 의 token 인자, NX_UID_TEMPLATE.
+ * 2.3: NX_CLOCK_REALTIME, 실행 계층(NxProcessFork/Exec, NxProcessCreate 의 flags), IPC 계층(NxPipeCreate),
+ *      핸들(NxDuplicateHandleEx/NxHandleFlags), 보안 계층(NxStatPath/NxSetMode/NxSetUmask, 실행 권한 검사),
+ *      nx_stat 의 mode/uid/gid, nx_procinfo 의 parent_pid, 표준 스트림 장치(dev:/stdin stdout stderr tty).
+ *      콘솔 쓰기는 커널 로그(printk)가 아니라 터미널 장치로 간다. dev:/ 목록(NxReadDir). NX_O_APPEND.
+ * 2.4: 신호(NxSignalAction/Mask/Send/Return/Suspend/Pending, 종료 코드 NX_EXIT_SIGNAL), 프로세스 그룹
+ *      (NxProcessGroup), 콘솔의 포그라운드 그룹(NX_DEVCMD_TTY_FOREGROUND, Ctrl-C = SIGINT). disk:/ 이름공간. */
 #define NX_ABI_MAJOR   2UL
-#define NX_ABI_MINOR   1UL
+#define NX_ABI_MINOR   4UL
 #define NX_ABI_PATCH   0UL
 #define NX_ABI_VERSION ((NX_ABI_MAJOR << 32) | (NX_ABI_MINOR << 16) | NX_ABI_PATCH)
 
@@ -163,10 +305,25 @@
 #define NX_RIGHT_DEVICE 0x400UL   /* 장치: NxDeviceCommand / NxDeviceMapMMIO */
 #define NX_RIGHT_ALL    0x7FFUL
 
+/* NxDuplicateHandleEx / NxPipeCreate 플래그 */
+#define NX_DUP_SHARE    0x1UL
+#define NX_DUP_TO_SLOT  0x2UL
+#define NX_DUP_CLOEXEC  0x4UL
+#define NX_DUP_MIN_SLOT 0x8UL
+
+/* 핸들 플래그 (NxHandleFlags) */
+#define NX_HFLAG_CLOEXEC 0x1UL
+
+/* NxProcessCreate 의 다섯 번째 인자 flags */
+#define NX_SPAWN_INHERIT 0x1UL    /* NX_HFLAG_CLOEXEC 가 아닌 핸들을 같은 슬롯 번호로 물려준다 (세대는 0: 값 = 슬롯 번호).
+                                     물려주지 않는 종류는 NxProcessFork 와 같다. 없으면 자기 콘솔 0/1/2 로 시작 */
+
 /* ---------------- NxOpen 플래그 ---------------- */
 #define NX_O_READ   0x1UL     /* 읽기 */
 #define NX_O_WRITE  0x2UL     /* 쓰기 (읽기 전용 파일시스템에서는 NreadOnly) */
-#define NX_O_MASK   0x3UL
+#define NX_O_APPEND 0x4UL     /* 파일: 쓰기마다 먼저 끝으로 옮긴다. 열린 파일의 속성이라 dup/fork/상속/exec 에도
+                                 이어진다 (POSIX O_APPEND). 파일이 아닌 대상에서는 무시 */
+#define NX_O_MASK   0x7UL
 
 /* ---------------- NxSeek ---------------- */
 #define NX_SEEK_SET 0UL
@@ -176,10 +333,9 @@
 /* ---------------- NxGetTime ---------------- */
 #define NX_CLOCK_MONOTONIC 0UL   /* 부팅 후 경과 시간(나노초). 해상도는 타이머 주기(현재 10ms) */
 /*
- * NX_CLOCK_REALTIME(1): 번호만 예약해 둔다. 커널에 RTC(실시간 시계) 드라이버가 아직 없어서
- * NxGetTime 은 이 clock_id 에 대해 Nunsupported 를 반환한다. libc 의 time()/gettimeofday()
- * 는 이 오류를 (time_t)-1 로 변환해 알려야 한다(정하지 않은 값을 지어내지 않는다) — 실제
- * 벽시계가 생기기 전까지는 이것이 "모른다"를 정직하게 표현하는 유일한 방법이다.
+ * NX_CLOCK_REALTIME(1): 1970-01-01 00:00:00 UTC 이후 나노초. 커널이 처음 요청받을 때 CMOS RTC 를 한 번
+ * 읽어 부팅 시각을 정하고, 그 뒤로는 MONOTONIC 을 더한다 (그래서 거꾸로 가지 않는다). RTC 는 UTC 로
+ * 맞춰져 있다고 가정한다. RTC 를 읽을 수 없으면 Nunsupported — libc 의 time() 은 이를 (time_t)-1 로 알린다.
  */
 #define NX_CLOCK_REALTIME  1UL
 
@@ -197,14 +353,24 @@
 /* 커널이 정하는 종료 코드 (프로그램이 NxProcessExit 로 주는 값과 겹치지 않도록 음수) */
 #define NX_EXIT_FAULT      (-1)       /* 사용자 모드 CPU 예외로 종료됨 */
 #define NX_EXIT_KILLED     (-2)       /* NxProcessKill 로 종료됨 */
+#define NX_EXIT_SIGNAL(sig) (-256 - (int)(sig))   /* 신호의 기본 동작으로 종료됨 (SIGINT = Ctrl-C 등) */
+#define NX_EXIT_IS_SIGNAL(code) ((code) <= -257 && (code) >= -256 - 31)
 
 #define NX_NO_TOKEN        0UL        /* NxProcessCreate: 토큰 없음 (부모 신원 상속). 0 은 stdin 이라 토큰일 수 없다 */
+
+/* uid/gid 예약 범위 (2^31 이상). 계정으로 쓸 수 없다 (커널 auth 가 그런 줄을 거부한다) */
+#define NX_UID_RESERVED_MIN 0x80000000U
+/* roi:/default/ 틀에서 "새 사용자 소유" 를 뜻하는 소유자. 복사할 때 그 사용자의 uid/gid 로 바뀐다 */
+#define NX_UID_TEMPLATE     0xFFFFFFFEU
 #define NX_AUTH_FAIL_DELAY_MS 1000UL  /* 인증 실패 시 지연 (무차별 대입을 느리게) */
 #define NX_POLL_MAX        16UL
 #define NX_CHAN_MSG_MAX    256UL      /* 채널 메시지 최대 바이트 */
 #define NX_CHAN_QUEUE_MAX  16UL       /* 채널 큐 최대 메시지 수 */
 #define NX_CHAN_PUBLIC     0x1UL      /* NxChannelCreate: 누구나 보낼 수 있음 */
 #define NX_BLOCK_SECTOR    512UL      /* 블록 장치 읽기/쓰기 단위 (오프셋/길이 모두 배수여야 함) */
+#define NX_PIPE_CAPACITY   4096U      /* 파이프 버퍼 */
+#define NX_PIPE_ATOMIC     512U       /* 이 이하의 파이프 쓰기는 섞이지 않는다 (POSIX PIPE_BUF) */
+#define NX_UMASK_DEFAULT   022U
 
 /* NxPoll 이벤트 */
 #define NX_POLL_IN         0x1U
@@ -220,6 +386,28 @@
 #define NX_DEVCMD_INFO     1UL        /* arg = struct nx_devinfo * */
 #define NX_DEVCMD_IOPERM   2UL        /* arg = 1 허용 / 0 회수 : 이 장치의 I/O 포트를 ring3 에서 직접 in/out */
 #define NX_DEVCMD_TTY_ECHO 3UL        /* 콘솔(stdin) 핸들에: arg = 1 에코 켬 / 0 끔 (비밀번호 입력) */
+/*
+ * 콘솔 핸들(0/1/2 어느 것이든)에: arg = NX_TTY_MODE_*.
+ *   COOKED 기본. 커널 줄 편집기가 한 줄씩 넘긴다 (tty.h).
+ *   RAW    줄 편집/에코 없음. 입력 바이트를 바로 넘기고 읽기는 있는 만큼(최대 len) 돌려준다.
+ *          키보드의 방향키/Home/End/Delete/PgUp/PgDn 은 VT 시퀀스(ESC [ A ...)로, Enter 는 '\r' 로 온다.
+ * 모드를 바꾸면 아직 읽지 않은 입력은 버린다 (TCSAFLUSH). RAW 를 켠 프로세스가 끝나면 커널이 COOKED 로 되돌린다.
+ */
+#define NX_DEVCMD_TTY_MODE    4UL
+#define NX_DEVCMD_TTY_WINSIZE 5UL     /* 콘솔 핸들에: arg = struct nx_winsize * (글자 칸 행/열) */
+/*
+ * 콘솔 핸들에: 포그라운드 프로세스 그룹. arg = pgid (0 = 없음) 로 정하거나 NX_PGID_QUERY 로 조회 -> 지금 값.
+ * cooked 모드에서 Ctrl-C 를 누르면: 쓰던 줄과 읽지 않은 입력을 버리고 "^C" 를 보인 뒤
+ *   - 포그라운드 그룹이 있으면 그 그룹의 프로세스에 SIGINT 를 보낸다 (Ctrl-\ 는 SIGQUIT). 처리기가 없으면
+ *     기본 동작으로 끝난다 (종료 코드 NX_EXIT_SIGNAL(SIGINT)).
+ *   - 없으면(셸이 프롬프트에서 기다리는 중) 빈 줄("\n")을 넘긴다 (셸이 새 프롬프트를 띄우도록).
+ * raw 모드에서는 Ctrl-C 도 0x03 바이트로 그대로 간다 (편집기 등이 직접 처리).
+ * 그룹을 정할 수 있는 조건: root 이거나, 그 그룹의 살아 있는 프로세스가 모두 호출자와 같은 uid
+ * (다른 사용자의 프로세스(init, login 등)를 Ctrl-C 로 끝내게 만들 수 없다). 아니면 Npermission.
+ */
+#define NX_DEVCMD_TTY_FOREGROUND 6UL
+#define NX_TTY_MODE_COOKED 0UL
+#define NX_TTY_MODE_RAW    1UL
 
 /* 장치 종류 (nx_devinfo.kind) */
 #define NX_DEV_STREAM      1U
@@ -231,9 +419,23 @@
  *   fs:/    전체 파일 트리. uid 0 만 직접 쓸 수 있다
  *   app:/   = fs:/usr/          실행 파일
  *   face:/  = fs:/home/<사용자>/  호출한 프로세스의 사용자 홈 (프로세스마다 다르다)
- *   roi:/   = fs:/roi/          운영체제 구동용 레지스트리. uid 0 만. roi:/users 는 커널 전용(아무도 열 수 없음)
+ *   roi:/   = fs:/roi/          운영체제 구동용 레지스트리 (파일 하나에 값 하나). uid 0 은 전부,
+ *                               그 외 사용자는 roi:/<자기 uid>/ 아래만 (나머지는 Npermission).
+ *                               roi:/users 는 커널 전용(아무도 열 수 없음). 구조:
+ *                                 roi:/hostname       호스트 이름 (root 가 고친다, info:/hostname 으로 공개)
+ *                                 roi:/timezone       시간대 이름 (기본 Europe/London, info:/timezone 으로 공개).
+ *                                                     이름뿐이다: 시각은 늘 UTC (오프셋/서머타임 없음)
+ *                                 roi:/default/       새 사용자용 틀 (소유자 NX_UID_TEMPLATE = 새 사용자)
+ *                                 roi:/<uid>/         0500 본인: 목록/들어가기만
+ *                                 roi:/<uid>/app/     0700 본인: 앱 설정 (자유롭게 읽고 씀)
+ *                                 roi:/<uid>/shell    0444 root: 관리자가 정한 로그인 셸 (app:/...)
+ *   info:/                      커널이 만드는 읽기 전용 가상 파일 (누구나). 파일 하나에 값 하나 + '\n'.
+ *                               열 때 내용을 만들어 둔다(스냅샷): 새 값은 다시 열어서. 쓰기/만들기/지우기는
+ *                               Npermission. 항목: hostname timezone utc_offset(늘 +00:00) version abi uptime_ms memory/total_kib
+ *                               memory/free_kib. 디렉터리(info:/, info:/memory)는 NxReadDir 로 나열.
  *   tmp:/   재부팅하면 사라지는 RAM 파일시스템 (누구나)
- *   dev:/   장치 (위 참고), svc:/ 채널 (위 참고)
+ *   disk:/  재부팅해도 남는 SATA 디스크의 nyfs (있을 때만. 권한은 디스크의 모드/소유자대로)
+ *   dev:/   장치 (위 참고. root 만, 표준 스트림 장치는 누구나), svc:/ 채널 (위 참고)
  *   "." 는 무시하고, 별칭의 뿌리 위로 올라가는 ".." 는 Npermission. 접두어가 없거나 모르는 접두어는 NnotFound.
  */
 
@@ -252,13 +454,17 @@
 #define NX_TYPE_TOKEN    5U
 #define NX_TYPE_CHANNEL  6U
 #define NX_TYPE_DEVICE   7U
+#define NX_TYPE_PIPE     8U
 
 /* NxStat: 32바이트 */
 struct nx_stat {
     uint64_t size;
     uint32_t type;        /* NX_TYPE_* */
-    uint32_t rights;      /* 이 핸들이 가진 NX_RIGHT_* */
-    uint64_t reserved[2]; /* 0 */
+    uint32_t rights;      /* 이 핸들이 가진 NX_RIGHT_* (NxStatPath 는 0) */
+    uint32_t mode;        /* 파일/디렉터리의 권한 비트 (0777 이하). 그 밖의 종류는 0 */
+    uint32_t uid;         /* 소유자 (파일/디렉터리만) */
+    uint32_t gid;
+    uint32_t reserved0;   /* 0 */
 };
 
 /* NxSysInfo: 48바이트 */
@@ -275,11 +481,49 @@ struct nx_sysinfo {
 };
 
 /* NxProcessInfo: 32바이트 */
+/* NxSignalAction (24 바이트) */
+struct nx_sigaction {
+    uint64_t handler;         /* NX_SIG_DFL / NX_SIG_IGN / 처리기 주소 */
+    uint64_t restorer;        /* 처리기가 돌아갈 주소 (NxSignalReturn 을 부른다) */
+    uint32_t mask;            /* 처리하는 동안 더 막을 신호 */
+    uint32_t flags;           /* NX_SA_* */
+};
+
+/* 처리기의 두 번째 인자 (128 바이트, 앞부분 배치는 Linux 의 siginfo_t 와 같다) */
+struct nx_siginfo {
+    int32_t  signo;
+    int32_t  err;             /* 늘 0 */
+    int32_t  code;            /* NX_SI_* */
+    int32_t  pad;
+    union {
+        struct { uint32_t pid; uint32_t uid; } proc;   /* NX_SI_USER, NX_SI_CHILD */
+        uint64_t addr;                                 /* NX_SI_FAULT */
+    } u;
+    uint8_t  reserved[104];
+};
+
+/* 처리기의 세 번째 인자: 신호가 오기 직전의 상태. NxSignalReturn 이 되돌린다 (처리기가 고치면 고친 대로) */
+struct nx_sigcontext {
+    uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
+    uint64_t rbp, rdi, rsi, rdx, rcx, rbx, rax;
+    uint64_t rip, rflags, rsp;
+    uint32_t mask;            /* 처리기가 끝나면 돌아갈 막은 집합 */
+    uint32_t pad;
+    uint8_t  fpu[512];        /* FXSAVE64 형식 */
+};
+
+/* 사용자 스택에 쌓이는 모양. 처리기가 시작할 때 rsp = &ret (rsp % 16 == 8, 함수 호출 직후와 같다) */
+struct nx_sigframe {
+    uint64_t ret;             /* = restorer */
+    struct nx_sigcontext ctx;
+    struct nx_siginfo info;
+};
+
 struct nx_procinfo {
     uint32_t pid;
     uint32_t state;           /* 0=READY 1=RUNNING 2=BLOCKED 3=TERMINATED */
     uint32_t handle_count;    /* 열려 있는 핸들 수 */
-    uint32_t reserved0;
+    uint32_t parent_pid;      /* 만든 프로세스의 pid (커널이 만들었으면 0) */
     uint64_t reserved[2];
 };
 
@@ -310,6 +554,14 @@ struct nx_dirent {
     uint32_t type;            /* NX_TYPE_FILE / NX_TYPE_DIR */
     uint32_t reserved;
     char     name[248];       /* NUL 종료 */
+};
+
+/* NX_DEVCMD_TTY_WINSIZE: 8바이트. 프레임버퍼 콘솔이 없으면 24 x 80 */
+struct nx_winsize {
+    uint16_t rows;
+    uint16_t cols;
+    uint16_t xpixel;          /* 화면 픽셀 크기 (모르면 0) */
+    uint16_t ypixel;
 };
 
 /* NX_DEVCMD_INFO: 40바이트 */
