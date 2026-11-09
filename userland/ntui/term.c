@@ -11,6 +11,7 @@
 
 static int g_tty = -1;                  /* 콘솔 fd (dev:/tty, 안 되면 stdin) */
 static struct termios g_orig;           /* 되돌릴 원래 설정 */
+static struct termios g_raw;            /* ntui 가 쓰는 raw 설정 (ttyResume 이 다시 건다) */
 
 /* raw 모드를 끄고 원래대로. 프로세스가 죽으면 커널도 cooked 로 되돌린다 */
 static void ttyRestore(void)
@@ -42,6 +43,9 @@ int ttyOpen(void)
     t.c_cc[VTIME] = 1;
     if (tcsetattr(fd, TCSAFLUSH, &t) < 0)
         goto fail;
+    g_raw = t;
+    if (fd > 0)
+        (void)fcntl(fd, F_SETFD, FD_CLOEXEC);   /* 띄우는 명령에게 넘기지 않는다 (명령은 0/1/2 를 쓴다) */
     g_tty = fd;                         /* raw 가 된 뒤에만: 실패하면 다음 호출이 다시 시도한다 */
     atexit(ttyRestore);
     return 0;
@@ -50,6 +54,20 @@ fail:
     if (fd > 0)
         close(fd);
     return -1;
+}
+
+/* 콘솔을 원래 모드(줄 단위, 에코)로 잠시 돌려준다: 전체 화면으로 다른 프로그램을 띄울 때 (nrunner) */
+void ttySuspend(void)
+{
+    if (g_tty >= 0)
+        (void)tcsetattr(g_tty, TCSAFLUSH, &g_orig);
+}
+
+/* ttySuspend 뒤에 다시 raw 로 */
+void ttyResume(void)
+{
+    if (g_tty >= 0)
+        (void)tcsetattr(g_tty, TCSAFLUSH, &g_raw);
 }
 
 /* 콘솔 fd (ttyOpen 이후. 그 전이면 -1) */
@@ -70,20 +88,26 @@ static int readb(void)
 }
 
 /*
- * 키 하나를 기다려 돌려준다. Enter = '\r', Backspace = 0x7F/0x08, Ctrl-C = 0x03, Ctrl-D = 0x04.
- * 방향키 등의 VT 시퀀스는 KEY_* 로 묶는다. 실패하면 EOF.
+ * 키 하나를 최대 ms 밀리초 기다린다 (100ms 단위로 올림. ms < 0 이면 끝없이).
+ * Enter = '\r', Backspace = 0x7F/0x08, Ctrl-C = 0x03, Ctrl-D = 0x04.
+ * 방향키 등의 VT 시퀀스는 KEY_* 로 묶는다. 시간이 지나면 KEY_TIMEOUT, 실패하면 EOF.
  */
-
-int getch(void)
+int getchTimeout(int ms)
 {
     int c, a, b;
+    int tries = ms < 0 ? -1 : (ms + 99) / 100;
 
     if (ttyOpen() < 0)
         return EOF;
     fflush(stdout);                     /* 그린 내용이 먼저 화면에 나가도록 */
 
-    while ((c = readb()) == -1)     /* 키가 올 때까지 */
-        ;
+    for (;;) {
+        c = readb();                    /* 바이트가 없으면 100ms 뒤 -1 */
+        if (c != -1)
+            break;
+        if (tries >= 0 && --tries <= 0)
+            return KEY_TIMEOUT;         /* ms == 0 도 한 번(100ms)은 기다린다 */
+    }
     if (c < 0)
         return EOF;                     /* 읽기 오류: 계속 돌면 CPU 를 다 쓴다 */
     if (c != 27)
@@ -114,4 +138,10 @@ int getch(void)
         }
     }
     return KEY_ESC;
+}
+
+/* 키 하나를 기다린다 (시간 제한 없음) */
+int getch(void)
+{
+    return getchTimeout(-1);
 }

@@ -39,6 +39,17 @@ int __nl_tty_mode(long h, int raw);                /* 1 = raw (줄 편집/에코
 int __nl_tty_echo(long h, int on);                 /* 줄 단위 모드의 에코 */
 int __nl_tty_winsize(long h, unsigned short ws[4]); /* 행, 열, x 픽셀, y 픽셀 */
 int __nl_wait_input(long h, long timeout_ms);      /* 읽을 입력이 있으면 1, 시간 초과 0 */
+/* 여러 핸들을 함께 기다린다 (poll.c). events/revents 는 NL_POLL_*. timeout_ms 음수 = 무기한.
+ * 준비된 항목 수, 시간 초과 0, 오류 -1 + errno (신호면 EINTR) */
+#define NL_POLL_IN  1
+#define NL_POLL_OUT 2
+#define NL_POLL_HUP 4
+struct __nl_pollent {
+    long h;
+    int events;
+    int revents;
+};
+int __nl_poll(struct __nl_pollent *p, int n, long timeout_ms);
 extern long __nl_tty_read_timeout_ms;              /* posix_fd.c 의 read 가 본다 */
 void *__nl_sbrk(long increment);                   /* 이전 brk, 실패하면 NULL + ENOMEM */
 int __nl_remove(const char *path);

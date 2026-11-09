@@ -293,6 +293,32 @@ int __nl_wait_input(long h, long timeout_ms)
     return r > 0 ? 1 : 0;
 }
 
+int __nl_poll(struct __nl_pollent *p, int n, long timeout_ms)
+{
+    struct { int fd; short events; short revents; } q[16];
+    long r;
+    int i;
+
+    if (n <= 0 || n > 16) {
+        errno = EINVAL;
+        return -1;
+    }
+    for (i = 0; i < n; i++) {
+        q[i].fd = (int)p[i].h;
+        q[i].events = (short)(((p[i].events & NL_POLL_IN) ? 0x001 : 0) | ((p[i].events & NL_POLL_OUT) ? 0x004 : 0));
+        q[i].revents = 0;
+    }
+    r = lsc(7 /* poll */, (long)q, n, timeout_ms < 0 ? -1L : timeout_ms);
+    if (r < 0)
+        return (int)ret(r);
+    for (i = 0; i < n; i++) {
+        p[i].revents = ((q[i].revents & 0x001) ? NL_POLL_IN : 0) |
+                       ((q[i].revents & 0x004) ? NL_POLL_OUT : 0) |
+                       ((q[i].revents & (0x010 | 0x008)) ? NL_POLL_HUP : 0);   /* POLLHUP | POLLERR */
+    }
+    return (int)r;
+}
+
 /* struct stat (x86_64): st_mode 는 24, st_size 는 48 바이트 위치 */
 static void from_kstat(const unsigned char *ks, struct __nl_stat *st)
 {

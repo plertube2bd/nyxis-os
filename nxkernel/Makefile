@@ -314,6 +314,15 @@ USER_CFLAGS = \
 	-fno-tree-loop-distribute-patterns -mgeneral-regs-only \
 	-I$(INCLUDE_DIR) -I$(ROOT)/userland/nlibc/library
 
+# 사용자 프로그램 (라이브러리가 아닌 것: init/login/sudo/..., elftest, coreutils, nysh, ntui 등 userland/ 의 앱)은
+#   C99 까지의 문법을 쓴다 (선언과 문장 섞기, // 주석, for 안의 선언, 지정 초기화 등). -pedantic 이 C11 이후의
+#   문법과 GNU 확장을 막는다. VLA 는 프로젝트 규칙대로 계속 금지(-Wvla: 작은 사용자 스택에서 위험).
+#   라이브러리(userland/lib, nlibc)와 nlibc 의 검사/예제 프로그램은 C89 그대로 (USER_CFLAGS, NLIBC_CFLAGS,
+#   NLIBC_PROG_CFLAGS).
+USER_PROG_STD    = -std=c99 -pedantic
+C99_FILTER       = -std=c89 -pedantic -Wdeclaration-after-statement
+USER_PROG_CFLAGS = $(USER_PROG_STD) $(filter-out $(C99_FILTER),$(USER_CFLAGS))
+
 ELFTEST_DIR = $(ROOT)/userland/elftest
 ULIB_DIR    = $(ROOT)/userland/lib
 USER_LDS    = $(ELFTEST_DIR)/linker.lds
@@ -345,14 +354,14 @@ USER_PROG_ELFS = $(addprefix $(USR_DIR)/,$(addsuffix .run,$(USER_PROGS)))
 
 $(USER_PROG_ELFS): $(USR_DIR)/%.run: $(ROOT)/userland/%/main.c $(ULIB_OBJS) $(ULIB_DIR)/nyx.h $(USER_LDS)
 	@mkdir -p $(BUILD)/obj/user $(USR_DIR)
-	$(CC) $(USER_CFLAGS) -I$(ULIB_DIR) -c $< -o $(BUILD)/obj/user/$*.o
+	$(CC) $(USER_PROG_CFLAGS) -I$(ULIB_DIR) -c $< -o $(BUILD)/obj/user/$*.o
 	$(USER_LD) -o $@ $(ULIB_OBJS) $(BUILD)/obj/user/$*.o
 
 # elftest: 자체 점검용 (자기 start.s 로 진입 레지스터를 검사하고, 공용 런타임도 쓴다)
 $(ELFTEST_ELF): $(ELFTEST_DIR)/elftest.c $(ELFTEST_DIR)/systest.c $(ELFTEST_DIR)/start.s $(USER_LDS) $(BUILD)/obj/ulib/nyx.o $(ULIB_DIR)/nyx.h
 	@mkdir -p $(BUILD)/obj/elftest $(USR_DIR)
-	$(CC) $(USER_CFLAGS) -I$(ULIB_DIR) -c $(ELFTEST_DIR)/elftest.c -o $(BUILD)/obj/elftest/elftest.o
-	$(CC) $(USER_CFLAGS) -I$(ULIB_DIR) -c $(ELFTEST_DIR)/systest.c -o $(BUILD)/obj/elftest/systest.o
+	$(CC) $(USER_PROG_CFLAGS) -I$(ULIB_DIR) -c $(ELFTEST_DIR)/elftest.c -o $(BUILD)/obj/elftest/elftest.o
+	$(CC) $(USER_PROG_CFLAGS) -I$(ULIB_DIR) -c $(ELFTEST_DIR)/systest.c -o $(BUILD)/obj/elftest/systest.o
 	$(AS) $(ASFLAGS) $(ELFTEST_DIR)/start.s -o $(BUILD)/obj/elftest/start.o
 	$(USER_LD) -o $@ $(BUILD)/obj/elftest/start.o $(BUILD)/obj/elftest/elftest.o $(BUILD)/obj/elftest/systest.o $(BUILD)/obj/ulib/nyx.o
 
@@ -363,7 +372,7 @@ NLIBC_DIR    = $(ROOT)/userland/nlibc
 #   커널이 프로세스마다 FPU/SSE 상태를 저장하므로(process.h 의 fpu_state) nlibc 프로그램은 부동소수점을 쓴다:
 #   -mgeneral-regs-only 를 뺀다.
 NLIBC_CFLAGS = $(filter-out -I% -mgeneral-regs-only,$(USER_CFLAGS)) -D_NYX_SOURCE -I$(NLIBC_DIR)/library -I$(INCLUDE_DIR)
-NLIBC_MODS   = ctype dirent env fpconv locale malloc math posix_fd posix_path printf process scanf signal start stdio stdlib string termios time
+NLIBC_MODS   = ctype dirent env fpconv locale malloc math poll posix_fd posix_path printf process scanf signal start stdio stdlib string termios time
 NLIBC_ASM_MODS = setjmp sigtramp
 NLIBC_HDRS   = $(wildcard $(NLIBC_DIR)/library/*.h $(NLIBC_DIR)/library/sys/*.h) $(NLIBC_DIR)/src/nl_internal.h $(INCLUDE_DIR)/nyx_abi.h
 NLIBC_OBJS   = $(patsubst %,$(BUILD)/obj/nlibc/%.o,$(NLIBC_MODS) $(NLIBC_ASM_MODS) nxsys)
@@ -411,6 +420,9 @@ nlibc-sdk: $(NLIBC_STAMP)
 NLIBC_PROG_CFLAGS = -std=c89 -pedantic -Wall -Wextra -Werror -Wstrict-prototypes -Wmissing-prototypes \
 	-Wshadow -Wdeclaration-after-statement -Wvla $(OPT) -fno-builtin
 
+# nlibc 앱 (coreutils, nysh, userland/<이름>/ 의 앱): C99 까지 (위의 USER_PROG_STD). nlibc 검사/예제는 C89 그대로
+NLIBC_APP_CFLAGS = $(USER_PROG_STD) $(filter-out $(C99_FILTER),$(NLIBC_PROG_CFLAGS))
+
 #   nlibctest: nlibc 검사 (fs:/usr/nlibctest.run, nysh 에서 `nlibctest`. 호스트에서는 make test-nlibc)
 #   fputest  : 커널의 프로세스별 FPU/SSE 상태 저장 검사 (fs:/usr/fputest.run)
 NLIBC_TEST_ELF = $(USR_DIR)/nlibctest.run
@@ -443,13 +455,13 @@ NLIBC_APP_ELFS  = $(addprefix $(USR_DIR)/,$(addsuffix .run,$(NLIBC_APPS)))
 define NLIBC_APP_RULE
 $(USR_DIR)/$(1).run: $(wildcard $(ROOT)/userland/$(1)/*.c $(ROOT)/userland/$(1)/*.h) $(NLIBC_STAMP)
 	@mkdir -p $(USR_DIR)
-	$(NLCC) $(NLIBC_PROG_CFLAGS) -D_POSIX_C_SOURCE=200809L -o $$@ $(wildcard $(ROOT)/userland/$(1)/*.c)
+	$(NLCC) $(NLIBC_APP_CFLAGS) -D_POSIX_C_SOURCE=200809L -o $$@ $(wildcard $(ROOT)/userland/$(1)/*.c)
 endef
 $(foreach a,$(NLIBC_APPS),$(eval $(call NLIBC_APP_RULE,$(a))))
 
 $(COREUTILS_ELFS): $(USR_DIR)/%.run: $(COREUTILS_DIR)/%.c $(COREUTILS_DIR)/common.c $(COREUTILS_DIR)/common.h $(NLIBC_STAMP)
 	@mkdir -p $(USR_DIR)
-	$(NLCC) $(NLIBC_PROG_CFLAGS) -D_POSIX_C_SOURCE=200809L -o $@ $< $(COREUTILS_DIR)/common.c
+	$(NLCC) $(NLIBC_APP_CFLAGS) -D_POSIX_C_SOURCE=200809L -o $@ $< $(COREUTILS_DIR)/common.c
 
 # ------------------------------------------------------------------
 # kilo (텍스트 편집기) = third_party/kilo (upstream 그대로) + userland/kilo/kilo-nyxis.patch -> fs:/usr/kilo.run
@@ -565,13 +577,21 @@ USERS_DB ?= $(ROOT)/config/users.db
 
 ifneq ($(SELFTEST),)
 ROOT_USERS_DB  = $(BUILD)/test-users.db
-ROOTFS_EXTRA   = --file /roi/test_password=$(BUILD)/test-password:0600
+# 실제 이미지의 로그인 셸은 rootfs/roi/default/shell (ntui) 이지만, 테스트 하네스(e2e, elftest)는 셸 명령을 치므로
+# SELFTEST 이미지에서는 틀의 shell 을 nysh 로 바꿔 넣는다
+TEST_SHELL     = $(BUILD)/test-shell
+ROOTFS_EXTRA   = --file /roi/test_password=$(BUILD)/test-password:0600 --template-file shell=$(TEST_SHELL)
+ROOTFS_EXTRA_DEPS = $(TEST_SHELL)
+$(TEST_SHELL):
+	@mkdir -p $(BUILD)
+	echo "app:/nysh.run" > $@
 $(ROOT_USERS_DB): $(ROOT)/tools/mkusers.py
 	@mkdir -p $(BUILD)
 	python3 $(ROOT)/tools/mkusers.py --test $(ROOT_USERS_DB) $(BUILD)/test-password
 else
 ROOT_USERS_DB  = $(USERS_DB)
 ROOTFS_EXTRA   =
+ROOTFS_EXTRA_DEPS =
 $(USERS_DB):
 	@echo "error: no user database ($(USERS_DB))." >&2
 	@echo "       run 'make users' to create accounts (or build with SELFTEST=1 for a test image)." >&2
@@ -599,7 +619,7 @@ $(NYFS_PACK):
 ROI_SRC   = $(ROOT)/rootfs/roi
 ROI_FILES = $(shell find $(ROI_SRC) -type f 2>/dev/null)
 
-$(INITRD_IMG): $(USER_PROG_ELFS) $(ELFTEST_ELF) $(NLIBC_TEST_ELF) $(FPUTEST_ELF) $(HELLO_ELF) $(COREUTILS_ELFS) $(NLIBC_APP_ELFS) $(KILO_ELF) $(NLCC_ELF) $(NLCC_STAMP) $(INITRD_RUN) $(ROOT_USERS_DB) $(NYFS_PACK) $(ROOT)/tools/mkrootfs.py $(ROI_FILES)
+$(INITRD_IMG): $(ROOTFS_EXTRA_DEPS) $(USER_PROG_ELFS) $(ELFTEST_ELF) $(NLIBC_TEST_ELF) $(FPUTEST_ELF) $(HELLO_ELF) $(COREUTILS_ELFS) $(NLIBC_APP_ELFS) $(KILO_ELF) $(NLCC_ELF) $(NLCC_STAMP) $(INITRD_RUN) $(ROOT_USERS_DB) $(NYFS_PACK) $(ROOT)/tools/mkrootfs.py $(ROI_FILES)
 	python3 $(ROOT)/tools/mkrootfs.py --users $(ROOT_USERS_DB) --bin $(USR_DIR) --roi $(ROI_SRC) \
 		--file /usr/hellowld.run=$(INITRD_RUN):0644 --tree /usr/lib=$(NLCC_ROOT)/lib --tree /usr/src=$(NLCC_ROOT)/src \
 		$(ROOTFS_EXTRA) > $(ROOTFS_MANIFEST)
@@ -761,6 +781,7 @@ test-host: $(FAT16_TEST_IMG)
 # nlibc 호스트 검사: 같은 libc 소스를 플랫폼 계층만 Linux 시스템 콜(tests/host/nlibc/sys_linux.c)로 바꿔
 # 정적 Linux 바이너리로 링크해 실행한다 (커널 없이 수 초 만에 libc 회귀 확인)
 NLIBC_HOST_OUT = $(HOST_OUT)/nlibc
+NLIBC_HOST_APP_CFLAGS = $(USER_PROG_STD) $(filter-out $(C99_FILTER),$(NLIBC_CFLAGS))   # 앱(coreutils/nysh)은 C99 까지
 NLIBC_HOST_SRCS = $(patsubst %,$(NLIBC_DIR)/src/%.c,$(NLIBC_MODS)) $(HOST_DIR)/nlibc/sys_linux.c
 NLIBC_HOST_LIB  = $(patsubst %,$(NLIBC_HOST_OUT)/%.o,$(NLIBC_MODS) $(NLIBC_ASM_MODS)) $(NLIBC_HOST_OUT)/sys_linux.o
 
@@ -800,15 +821,15 @@ CU_HOST_OUT = $(HOST_OUT)/coreutils
 
 test-coreutils: nlibc-host-lib
 	@mkdir -p $(CU_HOST_OUT)/bin
-	$(CC) $(NLIBC_CFLAGS) -c $(COREUTILS_DIR)/common.c -o $(CU_HOST_OUT)/common.o
+	$(CC) $(NLIBC_HOST_APP_CFLAGS) -c $(COREUTILS_DIR)/common.c -o $(CU_HOST_OUT)/common.o
 	@for u in $(COREUTILS); do \
 		echo "  CC(coreutils,host) $$u"; \
-		$(CC) $(NLIBC_CFLAGS) -c $(COREUTILS_DIR)/$$u.c -o $(CU_HOST_OUT)/$$u.o || exit 1; \
+		$(CC) $(NLIBC_HOST_APP_CFLAGS) -c $(COREUTILS_DIR)/$$u.c -o $(CU_HOST_OUT)/$$u.o || exit 1; \
 		$(LD) -static -nostdlib -o $(CU_HOST_OUT)/bin/$$u $(NLIBC_HOST_OUT)/crt0.o $(CU_HOST_OUT)/$$u.o \
 			$(CU_HOST_OUT)/common.o $(NLIBC_HOST_LIB) || exit 1; \
 	done
 	sh $(HOST_DIR)/coreutils/run.sh $(CU_HOST_OUT)/bin $(CU_HOST_OUT)/work
-	$(CC) $(NLIBC_CFLAGS) -c $(ROOT)/userland/nysh/main.c -o $(CU_HOST_OUT)/nysh.o
+	$(CC) $(NLIBC_HOST_APP_CFLAGS) -c $(ROOT)/userland/nysh/main.c -o $(CU_HOST_OUT)/nysh.o
 	$(LD) -static -nostdlib -o $(CU_HOST_OUT)/bin/nysh $(NLIBC_HOST_OUT)/crt0.o $(CU_HOST_OUT)/nysh.o $(NLIBC_HOST_LIB)
 	sh $(HOST_DIR)/nysh/run.sh $(CU_HOST_OUT)/bin $(CU_HOST_OUT)/work-nysh
 
@@ -816,7 +837,7 @@ test-coreutils: nlibc-host-lib
 # Check: C89 준수/경고 검사
 # =========================
 check:
-	@echo "[check] -O0 빌드 (-std=c89 -pedantic -Werror; '//' 주석은 컴파일러가 오류로 처리)"
+	@echo "[check] -O0 빌드 (커널/라이브러리 -std=c89, 사용자 프로그램 -std=c99; 모두 -pedantic -Werror)"
 	$(MAKE) -s -B BUILD=$(ROOT)/out-check-O0 OPT=-O0 all
 	@echo "[check] -O2 빌드"
 	$(MAKE) -s -B BUILD=$(ROOT)/out-check-O2 OPT=-O2 all

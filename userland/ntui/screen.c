@@ -114,6 +114,20 @@ void screenEnd(void)
     g_back = g_front = NULL;
 }
 
+/* 화면을 다른 프로그램에 잠시 넘긴다: 색/커서를 되돌리고 지운다 (버퍼는 그대로) */
+void screenSuspend(void)
+{
+    outCstr("\033[0m\033[2J\033[H\033[?25h");
+    outFlush();
+}
+
+/* 다시 가져온다: 커서를 숨기고 다음 screenFlush 가 모든 칸을 다시 그리게 한다 */
+void screenResume(void)
+{
+    outCstr("\033[?25l");
+    screenInvalidate();
+}
+
 /* ---------------- 그리기 (g_back 에만) ---------------- */
 
 void screenPut(int x, int y, int ch, enum role r)

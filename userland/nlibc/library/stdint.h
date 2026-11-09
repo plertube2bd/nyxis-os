@@ -64,6 +64,40 @@ typedef uint64_t uintmax_t;
 #define INTMAX_MAX  INT64_MAX
 #define UINTMAX_MAX UINT64_MAX
 
+/* 최소 폭/빠른 정수의 한계 (위 typedef 와 맞춘다) */
+#define INT_LEAST8_MIN   INT8_MIN
+#define INT_LEAST8_MAX   INT8_MAX
+#define UINT_LEAST8_MAX  UINT8_MAX
+#define INT_LEAST16_MIN  INT16_MIN
+#define INT_LEAST16_MAX  INT16_MAX
+#define UINT_LEAST16_MAX UINT16_MAX
+#define INT_LEAST32_MIN  INT32_MIN
+#define INT_LEAST32_MAX  INT32_MAX
+#define UINT_LEAST32_MAX UINT32_MAX
+#define INT_LEAST64_MIN  INT64_MIN
+#define INT_LEAST64_MAX  INT64_MAX
+#define UINT_LEAST64_MAX UINT64_MAX
+#define INT_FAST8_MIN    INT8_MIN
+#define INT_FAST8_MAX    INT8_MAX
+#define UINT_FAST8_MAX   UINT8_MAX
+#define INT_FAST16_MIN   INT64_MIN
+#define INT_FAST16_MAX   INT64_MAX
+#define UINT_FAST16_MAX  UINT64_MAX
+#define INT_FAST32_MIN   INT64_MIN
+#define INT_FAST32_MAX   INT64_MAX
+#define UINT_FAST32_MAX  UINT64_MAX
+#define INT_FAST64_MIN   INT64_MIN
+#define INT_FAST64_MAX   INT64_MAX
+#define UINT_FAST64_MAX  UINT64_MAX
+
+/* 다른 헤더의 정수형 한계: sig_atomic_t(signal.h), wchar_t(stddef.h), wint_t 는 모두 int */
+#define SIG_ATOMIC_MIN   INT32_MIN
+#define SIG_ATOMIC_MAX   INT32_MAX
+#define WCHAR_MIN        INT32_MIN
+#define WCHAR_MAX        INT32_MAX
+#define WINT_MIN         INT32_MIN
+#define WINT_MAX         INT32_MAX
+
 #define INT8_C(c)   c
 #define UINT8_C(c)  c
 #define INT16_C(c)  c

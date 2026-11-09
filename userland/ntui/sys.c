@@ -13,13 +13,14 @@ uid_t uid;
 char username[64];
 int utcOffset;                          /* UTC 오프셋 (분). info:/utc_offset */
 char timezoneName[64];                  /* info:/timezone */
+char hostname[64];                      /* info:/hostname */
 char isRoot;
 
 /*
  * info:/ 같은 "파일 하나에 값 하나" 를 buf 에 읽는다. 끝의 줄바꿈은 뗀다.
  * 성공하면 0, 못 열거나 비어 있으면 -1 (buf 는 빈 문자열).
  */
-static int readValue(const char *path, char *buf, size_t cap)
+int sysReadValue(const char *path, char *buf, size_t cap)
 {
     int file;
     size_t len = 0;
@@ -82,14 +83,17 @@ int init(void)
     username[sizeof(username) - 1] = '\0';
 
     /* timezone */
-    if (readValue("info:/timezone", timezoneName, sizeof(timezoneName)) < 0) {
+    if (sysReadValue("info:/timezone", timezoneName, sizeof(timezoneName)) < 0) {
         fprintf(stderr, "read timezone failed.\n");
         fprintf(stderr, "using default timezone: %s\n", timezoneNameDefault);
         strcpy(timezoneName, timezoneNameDefault);
     }
 
+    if (sysReadValue("info:/hostname", hostname, sizeof(hostname)) < 0)
+        strcpy(hostname, hostnameDefault);
+
     utcOffset = utcOffsetDefault;
-    if (readValue("info:/utc_offset", buf, sizeof(buf)) < 0 || parseUtcOffset(buf, &utcOffset) < 0)
+    if (sysReadValue("info:/utc_offset", buf, sizeof(buf)) < 0 || parseUtcOffset(buf, &utcOffset) < 0)
         utcOffset = utcOffsetDefault;
 
     return 0;

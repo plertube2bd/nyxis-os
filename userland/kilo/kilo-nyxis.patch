@@ -52,3 +52,44 @@
      case CTRL_L: /* ctrl+l, clear screen */
          /* Just refresht the line as side effect. */
          break;
+@@ -1289,14 +1310,36 @@
+ }
+ 
+ int main(int argc, char **argv) {
+-    if (argc != 2) {
+-        fprintf(stderr,"Usage: kilo <filename>\n");
++    /* Nyxis: without an argument (e.g. started from a menu or ntui's run
++     * dialog), ask for the file name on the still-cooked console instead of
++     * failing. An empty answer or EOF quits. */
++    char *filename;
++    static char asked[1024];
++
++    if (argc > 2) {
++        fprintf(stderr,"Usage: kilo [filename]\n");
+         exit(1);
+     }
++    if (argc == 2) {
++        filename = argv[1];
++    } else {
++        size_t len;
++
++        printf("kilo: file to edit (new or existing, empty = quit): ");
++        fflush(stdout);
++        if (fgets(asked,sizeof(asked),stdin) == NULL) exit(0);
++        len = strlen(asked);
++        while (len > 0 && (asked[len-1] == '\n' || asked[len-1] == '\r' ||
++                           asked[len-1] == ' '))
++            asked[--len] = '\0';
++        filename = asked;
++        while (*filename == ' ') filename++;
++        if (*filename == '\0') exit(0);
++    }
+ 
+     initEditor();
+-    editorSelectSyntaxHighlight(argv[1]);
+-    editorOpen(argv[1]);
++    editorSelectSyntaxHighlight(filename);
++    editorOpen(filename);
+     enableRawMode(STDIN_FILENO);
+     editorSetStatusMessage(
+         "HELP: Ctrl-S = save | Ctrl-Q = quit | Ctrl-F = find");

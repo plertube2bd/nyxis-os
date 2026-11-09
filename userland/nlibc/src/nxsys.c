@@ -359,6 +359,34 @@ int __nl_wait_input(long h, long timeout_ms)
     return r > 0 ? 1 : 0;
 }
 
+int __nl_poll(struct __nl_pollent *p, int n, long timeout_ms)
+{
+    struct nx_pollfd q[NX_POLL_MAX];
+    long r;
+    int i;
+
+    if (n <= 0 || n > (int)NX_POLL_MAX) {
+        errno = EINVAL;
+        return -1;
+    }
+    for (i = 0; i < n; i++) {
+        q[i].handle = (unsigned long)p[i].h;
+        q[i].events = ((p[i].events & NL_POLL_IN) ? NX_POLL_IN : 0U) |
+                      ((p[i].events & NL_POLL_OUT) ? NX_POLL_OUT : 0U);
+        q[i].revents = 0;
+    }
+    r = nx_sc(NX_SYS_POLL, (unsigned long)q, (unsigned long)n,
+              timeout_ms < 0 ? (unsigned long)NX_WAIT_INFINITE : (unsigned long)timeout_ms);
+    if (r < 0)
+        return (int)ret(r);
+    for (i = 0; i < n; i++) {
+        p[i].revents = ((q[i].revents & NX_POLL_IN) ? NL_POLL_IN : 0) |
+                       ((q[i].revents & NX_POLL_OUT) ? NL_POLL_OUT : 0) |
+                       ((q[i].revents & NX_POLL_HUP) ? NL_POLL_HUP : 0);
+    }
+    return (int)r;
+}
+
 long __nl_dup_ex(long h, int how, int arg, int cloexec)
 {
     struct fd_entry *e = entry_of(h);

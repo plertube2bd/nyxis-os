@@ -15,16 +15,16 @@
 /* style = { fg, bg, fg16, bg16, attr } */
 
 static const struct theme g_themes[] = {
-    /* Nyx: 남색/보라 계열의 어두운 기본 테마 */
+    /* Nyx: 거의 검정에 가까운 바탕 + 깊은 보라/청록 강조의 어두운 기본 테마 */
     { "nyx", 0, {
-        { 252,  17,  7,  4, 0 },                        /* ROLE_DESKTOP */
-        { 252, 236,  7,  0, 0 },                        /* ROLE_WINDOW */
-        {  61, 236,  8,  0, 0 },                        /* ROLE_BORDER */
-        { 231,  98, 15,  5, ATTR_BOLD },                /* ROLE_TITLE_ACTIVE */
-        { 248, 240,  7,  8, 0 },                        /* ROLE_TITLE_INACTIVE */
-        {  16,  80,  0,  6, 0 },                        /* ROLE_SELECTION */
-        { 252, 234,  7,  0, 0 },                        /* ROLE_TASKBAR */
-        { 231, 160, 15,  1, ATTR_BOLD }                 /* ROLE_ERROR */
+        {  60, 232,  8,  0, 0 },                        /* ROLE_DESKTOP        #080808 */
+        { 250, 234,  7,  0, 0 },                        /* ROLE_WINDOW         #1c1c1c */
+        {  60, 234,  8,  0, 0 },                        /* ROLE_BORDER         #5f5f87 */
+        { 231,  54, 15,  5, ATTR_BOLD },                /* ROLE_TITLE_ACTIVE   #5f0087 */
+        { 244, 235,  8,  0, 0 },                        /* ROLE_TITLE_INACTIVE #262626 */
+        { 231,  23, 15,  6, 0 },                        /* ROLE_SELECTION      #005f5f */
+        { 248, 233,  7,  0, 0 },                        /* ROLE_TASKBAR        #121212 */
+        { 231,  88, 15,  1, ATTR_BOLD }                 /* ROLE_ERROR          #870000 */
     } },
 
     /* Daylight: 흰 창, 연회색 바탕화면, 파란 강조 */
@@ -47,7 +47,7 @@ static const struct theme g_themes[] = {
         {   7,   0,  7,  0, ATTR_REVERSE | ATTR_BOLD }, /* ROLE_TITLE_ACTIVE */
         {   7,   0,  7,  0, 0 },                        /* ROLE_TITLE_INACTIVE */
         {   7,   0,  7,  0, ATTR_REVERSE },             /* ROLE_SELECTION */
-        {   7,   0,  7,  0, ATTR_REVERSE },             /* ROLE_TASKBAR */
+        {   7,   0,  7,  0, ATTR_BOLD },                /* ROLE_TASKBAR (반전이면 활성 창 반전과 구분되지 않는다) */
         {   7,   0,  7,  0, ATTR_REVERSE | ATTR_BOLD }  /* ROLE_ERROR */
     } }
 };

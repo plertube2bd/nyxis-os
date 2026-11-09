@@ -30,6 +30,9 @@
 #include <sys/wait.h>
 #include <dirent.h>
 #include <spawn.h>
+#include <poll.h>
+#include <stdbool.h>
+#include <stdint.h>
 #include <termios.h>
 #include <sys/ioctl.h>
 
@@ -109,6 +112,23 @@ static void test_string(void)
     CHECK(strxfrm(buf, "abc", sizeof(buf)) == 3 && strcmp(buf, "abc") == 0);
     CHECK(strcoll("a", "b") < 0);
     CHECK(strcmp(strerror(ENOENT), "No such file or directory") == 0);
+}
+
+/* stdbool.h / stdint.h (이 검사는 C89 로 컴파일된다: bool 은 unsigned char 대체) */
+static void test_stdbool_stdint(void)
+{
+    bool t = true;
+    bool f = false;
+    int_least16_t l16 = INT_LEAST16_MAX;
+    uint_fast32_t f32 = UINT_FAST32_MAX;
+    intmax_t m = INTMAX_C(1) << 62;
+
+    CHECK(t && !f && true == 1 && false == 0 && __bool_true_false_are_defined == 1);
+    CHECK(sizeof(int8_t) == 1 && sizeof(int16_t) == 2 && sizeof(int32_t) == 4 && sizeof(int64_t) == 8);
+    CHECK(sizeof(intptr_t) == sizeof(void *) && sizeof(uintmax_t) == 8);
+    CHECK(l16 == 32767 && f32 == UINT64_MAX && m > 0);
+    CHECK(INT_FAST8_MIN == -128 && UINT_LEAST8_MAX == 255 && SIG_ATOMIC_MAX == INT32_MAX && WCHAR_MIN < 0);
+    CHECK(UINT32_C(4000000000) > 0 && INT64_C(-1) < 0 && UINT64_C(1) << 63 > 0);
 }
 
 static void test_ctype(void)
@@ -1621,6 +1641,27 @@ static void test_pipe_dup(const char *dir)
     CHECK(write(q[1], "x", 1) == -1 && errno == EPIPE);
     close(q[1]);
 
+    /* poll: 빈 파이프는 시간 초과, 쓰면 POLLIN, 쓰는 쪽을 닫으면 POLLHUP, 닫힌 fd 는 POLLNVAL */
+    {
+        struct pollfd pf[2];
+
+        CHECK(pipe(p) == 0);
+        pf[0].fd = p[0];
+        pf[0].events = POLLIN;
+        pf[1].fd = -1;                              /* 건너뛴다 */
+        pf[1].events = POLLIN;
+        CHECK(poll(pf, 2, 0) == 0 && pf[0].revents == 0 && pf[1].revents == 0);
+        CHECK(write(p[1], "z", 1) == 1 && poll(pf, 2, 1000) == 1 && (pf[0].revents & POLLIN));
+        CHECK(read(p[0], buf, 1) == 1);
+        pf[1].fd = p[1];
+        pf[1].events = POLLOUT;
+        CHECK(poll(pf, 2, 0) == 1 && pf[0].revents == 0 && (pf[1].revents & POLLOUT));
+        CHECK(close(p[1]) == 0);
+        pf[1].fd = p[1];                            /* 이제 닫힌 fd */
+        CHECK(poll(pf, 2, 1000) == 2 && (pf[0].revents & POLLHUP) && pf[1].revents == POLLNVAL);
+        CHECK(close(p[0]) == 0);
+    }
+
     /* 버퍼(4KiB)보다 많이: 부모가 쓰고 자식이 읽어 합을 확인 (쓰는 쪽이 공간을 기다린다) */
     CHECK(pipe(p) == 0);
     fflush(stdout);
@@ -1977,6 +2018,7 @@ int main(int argc, char **argv, char **envp)
 
     assert(argc >= 1);
     test_string();
+    test_stdbool_stdint();
     test_ctype();
     test_strtol();
     test_printf();

@@ -17,6 +17,8 @@ mkrootfs.py - NyxisOS 루트 파일시스템(fs:/) 매니페스트를 만든다 
   /roi/<uid>/      DB 의 각 사용자(root 포함): 틀을 복사하고 NX_UID_TEMPLATE 을 그 uid/gid 로 바꾼다
   /home            0755 root
   /home/<이름>     0700 <uid>     face:/  (DB 의 각 사용자)
+--template-file <틀 안의 경로>=<호스트 파일> 로 틀(<roi>/default/)의 파일 내용을 바꿔 넣는다 (모든 사용자에게 복사된다).
+예: SELFTEST 이미지는 테스트 하네스가 셸 명령을 치므로 shell 을 app:/nysh.run 으로 바꾼다.
 --file 로 추가 파일을 넣는다 (예: 테스트 이미지의 /roi/test_password). 모드 기본값 0644, 소유자 root.
 --tree <이미지경로>=<호스트 디렉터리> 로 디렉터리를 통째로 넣는다 (디렉터리 0755, 파일 0644 — 실행 비트가
 있는 파일과 *.run 은 0755, 소유자 root). 예: nlcc 의 헤더/라이브러리(/usr/lib), 부트스트랩용 소스(/usr/src).
@@ -87,7 +89,7 @@ def emit_template(out, entries, dest, uid, gid):
 
 
 def main():
-    users_db, bin_dir, roi_dir, extra, trees = None, None, None, [], []
+    users_db, bin_dir, roi_dir, extra, trees, overrides = None, None, None, [], [], {}
     args = sys.argv[1:]
     while args:
         a = args.pop(0)
@@ -97,6 +99,9 @@ def main():
             bin_dir = args.pop(0)
         elif a == "--roi":
             roi_dir = args.pop(0)
+        elif a == "--template-file":
+            rel, src = args.pop(0).split("=", 1)
+            overrides[os.path.normpath(rel)] = os.path.abspath(src)
         elif a == "--file":
             extra.append(args.pop(0))
         elif a == "--tree":
@@ -140,6 +145,10 @@ def main():
                 out.append(f"f {base}/{name} 0600 0 0 {os.path.abspath(os.path.join(root, name))}")
 
     entries = template_entries(os.path.join(roi_dir, "default"), load_owners(os.path.join(roi_dir, "default.owners")))
+    for rel in overrides:
+        if not any(e[0] == rel and e[1] == "f" for e in entries):
+            sys.exit(f"--template-file: '{rel}' is not a file in the template")
+    entries = [(r, k, m, w, overrides.get(r, s) if k == "f" else s) for r, k, m, w, s in entries]
     emit_template(out, entries, "/roi/default", UID_TEMPLATE, UID_TEMPLATE)
     for _, uid, gid in users:
         emit_template(out, entries, f"/roi/{uid}", uid, gid)

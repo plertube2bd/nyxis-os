@@ -6,6 +6,7 @@
 
 ```
 kilo 파일이름        # 없는 파일이면 저장할 때 만든다
+kilo                 # 파일 이름을 묻는다 (빈 줄이나 Ctrl-D 면 끝). ntui 의 실행 상자(Ctrl-R, 전체 화면)에서 편하다
 ```
 
 | 키 | 동작 |
@@ -25,10 +26,11 @@ kilo 는 POSIX 터미널을 그대로 쓰므로 대부분은 패치가 아니라
   화면 그리기는 커널 터미널 해석기(`nxkernel/console/outputs/ansi.h`)가 처리한다.
 - **nlibc**: `termios.h` (`tcgetattr`/`tcsetattr`, VMIN=0/VTIME 시간 제한 읽기), `sys/ioctl.h` (`TIOCGWINSZ`),
   `getline`/`getdelim`, `SIGWINCH`, `ENOTTY`.
-- **패치** (`kilo-nyxis.patch`, 세 군데):
+- **패치** (`kilo-nyxis.patch`, 네 군데):
   - 저장: 커널에 파일 자르기가 없어 `ftruncate` 대신 `O_TRUNC` 로 연다.
   - 끝낼 때 화면을 지우고 커서를 맨 위로 (콘솔에 대체 화면이 없어 편집기 화면이 남는다).
   - Home/End 처리 (upstream 버그: 키를 해석만 하고 처리하지 않아 키 코드가 글자로 들어갔다).
+  - 인자 없이 실행하면 사용법을 보이고 끝내는 대신, raw 모드로 바꾸기 전에 파일 이름을 한 줄 묻는다.
 
 ## 제약
 - 콘솔 크기는 바뀌지 않으므로 `SIGWINCH` 는 오지 않는다.
