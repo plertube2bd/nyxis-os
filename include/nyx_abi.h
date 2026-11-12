@@ -149,6 +149,15 @@
 #define NX_SYS_SIGNAL_RETURN    79U
 #define NX_SYS_SIGNAL_SUSPEND   80U
 #define NX_SYS_SIGNAL_PENDING   81U
+/*
+ * NxProcessList(struct nx_procent *out, max) -> 살아 있는 프로세스 수 (max 보다 크면 앞의 max 개만 채운다).
+ *   누구나 부를 수 있다 (이름/소유자/상태/메모리/CPU 틱만: 인자, 환경, 핸들 내용은 보이지 않는다). ntop 이 쓴다.
+ * NxSignalSendPid(pid, sig) -> 0. 핸들 없이 pid 로 신호를 보낸다 (NxSignalSend 와 같은 뜻, sig 0 은 확인만).
+ *   root 는 누구에게나, 그 밖에는 같은 uid 의 사용자 프로세스에게만 (아니면 Npermission). 커널 스레드(idle 등)는
+ *   Npermission, 없는 pid 는 NnotFound.
+ */
+#define NX_SYS_PROCESS_LIST     82U
+#define NX_SYS_SIGNAL_SEND_PID  83U
 
 #define NX_SIG_MAX      32U          /* 신호 번호 < NX_SIG_MAX */
 #define NX_SIGHUP       1U
@@ -226,6 +235,19 @@
 #define NX_SYS_CHANNEL_RECEIVE  131U
 
 /*
+ * NxPtyCreate(u64 out[2], flags) -> 0. 의사 터미널 (console/inputs/tty.h).
+ *   out[0] = 주 끝(master, READ|WRITE|STAT|DUP): 쓴 바이트는 키 입력이 되고(종속 끝의 줄 편집기/raw 규칙),
+ *            읽으면 종속 끝의 출력과 에코가 걸러지지 않은 그대로 나온다. NxStat 의 type 은 NX_TYPE_PTY.
+ *   out[1] = 종속 끝(slave, READ|WRITE|STAT|DUP): 콘솔 핸들 (NX_TYPE_CONSOLE). 콘솔과 같은 NX_DEVCMD_TTY_* 를 받는다.
+ *            새 프로세스의 0 번 핸들이 종속 끝이면 그 pty 가 그 프로세스의 제어 터미널(dev:/tty)이 된다.
+ *   flags: NX_DUP_CLOEXEC 이면 두 핸들 모두 NX_HFLAG_CLOEXEC.
+ *   창 크기는 주 끝(또는 종속 끝)에 NX_DEVCMD_TTY_SET_WINSIZE 로 정한다 (기본 24 x 80). 바뀌면 포그라운드 그룹에 SIGWINCH.
+ *   주 끝이 모두 닫히면 끊김: 종속 끝 읽기는 0, 쓰기는 Ndisconnected, 그 터미널을 쓰는 프로세스에 SIGHUP.
+ *   종속 끝이 모두 닫히면(제어 터미널로 쓰는 프로세스 포함) 주 끝 읽기는 남은 것을 다 읽은 뒤 0, NxPoll 은 HUP.
+ */
+#define NX_SYS_PTY_CREATE       134U
+
+/*
  * 파일시스템 노드 (경로 규칙은 아래 "이름공간" 참고)
  *   NxCreateNode(path, type, mode)   type: NX_NODE_FILE / NX_NODE_DIR, mode: 권한 비트(0777 이하)
  *   NxRemoveNode(path)               파일 또는 빈 디렉터리
@@ -254,6 +276,17 @@
  *                 소유 중에는 커널 로그/stdin 이 COM1 을 쓰지 않는다
  *   dev:/rd0      비어 있는 RAM 블록 장치 (마운트되지 않음). NxRead/NxWrite/NxSeek, 512바이트 단위
  *   dev:/rootdisk fs:/ 가 올라간 RAM 디스크. 마운트되어 있으므로 읽기만 된다 (쓰기 열기는 Nbusy)
+ * 콘솔 화면 장치 (콘솔 세션 프로세스와 root 만):
+ *   dev:/console  화면(프레임버퍼)과 키보드를 함께 독점한다 (데스크톱 같은 "디스플레이 서버" 용). 열 수 있는 것은
+ *                 uid 0, 또는 로그인이 NX_SPAWN_CONSOLE_SESSION 으로 띄운 그 프로세스 자신뿐이다 (자식은 안 된다:
+ *                 로그아웃 뒤에 남은 프로세스가 화면/키보드를 잡아 가짜 로그인 화면을 띄우지 못하게).
+ *                 dev:/fb0 과 함께 열 수 없다 (Nbusy). 프레임버퍼가 없으면 NnotFound.
+ *                 - NxDeviceMapMMIO: 프레임버퍼 매핑 (NX_DEVCMD_INFO 의 width/height/pitch/format)
+ *                 - NxRead: struct nx_keyevent 들 (len 은 8 의 배수, 최소 8). 없으면 잠든다. NxPoll 의 IN.
+ *                   그동안 PS/2 키는 콘솔 터미널(stdin)로 가지 않는다 (시리얼 입력은 그대로 콘솔로).
+ *                   Alt+SysRq 는 그대로 커널이 처리한다.
+ *                 - NX_DEVCMD_CONSOLE_FONT: 커널 콘솔 글꼴 (struct nx_fontinfo)
+ *                 닫거나 프로세스가 끝나면 화면을 지우고 커널 콘솔로 돌려준다.
  * 표준 스트림 장치 (누구나 연다. 독점이 아니다):
  *   dev:/tty      콘솔 터미널 자체 (리디렉션과 무관하게 화면/키보드). 쓰기는 커널 로그를 거치지 않는다
  *   dev:/stdin    호출자의 0/1/2 번 핸들이 가리키는 객체를 공유하는 새 핸들 (dup 와 같다: 파일이면 오프셋도
@@ -280,9 +313,14 @@
  *      nx_stat 의 mode/uid/gid, nx_procinfo 의 parent_pid, 표준 스트림 장치(dev:/stdin stdout stderr tty).
  *      콘솔 쓰기는 커널 로그(printk)가 아니라 터미널 장치로 간다. dev:/ 목록(NxReadDir). NX_O_APPEND.
  * 2.4: 신호(NxSignalAction/Mask/Send/Return/Suspend/Pending, 종료 코드 NX_EXIT_SIGNAL), 프로세스 그룹
- *      (NxProcessGroup), 콘솔의 포그라운드 그룹(NX_DEVCMD_TTY_FOREGROUND, Ctrl-C = SIGINT). disk:/ 이름공간. */
+ *      (NxProcessGroup), 콘솔의 포그라운드 그룹(NX_DEVCMD_TTY_FOREGROUND, Ctrl-C = SIGINT). disk:/ 이름공간.
+ * 2.5: 노드 = 하나의 오브젝트 (파일/디렉터리 구분 없음: 어느 노드든 내용과 자식을 함께 가진다. nx_stat/nx_dirent
+ *      의 type 은 "지금 자식이 있으면 NX_TYPE_DIR"), NX_O_TRUNC.
+ * 2.6: 의사 터미널(NxPtyCreate, NX_TYPE_PTY, NX_DEVCMD_TTY_SET_WINSIZE, 프로세스별 제어 터미널), 콘솔 화면 장치
+ *      dev:/console (NX_SPAWN_CONSOLE_SESSION, struct nx_keyevent, NX_DEVCMD_CONSOLE_FONT), nx_devinfo.format,
+ *      NxProcessList(struct nx_procent), NxSignalSendPid, 보호 프로세스(NX_SPAWN_CRITICAL, NX_PROCENT_CRITICAL). */
 #define NX_ABI_MAJOR   2UL
-#define NX_ABI_MINOR   4UL
+#define NX_ABI_MINOR   6UL
 #define NX_ABI_PATCH   0UL
 #define NX_ABI_VERSION ((NX_ABI_MAJOR << 32) | (NX_ABI_MINOR << 16) | NX_ABI_PATCH)
 
@@ -315,6 +353,11 @@
 #define NX_HFLAG_CLOEXEC 0x1UL
 
 /* NxProcessCreate 의 다섯 번째 인자 flags */
+#define NX_SPAWN_CONSOLE_SESSION 0x2UL  /* uid 0 만: 새 프로세스가 콘솔 세션이 된다 (dev:/console 을 열 수 있다).
+                                         로그인이 로그인 셸을 띄울 때 쓴다 */
+#define NX_SPAWN_CRITICAL 0x4UL         /* 보호 프로세스(uid 0 이면서 자신도 보호 프로세스인 쪽만: init -> login): 부모 말고는
+                                         root 도 신호/종료를 보낼 수 없다 (Npermission). 그룹 신호(Ctrl-C 등)도 가지 않는다.
+                                         자기 종료, 커널의 예외 처리는 그대로. 물려주지 않는다 (fork, 자식) */
 #define NX_SPAWN_INHERIT 0x1UL    /* NX_HFLAG_CLOEXEC 가 아닌 핸들을 같은 슬롯 번호로 물려준다 (세대는 0: 값 = 슬롯 번호).
                                      물려주지 않는 종류는 NxProcessFork 와 같다. 없으면 자기 콘솔 0/1/2 로 시작 */
 
@@ -323,7 +366,9 @@
 #define NX_O_WRITE  0x2UL     /* 쓰기 (읽기 전용 파일시스템에서는 NreadOnly) */
 #define NX_O_APPEND 0x4UL     /* 파일: 쓰기마다 먼저 끝으로 옮긴다. 열린 파일의 속성이라 dup/fork/상속/exec 에도
                                  이어진다 (POSIX O_APPEND). 파일이 아닌 대상에서는 무시 */
-#define NX_O_MASK   0x7UL
+#define NX_O_TRUNC  0x8UL     /* NX_O_WRITE 와 함께: 열면서 내용을 0 바이트로 자른다 (자식은 그대로). 파일시스템
+                                 노드가 아닌 대상에서는 무시 */
+#define NX_O_MASK   0xFUL
 
 /* ---------------- NxSeek ---------------- */
 #define NX_SEEK_SET 0UL
@@ -345,6 +390,7 @@
 #define NX_MAX_HANDLES     32UL       /* 프로세스당 핸들 수 */
 #define NX_SLEEP_MAX_MS    3600000UL  /* NxSleep 최대 1시간 */
 #define NX_PID_SELF        0xFFFFFFFFUL
+#define NX_PROC_NAME_MAX   32U        /* nx_procent.name (NUL 포함) */
 #define NX_ARG_MAX         4096UL     /* NxProcessCreate: argv+envp 문자열 합계 (NUL 포함) */
 #define NX_ARGV_MAX        256UL      /* NxProcessCreate: argv+envp 항목 수 합계 */
 #define NX_WAIT_INFINITE   0xFFFFFFFFFFFFFFFFUL  /* NxProcessWait 시간 제한 없음 */
@@ -406,6 +452,10 @@
  * (다른 사용자의 프로세스(init, login 등)를 Ctrl-C 로 끝내게 만들 수 없다). 아니면 Npermission.
  */
 #define NX_DEVCMD_TTY_FOREGROUND 6UL
+/* dev:/console 에: arg = struct nx_fontinfo * (buf 가 0 이면 크기만 채운다) */
+#define NX_DEVCMD_CONSOLE_FONT   7UL
+/* pty 주 끝 또는 종속 끝에: arg = const struct nx_winsize * (창 크기를 정한다. 콘솔은 Nunsupported) */
+#define NX_DEVCMD_TTY_SET_WINSIZE 8UL
 #define NX_TTY_MODE_COOKED 0UL
 #define NX_TTY_MODE_RAW    1UL
 
@@ -413,6 +463,11 @@
 #define NX_DEV_STREAM      1U
 #define NX_DEV_BLOCK       2U
 #define NX_DEV_FRAMEBUFFER 3U
+#define NX_DEV_CONSOLE     4U     /* dev:/console: 프레임버퍼 + 키보드 */
+
+/* nx_devinfo.format: 픽셀 하나(32비트 little-endian 정수)의 배치 */
+#define NX_FB_FORMAT_XRGB  1U     /* 0x00RRGGBB (메모리 순서 B G R X) */
+#define NX_FB_FORMAT_XBGR  2U     /* 0x00BBGGRR (메모리 순서 R G B X) */
 
 /*
  * 이름공간 (NxOpen / NxCreateNode / NxRemoveNode / NxRenameNode / NxReadDir / NxProcessCreate 의 경로)
@@ -432,7 +487,7 @@
  *   info:/                      커널이 만드는 읽기 전용 가상 파일 (누구나). 파일 하나에 값 하나 + '\n'.
  *                               열 때 내용을 만들어 둔다(스냅샷): 새 값은 다시 열어서. 쓰기/만들기/지우기는
  *                               Npermission. 항목: hostname timezone utc_offset(늘 +00:00) version abi uptime_ms memory/total_kib
- *                               memory/free_kib. 디렉터리(info:/, info:/memory)는 NxReadDir 로 나열.
+ *                               memory/free_kib memory/ram_kib memory/reserved_kib. 디렉터리(info:/, info:/memory)는 NxReadDir 로 나열.
  *   tmp:/   재부팅하면 사라지는 RAM 파일시스템 (누구나)
  *   disk:/  재부팅해도 남는 SATA 디스크의 nyfs (있을 때만. 권한은 디스크의 모드/소유자대로)
  *   dev:/   장치 (위 참고. root 만, 표준 스트림 장치는 누구나), svc:/ 채널 (위 참고)
@@ -455,6 +510,7 @@
 #define NX_TYPE_CHANNEL  6U
 #define NX_TYPE_DEVICE   7U
 #define NX_TYPE_PIPE     8U
+#define NX_TYPE_PTY      9U     /* 의사 터미널 주 끝 */
 
 /* NxStat: 32바이트 */
 struct nx_stat {
@@ -567,7 +623,7 @@ struct nx_winsize {
 /* NX_DEVCMD_INFO: 40바이트 */
 struct nx_devinfo {
     uint32_t kind;            /* NX_DEV_* */
-    uint32_t reserved0;
+    uint32_t format;          /* 프레임버퍼: NX_FB_FORMAT_* (그 밖의 장치는 0) */
     uint64_t size;            /* 블록 장치/프레임버퍼 바이트 수 */
     uint32_t width;           /* 프레임버퍼 */
     uint32_t height;
@@ -576,6 +632,87 @@ struct nx_devinfo {
     uint16_t io_base;         /* 스트림 장치의 I/O 포트 범위 (NX_DEVCMD_IOPERM 대상) */
     uint16_t io_count;
     uint32_t reserved1;
+};
+
+/*
+ * dev:/console 읽기: 키 이벤트 8바이트.
+ * code 는 PS/2 스캔코드 세트 1 의 누름 코드이고, E0 으로 시작하는 확장 키는 0x100 을 더한다 (NX_KEY_*).
+ * 키를 누르고 있으면 자동 반복으로 pressed = 1 이 여러 번 온다.
+ */
+struct nx_keyevent {
+    uint16_t code;            /* NX_KEY_* */
+    uint16_t mods;            /* NX_KMOD_*: 이 이벤트를 반영한 뒤의 수정자 상태 */
+    uint8_t  pressed;         /* 1 누름, 0 뗌 */
+    uint8_t  ch;              /* Shift/Caps Lock 을 반영한 ASCII (글자가 아닌 키는 0). Ctrl/Alt 는 반영하지 않는다 */
+    uint16_t reserved;
+};
+
+#define NX_KMOD_SHIFT  0x01U
+#define NX_KMOD_CTRL   0x02U
+#define NX_KMOD_ALT    0x04U      /* 왼쪽 Alt */
+#define NX_KMOD_SUPER  0x08U      /* Windows / Command 키 */
+#define NX_KMOD_ALTGR  0x10U      /* 오른쪽 Alt */
+#define NX_KMOD_CAPS   0x20U      /* Caps Lock 켜짐 */
+
+#define NX_KEY_ESC        0x001U
+#define NX_KEY_BACKSPACE  0x00EU
+#define NX_KEY_TAB        0x00FU
+#define NX_KEY_ENTER      0x01CU
+#define NX_KEY_LCTRL      0x01DU
+#define NX_KEY_LSHIFT     0x02AU
+#define NX_KEY_RSHIFT     0x036U
+#define NX_KEY_LALT       0x038U
+#define NX_KEY_SPACE      0x039U
+#define NX_KEY_CAPSLOCK   0x03AU
+#define NX_KEY_F1         0x03BU     /* F1..F10 = 0x3B..0x44 */
+#define NX_KEY_F10        0x044U
+#define NX_KEY_F11        0x057U
+#define NX_KEY_F12        0x058U
+#define NX_KEY_KP_ENTER   0x11CU
+#define NX_KEY_RCTRL      0x11DU
+#define NX_KEY_RALT       0x138U
+#define NX_KEY_HOME       0x147U
+#define NX_KEY_UP         0x148U
+#define NX_KEY_PGUP       0x149U
+#define NX_KEY_LEFT       0x14BU
+#define NX_KEY_RIGHT      0x14DU
+#define NX_KEY_END        0x14FU
+#define NX_KEY_DOWN       0x150U
+#define NX_KEY_PGDN       0x151U
+#define NX_KEY_INSERT     0x152U
+#define NX_KEY_DELETE     0x153U
+#define NX_KEY_LSUPER     0x15BU
+#define NX_KEY_RSUPER     0x15CU
+#define NX_KEY_MENU       0x15DU
+#define NX_KEY_PRTSC      0x137U     /* PrintScreen (Alt 와 함께면 SysRq: 커널이 쓴다) */
+
+/* NxProcessList 항목: 112바이트 */
+struct nx_procent {
+    uint32_t pid;
+    uint32_t parent_pid;
+    uint32_t pgid;
+    uint32_t uid;
+    uint32_t state;           /* 0=READY 1=RUNNING 2=BLOCKED (끝난 프로세스는 나오지 않는다) */
+    uint32_t flags;           /* NX_PROCENT_* */
+    uint64_t cpu_ticks;       /* CPU 를 쓴 타이머 틱 수 (NxSysInfo 의 틱 단위) */
+    uint64_t start_tick;      /* 만든 시각 (부팅 후 틱) */
+    uint64_t mem_kib;         /* 사용자 주소 공간에 매핑된 메모리 (장치 MMIO 제외) */
+    char     name[32];        /* 실행 파일 이름 (경로의 마지막 이름, ".run" 없이). 커널 스레드는 "idle"/"kernel" */
+    char     user[32];        /* 사용자 이름 */
+};
+#define NX_PROCENT_USER    0x1U   /* 사용자 프로세스 (아니면 커널 스레드) */
+#define NX_PROCENT_SESSION 0x2U   /* 콘솔 세션 (로그인 셸) */
+#define NX_PROCENT_PTY     0x4U   /* 제어 터미널이 의사 터미널 */
+#define NX_PROCENT_CRITICAL 0x8U  /* 보호 프로세스 (init, login: NX_SPAWN_CRITICAL) */
+
+/* NX_DEVCMD_CONSOLE_FONT: 32바이트. 글자 하나 = cell_w * cell_h 바이트의 알파(0 배경 ~ 255 글자색), 줄 순서 */
+struct nx_fontinfo {
+    uint64_t buf;             /* 받을 사용자 버퍼 (0 이면 크기만) */
+    uint64_t cap;             /* buf 의 크기 (count * cell_w * cell_h 이상이어야 한다) */
+    uint32_t cell_w;          /* 커널이 채운다 */
+    uint32_t cell_h;
+    uint32_t first;           /* 첫 글자 코드 (32) */
+    uint32_t count;           /* 글자 수 (95: ' ' ~ '~') */
 };
 
 #endif /* NYX_ABI_H */

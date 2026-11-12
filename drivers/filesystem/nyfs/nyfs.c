@@ -68,6 +68,7 @@ typedef struct {
     u32 diskno;
     nyfs_disk_read_fn read;
     nyfs_disk_write_fn write;
+    nyfs_disk_discard_fn discard;
     NTBLI *info;
     nyfs_superblock_t sb;   /* 메모리에 캐시된 슈퍼블록. 바뀔 때마다 블록 0 에 다시 쓴다 */
     u32 block_size;          /* 1 << sb.block_size_shift (매번 시프트 계산 피하려고 캐시) */
@@ -138,6 +139,7 @@ static void nyfs_free_volume(nyfs_volume_t *vol)
     vol->root_vnode = nNULL;
     vol->read = nNULL;
     vol->write = nNULL;
+    vol->discard = nNULL;
     memset(vol->mount_path, 0, sizeof(vol->mount_path));
 }
 
@@ -365,6 +367,9 @@ static Nstatus nyfs_free_block(nyfs_volume_t *vol, nyfs_blkno_t blkno)
         status = nyfs_flush_superblock(vol);
     }
     spin_unlock(&vol->lock);
+    /* 블록은 이미 자유: 버리기에 실패해도 내용이 남을 뿐 파일시스템은 일관되다 */
+    if (!NSTATUS_IS_ERR(status) && vol->discard)
+        (void)vol->discard(vol->diskno, (usize)((u64)blkno * (u64)vol->block_size), (usize)vol->block_size, vol->info);
     return status;
 }
 
@@ -946,10 +951,9 @@ static Nstatus nyfs_check_access(nyfs_volume_t *vol, const nyfs_inode_t *inode,
         /* ACL 이 전혀 없으면 순수 UNIX 모드로만 판단한다 */
         u16 mode = inode->unix_mode;
         u32 bits;
-        /* UNIX 의미: 디렉터리의 쓰기 권한은 그 안의 항목을 지우거나 옮길 권한(DELETE_CHILD)을 포함한다.
-         * (예전에는 빠져 있어서 root 가 아니면 자기 홈에서도 파일을 지울 수 없었다) */
-        u32 wbits = NYFS_ACE_WRITE_DATA | NYFS_ACE_APPEND_DATA
-                  | ((inode->type == NYFS_INO_TYPE_DIR) ? NYFS_ACE_DELETE_CHILD : 0U);
+        /* UNIX 의미: 쓰기 권한은 그 안의 항목을 지우거나 옮길 권한(DELETE_CHILD)을 포함한다.
+         * 노드는 파일/디렉터리 구분 없이 자식을 가질 수 있으므로 모든 노드에 같다 */
+        u32 wbits = NYFS_ACE_WRITE_DATA | NYFS_ACE_APPEND_DATA | NYFS_ACE_DELETE_CHILD;
 
         if (cred->uid == inode->uid) {
             bits = (u32)((mode & NYFS_MODE_IRUSR) ? NYFS_ACE_READ_DATA : 0U)
@@ -1106,6 +1110,16 @@ static Nstatus nyfs_inherit_acl(nyfs_volume_t *vol, const nyfs_inode_t *parent,
         child->acl_overflow_count = overflow_count;
         return Nok;
     }
+}
+
+/*
+ * 노드의 종류 (vfs_stat_t.type: 1 = 파일, 2 = 디렉터리). nyfs 의 노드는 파일과 디렉터리의 구분이 없는 하나의
+ * 오브젝트다: 어느 노드든 내용(데이터 스트림, read/write)과 자식 목록을 함께 가질 수 있다. 그래서 종류는
+ * 저장된 type 이 아니라 "지금 자식이 있는지" 로 정한다 (자식이 있으면 디렉터리).
+ */
+static u32 nyfs_node_kind(const nyfs_inode_t *inode)
+{
+    return inode->dir_entry_count > 0 ? 2U : 1U;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1440,9 +1454,6 @@ static Nstatus nyfs_lookup(vnode_t *dir, const char *name, vnode_t **out_vnode)
     if (NSTATUS_IS_ERR(status)) {
         return status;
     }
-    if (dir_inode.type != NYFS_INO_TYPE_DIR) {
-        return Nunsupported;
-    }
 
     nyfs_current_cred(&cred);
     status = nyfs_check_access(dirdata->vol, &dir_inode, &cred, NYFS_ACE_EXECUTE);
@@ -1473,7 +1484,7 @@ static Nstatus nyfs_lookup(vnode_t *dir, const char *name, vnode_t **out_vnode)
     childdata->vol = dirdata->vol;
     childdata->ino = child_ino;
 
-    status = vfs_init_vnode(child, child_ino, (child_inode.type == NYFS_INO_TYPE_DIR) ? 2U : 1U,
+    status = vfs_init_vnode(child, child_ino, nyfs_node_kind(&child_inode),
                              &g_nyfs_ops, nNULL, childdata);
     if (NSTATUS_IS_ERR(status)) {
         nyfs_free_vnode_data(childdata);
@@ -1516,10 +1527,8 @@ static Nstatus nyfs_open(vnode_t *vnode, u32 flags, handle_t *out_handle)
         requested |= NYFS_ACE_WRITE_DATA;
     }
     if (flags & VFS_O_EXEC) {
-        /* 실행: 일반 파일이어야 하고 EXECUTE 권한이 있어야 한다 */
-        if (inode.type == NYFS_INO_TYPE_DIR) {
-            return Npermission;
-        }
+        /* 실행: EXECUTE 권한. 노드의 종류(자식이 있는지)와는 무관하다 — 내용이 ELF 면 실행된다
+         * (앱 = ELF 를 내용으로, 기본 설정을 자식으로: app:/ntui.run, app:/ntui.run/theme) */
         requested |= NYFS_ACE_EXECUTE;
     }
 
@@ -1629,6 +1638,46 @@ static Nstatus nyfs_write(handle_t *handle, const void *buffer, usize size, usiz
     return Nok;
 }
 
+/* 내용을 0 바이트로 (자식 목록은 그대로). 쓰기로 연 핸들에만 불린다 (vfs_truncate) */
+static Nstatus nyfs_truncate(handle_t *handle)
+{
+    nyfs_vnode_data_t *hdata;
+    nyfs_inode_t inode;
+    nyfs_blkno_t old_root;
+    Nstatus status;
+
+    if (!handle || !(handle->flags & NX_O_WRITE)) {
+        return NinvalidArg;
+    }
+    hdata = (nyfs_vnode_data_t *)handle->fs_private;
+    if (!hdata || !hdata->vol) {
+        return NinvalidArg;
+    }
+    if (!hdata->vol->write) {
+        return NreadOnly;
+    }
+    status = nyfs_read_inode(hdata->vol, hdata->ino, &inode);
+    if (NSTATUS_IS_ERR(status)) {
+        return status;
+    }
+    if (inode.size == 0 && inode.data_extent_root == NYFS_BLKNO_NONE) {
+        return Nok;
+    }
+    old_root = inode.data_extent_root;
+    inode.data_extent_root = NYFS_BLKNO_NONE;
+    inode.data_extent_depth = 0;
+    inode.size = 0;
+    /* 먼저 inode 를 써서 옛 블록을 가리키지 않게 한 뒤 회수한다 (중간에 끊겨도 새는 쪽이지 깨지는 쪽이 아니다) */
+    status = nyfs_write_inode(hdata->vol, hdata->ino, &inode);
+    if (NSTATUS_IS_ERR(status)) {
+        return status;
+    }
+    if (old_root != NYFS_BLKNO_NONE) {
+        (void)nyfs_free_extent_chain(hdata->vol, old_root);
+    }
+    return Nok;
+}
+
 static void nyfs_release(vnode_t *vnode)
 {
     nyfs_free_vnode_data((nyfs_vnode_data_t *)vfs_get_vnode_private(vnode));
@@ -1665,7 +1714,7 @@ static Nstatus nyfs_stat(vnode_t *vnode, vfs_stat_t *out)
     }
 
     out->size = inode.size;
-    out->type = (inode.type == NYFS_INO_TYPE_DIR) ? 2U : 1U;
+    out->type = nyfs_node_kind(&inode);
     out->reserved = 0;
     out->mode = (u32)inode.unix_mode & 0777U;
     out->uid = inode.uid;
@@ -1735,9 +1784,6 @@ static Nstatus nyfs_create(vnode_t *dir, const char *name, u32 mode, vnode_t **o
     status = nyfs_read_inode(dirdata->vol, dirdata->ino, &dir_inode);
     if (NSTATUS_IS_ERR(status)) {
         return status;
-    }
-    if (dir_inode.type != NYFS_INO_TYPE_DIR) {
-        return Nunsupported;
     }
 
     nyfs_current_cred(&cred);
@@ -1846,9 +1892,6 @@ static Nstatus nyfs_mkdir(vnode_t *dir, const char *name, u32 mode, vnode_t **ou
     if (NSTATUS_IS_ERR(status)) {
         return status;
     }
-    if (dir_inode.type != NYFS_INO_TYPE_DIR) {
-        return Nunsupported;
-    }
 
     nyfs_current_cred(&cred);
     status = nyfs_check_access(dirdata->vol, &dir_inode, &cred, NYFS_ACE_WRITE_DATA);
@@ -1919,7 +1962,7 @@ static Nstatus nyfs_mkdir(vnode_t *dir, const char *name, u32 mode, vnode_t **ou
     childdata->vol = dirdata->vol;
     childdata->ino = new_ino;
 
-    status = vfs_init_vnode(child, new_ino, 2U, &g_nyfs_ops, nNULL, childdata);
+    status = vfs_init_vnode(child, new_ino, 1U, &g_nyfs_ops, nNULL, childdata);
     if (NSTATUS_IS_ERR(status)) {
         nyfs_free_vnode_data(childdata);
         vfs_free_vnode(child);
@@ -1956,9 +1999,6 @@ static Nstatus nyfs_unlink(vnode_t *dir, const char *name)
     if (NSTATUS_IS_ERR(status)) {
         return status;
     }
-    if (dir_inode.type != NYFS_INO_TYPE_DIR) {
-        return Nunsupported;
-    }
 
     nyfs_current_cred(&cred);
     status = nyfs_check_access(dirdata->vol, &dir_inode, &cred, NYFS_ACE_DELETE_CHILD);
@@ -1976,7 +2016,7 @@ static Nstatus nyfs_unlink(vnode_t *dir, const char *name)
         return status;
     }
 
-    if (target_inode.type == NYFS_INO_TYPE_DIR && target_inode.dir_entry_count > 0) {
+    if (target_inode.dir_entry_count > 0) {
         /* "디렉터리가 비어있지 않음" 전용 에러 코드가 없어 Nbusy 로 대신한다 -
          * 연산 자체는 지원하지만(Nunsupported 가 아니라) 지금 상태에서는 거부한다는 뜻 */
         return Nbusy;
@@ -1999,7 +2039,7 @@ static Nstatus nyfs_unlink(vnode_t *dir, const char *name)
     if (target_inode.link_count == 0) {
         /* 저널이 없어 아래 두 회수가 중간에 끊기면 블록이 새는(leak) 상태로 남을 수
          * 있다 - 저널을 붙일 때 반드시 같이 다뤄야 할 지점이다(파일 상단 주석 참고) */
-        if (target_inode.type == NYFS_INO_TYPE_DIR) {
+        if (target_inode.dir_hash_root != NYFS_BLKNO_NONE) {
             (void)nyfs_free_extent_chain(dirdata->vol, target_inode.dir_hash_root);
         }
         (void)nyfs_free_extent_chain(dirdata->vol, target_inode.data_extent_root);
@@ -2034,9 +2074,6 @@ static Nstatus nyfs_readdir(vnode_t *dir, u64 index, char *name_out, usize name_
     status = nyfs_read_inode(dirdata->vol, dirdata->ino, &dir_inode);
     if (NSTATUS_IS_ERR(status)) {
         return status;
-    }
-    if (dir_inode.type != NYFS_INO_TYPE_DIR) {
-        return Nunsupported;
     }
 
     nyfs_current_cred(&cred);
@@ -2094,7 +2131,15 @@ static Nstatus nyfs_readdir(vnode_t *dir, u64 index, char *name_out, usize name_
                     return status;
                 }
                 name_out[copy_len] = '\0';
-                *type_out = de.file_type;
+                {
+                    nyfs_inode_t child_inode;
+
+                    /* 저장된 file_type 은 만들 때의 값이다: 지금 자식이 있는지로 다시 정한다 */
+                    if (!NSTATUS_IS_ERR(nyfs_read_inode(dirdata->vol, de.ino, &child_inode)))
+                        *type_out = nyfs_node_kind(&child_inode);
+                    else
+                        *type_out = de.file_type;
+                }
                 return Nok;
             }
 
@@ -2143,9 +2188,6 @@ static Nstatus nyfs_rename(vnode_t *old_dir, const char *old_name, vnode_t *new_
     if (NSTATUS_IS_ERR(status)) {
         return status;
     }
-    if (old_dir_inode.type != NYFS_INO_TYPE_DIR) {
-        return Nunsupported;
-    }
 
     if (same_dir) {
         new_dir_inode = &old_dir_inode;   /* 같은 디렉터리면 사본 하나만 갱신한다 */
@@ -2153,9 +2195,6 @@ static Nstatus nyfs_rename(vnode_t *old_dir, const char *old_name, vnode_t *new_
         status = nyfs_read_inode(newdata->vol, newdata->ino, &new_dir_inode_storage);
         if (NSTATUS_IS_ERR(status)) {
             return status;
-        }
-        if (new_dir_inode_storage.type != NYFS_INO_TYPE_DIR) {
-            return Nunsupported;
         }
         new_dir_inode = &new_dir_inode_storage;
     }
@@ -2184,7 +2223,7 @@ static Nstatus nyfs_rename(vnode_t *old_dir, const char *old_name, vnode_t *new_
      * 자명한 순환만 여기서 막는다. 더 깊은 순환(자기 하위 디렉터리 밑으로 옮기기)은
      * nyfs inode 에 부모 포인터가 없어 이 계층만으로는 잡지 못한다 - 알려진 한계다
      * (vfs_rename() 이 dentry 캐시가 아는 한도 안에서 한 번 더 잡아준다). */
-    if (moved_type == NYFS_DIRENT_TYPE_DIR && moved_ino == newdata->ino) {
+    if (moved_ino == newdata->ino) {
         return NinvalidArg;
     }
 
@@ -2257,6 +2296,7 @@ Nstatus nyfs_mount(u32 diskno, void *userdata)
 
     vol->read = params->read;
     vol->write = params->write;
+    vol->discard = params->discard;
     vol->info = params->info;
 
     status = nyfs_raw_read(vol, 0, &vol->sb, sizeof(vol->sb));
@@ -2558,6 +2598,7 @@ Nstatus nyfs_register(void)
     g_nyfs_ops.readdir = nyfs_readdir;
     g_nyfs_ops.rename = nyfs_rename;
     g_nyfs_ops.chmod = nyfs_chmod;
+    g_nyfs_ops.truncate = nyfs_truncate;
     g_nyfs_ops.release = nyfs_release;
 
     ops.mount = nyfs_mount;

@@ -7,6 +7,10 @@
  *  - 노출하지 않음: PIC, PIT, PCI 설정 공간, DMA 장치 레지스터.
  *  - 여는 것은 uid 0 만 (nspath 가 dev:/ 를 root 전용으로 해석한다).
  *
+ * dev:/console: 프레임버퍼(fb0 과 같은 메모리)와 키보드를 함께 독점한다. uid 0 이나 콘솔 세션 프로세스
+ * (process->console_session, NX_SPAWN_CONSOLE_SESSION) 만 연다. fb0 과는 서로 배타적이다. 닫으면 화면을 지우고
+ * 커널 콘솔(그리기 + 키보드 -> 콘솔 터미널)로 돌려준다.
+ *
  * 소유권: 프레임버퍼/COM1 은 연 프로세스가 독점한다 (두 번째 열기는 Nbusy). 그동안 커널은 그 장치를 쓰지
  * 않는다 (printk/stdin 이 비켜 준다). 블록 장치는 쓰기 열기가 독점이고 읽기 열기는 여럿이 가능하다.
  * 핸들을 닫거나 프로세스가 끝나면(죽어도 — 핸들 정리 경로) 모든 것이 커널로 돌아온다: 매핑 해제,
@@ -28,6 +32,7 @@ typedef struct nx_device {
     u64  size;                  /* 블록/프레임버퍼 바이트 수 */
     u64  phys;                  /* 프레임버퍼 물리 주소 */
     u32  width, height, pitch, bpp;
+    u32  format;                /* 프레임버퍼: NX_FB_FORMAT_* */
     u16  io_base, io_count;     /* 스트림: I/O 포트 범위 */
 
     struct process *owner;      /* 독점 소유자 (없으면 NULL) */
@@ -54,6 +59,15 @@ Nstatus device_write(nx_device_t *dev, struct process *p, bool write_open, u64 *
 
 /* 소유자 p 의 주소 공간에 프레임버퍼를 매핑하고 사용자 주소를 돌려준다 (이미 했으면 같은 주소) */
 Nstatus device_map_mmio(nx_device_t *dev, struct process *p, u64 *out_va);
+
+/*
+ * dev:/console 읽기: 키 이벤트(struct nx_keyevent)를 사용자 버퍼로. 없으면 잠든다. 반환: 바이트 수 또는 음수.
+ * len 은 이벤트 크기의 배수로 내린다 (이벤트 하나보다 작으면 NinvalidArg)
+ */
+i64 device_console_read_user(nx_device_t *dev, struct process *p, u64 ubuf, u64 len);
+
+/* NX_DEVCMD_CONSOLE_FONT: arg = 사용자의 struct nx_fontinfo */
+Nstatus device_console_font(nx_device_t *dev, struct process *p, u64 uarg);
 
 /* NX_DEVCMD_INFO 내용 */
 void device_info(const nx_device_t *dev, struct nx_devinfo *out);

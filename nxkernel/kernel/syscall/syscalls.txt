@@ -75,6 +75,7 @@
 ;                                          mmap 스타일 API 를 위해 번호만 예약(v1 미구현).
 ;
 ;   128 NxPipeCreate(u64 out[2], flags)   IPC 계층 kernel/ipc/pipe: 읽기/쓰기 끝, 블로킹, EOF/Ndisconnected
+;   134 NxPtyCreate(u64 out[2], flags)    의사 터미널 console/inputs/tty: 주 끝(NX_TYPE_PTY) + 종속 끝(콘솔 핸들)
 ;   129 NxChannelCreate(path, flags)      svc:/sys/<이름> (root) 또는 svc:/<사용자>/<이름> -> 수신 핸들
 ;   130 NxChannelSend(h, buf, len)        NxOpen("svc:/...", NX_O_WRITE) 로 얻은 송신 핸들. 가득 차면 Nbusy
 ;   131 NxChannelReceive(h, buf, len, struct nx_msginfo *info, timeout_ms) 보낸 쪽 pid/uid/gid 가 붙는다
@@ -170,6 +171,8 @@
 79  | NxSignalReturn  ; [구현됨]
 80  | NxSignalSuspend  ; [구현됨]
 81  | NxSignalPending  ; [구현됨]
+82  | NxProcessList  ; [구현됨]
+83  | NxSignalSendPid  ; [구현됨]
 
 ; =========================================================
 ; 0x0060 ~ 0x007F : Memory
@@ -191,6 +194,7 @@
 131 | NxChannelReceive  ; [구현됨]
 132 | NxSignal
 133 | NxEventCreate
+134 | NxPtyCreate  ; [구현됨]
 
 ; =========================================================
 ; 0x00A0 ~ 0x00BF : Filesystem

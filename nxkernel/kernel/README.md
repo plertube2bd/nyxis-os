@@ -17,6 +17,9 @@ so the kernel never depends on the firmware/boot method. `make iso` builds a GRU
 - `interrupt_init()`: Fills all 256 IDT vectors from the assembly stubs in `isr_stubs.s` and loads the IDT.
 - `interrupt_register_handler()` / `irq_register_handler()`: Register C handlers taking a `struct trap_frame *`.
 - CPU exceptions print a register dump; kernel-mode exceptions panic, user-mode exceptions terminate the process.
+- SysRq (like Linux Magic SysRq): Alt+SysRq+C on the PS/2 keyboard, or a serial BREAK followed by `c` within 5 s,
+  forces a kernel panic (clears the screen, shows the interrupted context and registers). `h` prints the key list.
+  In QEMU use the monitor: `sendkey alt-sysrq-c` (pressing Alt+PrintScreen on a Linux host may be caught by the host's own SysRq).
 
 ### Paging (`paging/`)
 
@@ -243,6 +246,12 @@ E820 기반 맵은 이미 쓰이고 있는 그 영역들도 "사용 가능"으�
 - `outputs/printk.c`: 커널 로그. 서식만 풀어 conout 으로 보낸다.
 - `inputs/tty.c`: 터미널 — 줄 편집 입력(`tty_read`)과 사용자 출력(`tty_write`, 제어 문자를 `?` 로 거른다).
   사용자 프로그램의 stdout/stderr 는 tty -> conout 으로 가고 printk 를 거치지 않는다 (NxKernelPrint 만 커널 로그로 간다).
+  같은 줄 편집기를 터미널 객체(`tty_t`)마다 따로 가진다: 물리 콘솔 하나 + 의사 터미널(pty, `NxPtyCreate`).
+  pty 는 주 끝에 쓴 바이트가 키 입력, 종속 끝의 출력/에코는 걸러지지 않고 주 끝으로 (터미널 에뮬레이터가 해석).
+  프로세스마다 제어 터미널(`process->ctty`)이 있고 `dev:/tty` 와 새로 만든 0/1/2 콘솔 핸들은 그것을 가리킨다.
+- `inputs/inputs_base.c`: PS/2 키보드 — 누름/뗌 + 수정자(Shift/Ctrl/Alt/Super/AltGr/Caps) 키 이벤트. 평소에는 콘솔
+  터미널로, `dev:/console` 이 열려 있으면 그 프로세스의 이벤트 큐로 (`kernel/dev/device.c`).
+- `dev:/console`: 프레임버퍼 + 키보드 독점 (콘솔 세션 프로세스와 root 만, `NX_SPAWN_CONSOLE_SESSION`). ntui 가 쓴다.
 - 표준 스트림 장치: `dev:/tty`(터미널), `dev:/stdin|stdout|stderr`(호출자의 0/1/2 번을 공유하는 새 핸들,
   리디렉션을 따른다). `dev:/` 의 다른 장치와 달리 누구나 열 수 있다 (`nspath.c` 의 `nsp_dev_is_public`,
   `syscall.c` 의 `open_stream`).

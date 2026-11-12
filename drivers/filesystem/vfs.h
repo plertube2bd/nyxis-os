@@ -55,6 +55,10 @@ typedef struct vfs_ops {
      * (v1 은 덮어쓰기 rename 을 지원하지 않는다 - 필요하면 먼저 unlink 한다). */
     Nstatus (*rename)(vnode_t *old_dir, const char *old_name, vnode_t *new_dir, const char *new_name);
 
+    /* 열린 노드의 내용(데이터)을 0 바이트로 자른다 (선택 사항). 자식은 건드리지 않는다.
+     * 쓰기로 연 핸들에만 부른다 (권한은 open 이 이미 검사했다) */
+    Nstatus (*truncate)(handle_t *handle);
+
     /* 권한 비트를 바꾼다 (선택 사항). 누가 바꿀 수 있는지는 드라이버가 판정한다 (소유자 또는 root) */
     Nstatus (*chmod)(vnode_t *vnode, u32 mode);
 
@@ -88,6 +92,9 @@ Nstatus vfs_open(const char *path, u32 flags, handle_t *out_handle);
 Nstatus vfs_read(handle_t *handle, void *buffer, usize size, usize *bytes_read);
 Nstatus vfs_write(handle_t *handle, const void *buffer, usize size, usize *bytes_written);
 Nstatus vfs_close(handle_t *handle);
+
+/* 열린 노드의 내용을 0 바이트로 자르고 오프셋을 0 으로 (파일시스템이 지원하지 않으면 Nunsupported) */
+Nstatus vfs_truncate(handle_t *handle);
 
 /* 열린 핸들이 가리키는 파일의 정보를 얻는다 (경로가 아니라 핸들 기준이라 경로 경쟁이 없다) */
 Nstatus vfs_fstat(handle_t *handle, vfs_stat_t *out);

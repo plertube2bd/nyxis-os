@@ -6,7 +6,7 @@
  * 이름공간(face:/ tmp:/ app:/ ...)의 뿌리에서 위로 가면 "places" 목록이 나온다 (자주 쓰는 이름공간).
  *
  * 키
- *   ↑ ↓ PgUp PgDn Home End  고르기          Enter / ->  디렉터리 열기, 파일은 kilo 로 편집 (전체 화면)
+ *   ↑ ↓ PgUp PgDn Home End  고르기          Enter / ->  디렉터리 열기, 파일은 kilo 로 편집 (최대화된 창)
  *   Backspace / <-          위 디렉터리     v  보기 (cat, 명령 창)         e  kilo 로 편집
  *   t  여기서 터미널        r  이름 바꾸기   d  지우기 (y 로 확인, 빈 디렉터리만)
  *   n  새 파일              m  새 디렉터리   g  경로로 가기     ~  face:/     .  다시 읽기
@@ -48,6 +48,7 @@ struct files {
     char input[FILES_NAME];
     int inLen;
     char msg[96];                       /* 마지막 결과/오류 */
+    int reloadSoon;                     /* 편집기를 띄웠다: 다시 활성이 되면 목록을 다시 읽는다 */
 };
 
 /* ---------------- 경로 ---------------- */
@@ -253,8 +254,9 @@ static void openSelected(struct files *f, bool edit)
         return;
     shellQuote(quoted, sizeof(quoted), path);
     snprintf(cmd, sizeof(cmd), "kilo %s", quoted);
-    nrunnerExec(cmd);
-    (void)reload(f, e->name);           /* 저장했으면 크기가 바뀌었다 */
+    if (nterminalRunEx(cmd, RUN_MAXIMIZED | RUN_AUTOCLOSE, NULL, 0, 0) == NULL)
+        snprintf(f->msg, sizeof(f->msg), "cannot open a window");
+    f->reloadSoon = 1;                  /* 편집기 창이 닫혀 이 창이 다시 활성이 되면 크기를 다시 읽는다 */
 }
 
 static void viewSelected(struct files *f)
@@ -383,6 +385,14 @@ static void filesDraw(struct window *w, int x, int y, int cols, int rows, int ac
     if (cols < 4 || rows < 3)
         return;
     f->rows = listRows;
+    if (active && f->reloadSoon) {
+        const struct entry *e = selected(f);
+        char name[FILES_NAME];
+
+        f->reloadSoon = 0;
+        snprintf(name, sizeof(name), "%s", e != NULL ? e->name : "");
+        (void)reload(f, name[0] ? name : NULL);   /* 편집기에서 저장했으면 크기가 바뀌었다 */
+    }
 
     /* 경로 */
     snprintf(line, sizeof(line), " %s", f->path[0] ? f->path : "places");

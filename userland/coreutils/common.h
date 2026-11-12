@@ -35,7 +35,11 @@ int cu_join(char *out, size_t cap, const char *dir, const char *name);
 int cu_color_ok(int fd);
 
 /* 디렉터리면 1, 아니면(없음 포함) 0 */
+/* 디렉터리로 다룰지: 자식이 있으면(S_ISDIR), 또는 경로가 '/' 로 끝나고 자식을 가질 수 있는 노드면.
+ * Nyxis 의 노드는 파일/디렉터리 구분 없이 내용과 자식을 함께 가지고, 자식이 있으면 디렉터리로 보인다 */
 int cu_is_dir(const char *path);
+/* path 가 자식을 담을 수 있는 노드인지 (opendir 이 된다: Nyxis 는 모든 노드, 다른 OS 는 디렉터리) */
+int cu_can_hold(const char *path);
 
 /* n 바이트를 모두 쓴다. 실패하면 -1 */
 int cu_write_all(int fd, const void *buf, size_t n);

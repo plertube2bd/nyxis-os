@@ -19,6 +19,7 @@
 #define UART_LSR        5
 
 #define LSR_DATA_READY  0x01
+#define LSR_BREAK       0x10
 #define LSR_THR_EMPTY   0x20
 #define SERIAL_SPIN_MAX 100000UL
 
@@ -75,6 +76,22 @@ bool serial_rx_ready(void)
     if (!g_serial_ready)
         return false;
     return (inb(COM1_BASE + UART_LSR) & LSR_DATA_READY) ? true : false;
+}
+
+/* 받은 바이트가 있으면 1 바이트를 *c 에. BREAK(선이 일정 시간 0)와 함께 온 바이트면 *brk = true.
+ * LSR 을 한 번만 읽는다 (읽으면 BREAK 비트가 지워진다). 없으면 false */
+bool serial_rx_byte(char *c, bool *brk)
+{
+    u8 lsr;
+
+    if (!g_serial_ready)
+        return false;
+    lsr = inb(COM1_BASE + UART_LSR);
+    if (!(lsr & LSR_DATA_READY))
+        return false;
+    *brk = (lsr & LSR_BREAK) ? true : false;
+    *c = (char)inb(COM1_BASE + UART_DATA);
+    return true;
 }
 
 char serial_getc_nowait(void)

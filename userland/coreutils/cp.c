@@ -1,10 +1,15 @@
 /*
  * cp [-r] 원본 대상        - 파일 하나를 복사한다
  * cp [-r] 원본... 디렉터리  - 디렉터리 안으로 같은 이름으로 복사한다
- *   -r, -R  디렉터리를 내용까지 복사한다
+ *   -r, -R  자식까지 복사한다 (노드의 내용과 자식 모두)
+ * Nyxis 의 노드는 파일/디렉터리 구분 없이 내용과 자식을 함께 가진다 (자식이 있으면 디렉터리로 보인다).
+ * -r 없이 자식이 있는 노드를 주면 내용만 복사한다 (예: cp app:/nysh.run x.run 은 실행 파일만).
+ * 대상이 '/' 로 끝나면 "그 안으로" (자식이 아직 없는 노드도): cp a.txt box/
  */
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <string.h>
 #include <sys/stat.h>
 #include "common.h"
@@ -12,6 +17,24 @@
 static int g_recursive = 0;
 
 static int copy_path(const char *src, const char *dst);
+
+/* 디렉터리가 읽을 수 있는 내용을 가졌는지 (Nyxis: 내용 없는 디렉터리는 open 이 EISDIR, 다른 OS: read 가 EISDIR) */
+static int has_content(const char *path)
+{
+    char c;
+    ssize_t n;
+    int e = errno;
+    int fd = open(path, O_RDONLY);
+
+    if (fd < 0) {
+        errno = e;
+        return 0;
+    }
+    n = read(fd, &c, 1);
+    close(fd);
+    errno = e;
+    return n == 1;
+}
 
 static int copy_dir(const char *src, const char *dst, mode_t mode)
 {
@@ -27,10 +50,13 @@ static int copy_dir(const char *src, const char *dst, mode_t mode)
         cu_msg("cannot copy '%s' into itself", src);
         return 1;
     }
-    if (mkdir(dst, mode | 0700) != 0 && !(errno == EEXIST && cu_is_dir(dst))) {
+    if (mkdir(dst, mode | 0700) != 0 && !(errno == EEXIST && cu_can_hold(dst))) {
         cu_warn(dst);
         return 1;
     }
+    /* 노드의 내용도 (Nyxis: 자식이 있는 노드도 내용을 가진다. 다른 OS 의 디렉터리는 내용이 없다) */
+    if (has_content(src) && cu_copy_file(src, dst) != 0)
+        rc = 1;
     d = opendir(src);
     if (!d) {
         cu_warn(src);
@@ -57,7 +83,11 @@ static int copy_path(const char *src, const char *dst)
         return 1;
     }
     if (S_ISDIR(st.st_mode)) {
+        /* nyfs 의 디렉터리는 내용도 가질 수 있는 오브젝트다 (예: app:/nysh.run = ELF + 기본 설정).
+         * -r 이 없으면 그 내용을 파일로 복사한다. 내용이 없는 디렉터리는 예전처럼 -r 이 필요하다 */
         if (!g_recursive) {
+            if (has_content(src))
+                return cu_copy_file(src, dst) == 0 ? 0 : 1;
             cu_msg("-r not specified; omitting directory '%s'", src);
             return 1;
         }

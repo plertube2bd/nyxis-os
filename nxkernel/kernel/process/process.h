@@ -54,7 +54,7 @@
 #include "kernel/process/waitq.h"        /* waitq_t */
 #include "interrupt.h"                   /* struct trap_frame */
 
-#define PROCESS_MAX          16U
+#define PROCESS_MAX          32U
 #define PROCESS_KSTACK_SIZE  16384U
 #define NX_USER_NAME_MAX     32U        /* 사용자 이름 최대 길이 (NUL 포함) */
 #define PROCESS_KSTACK_GUARD 4096U      /* 스택 아래 매핑하지 않는 가드 페이지 (PAGE_SIZE 와 같아야 함) */
@@ -107,6 +107,20 @@ typedef struct process {
     u16   io_base;        /* ring3 에서 직접 in/out 할 수 있는 포트 범위 (dev:/com1 의 NX_DEVCMD_IOPERM). */
     u16   io_count;       /* 0 이면 없음. 전환할 때마다 TSS I/O 비트맵에 반영된다 */
     u32   umask;          /* NxCreateNode 의 mode 에서 지울 비트 (NxSetUmask). fork/생성 시 물려준다 */
+
+    /* 제어 터미널 (dev:/tty, 0/1/2 콘솔 핸들의 대상). NULL 이면 물리 콘솔. pty 면 종속 끝 참조 1 개를 가진다
+     * (tty_retain). 만든 프로세스에게서 물려받고, 새 프로세스의 0 번 핸들이 pty 종속 끝이면 그 pty 가 된다 */
+    struct tty *ctty;
+    /* 콘솔 세션 (NX_SPAWN_CONSOLE_SESSION 으로 만들어졌다): dev:/console 을 열 수 있다. 물려주지 않는다 */
+    bool  console_session;
+    /* 보호 프로세스 (init 은 커널이, login 은 init 이 NX_SPAWN_CRITICAL 로): 부모 말고는 root 도 신호/종료를
+     * 보낼 수 없다 (signal_protected). 물려주지 않는다 */
+    bool  critical;
+    /* ntop / NxProcessList 용: 실행 파일 이름 (경로의 마지막 이름에서 ".run" 을 뗀 것. 생성/exec 때 커널이 정한다,
+     * argv[0] 과 달리 사용자가 꾸밀 수 없다. fork 는 물려받는다), 이 프로세스가 CPU 를 쓴 타이머 틱 수, 시작 틱 */
+    char  name[NX_PROC_NAME_MAX];
+    u64   cpu_ticks;
+    u64   start_tick;
 
     /* 실행 계층 (kernel/exec/exec.h) */
     struct trap_frame *uframe;      /* 지금 처리 중인 시스템 콜의 사용자 레지스터 (syscall_handle 이 설정) */
@@ -181,6 +195,25 @@ Nstatus process_terminate(u32 pid);
 
 /* proc 를 종료 코드 code 로 종료한다 (이미 끝났으면 아무것도 하지 않고 성공). 자기 자신이면 반환하지 않는다. */
 Nstatus process_kill(process_t *proc, i32 code);
+
+/* path 의 마지막 이름(".run" 을 뗀 것)을 proc->name 에 */
+void process_set_name(process_t *proc, const char *path);
+
+/* 살아 있는 프로세스를 out 에 최대 max 개 채운다. 살아 있는 프로세스 수를 돌려준다 (max 보다 클 수 있다) */
+u32 process_list_snapshot(struct nx_procent *out, u32 max);
+
+/* 제어 터미널을 바꾼다 (참조를 옮긴다: t 를 retain 하고 이전 것을 release) */
+void process_set_ctty(process_t *proc, struct tty *t);
+
+/*
+ * 새 프로세스(spawn/fork)나 exec 한 프로세스의 제어 터미널을 정한다: 0 번 핸들이 pty 종속 끝이면 그 pty,
+ * 아니면 inherited (부모의 것, exec 이면 자기 것). fresh_console: 핸들을 물려받지 않고 새로 만든 0/1/2 콘솔
+ * 핸들이면 그것들도 그 제어 터미널을 가리키게 한다 (0 번 핸들은 보지 않는다).
+ */
+void process_adopt_ctty(process_t *proc, struct tty *inherited, bool fresh_console);
+
+/* 제어 터미널이 t 인 살아 있는 프로세스 모두에게 SIGHUP (pty 끊김). 인터럽트를 막은 상태에서 */
+void process_hangup_ctty(struct tty *t);
 
 /* 그룹 pgid 의 살아 있는 프로세스가 모두 uid 이면 true (비어 있어도 true) */
 bool process_group_owned_by(u32 pgid, u32 uid);

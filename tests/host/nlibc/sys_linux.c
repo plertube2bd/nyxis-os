@@ -274,6 +274,20 @@ int __nl_tty_echo(long h, int on)
     return on ? linux_lflag(h, 0, 8U) : linux_lflag(h, 8U, 0);
 }
 
+int __nl_tty_set_winsize(long h, const unsigned short ws[4])
+{
+    return (int)ret(lsc(L_IOCTL, h, 0x5414 /* TIOCSWINSZ */, (long)ws));
+}
+
+/* 호스트 테스트에는 Nyxis 의 pty/화면 장치/프로세스 목록이 없다 */
+int __nl_proc_list(struct __nl_procent *out, int max) { (void)out; (void)max; errno = ENOSYS; return -1; }
+int __nl_signal_pid(unsigned long pid, int sig) { (void)pid; (void)sig; errno = ENOSYS; return -1; }
+unsigned long __nl_timer_hz(void) { return 100; }
+int __nl_check_password(const char *name, const char *password) { (void)name; (void)password; errno = ENOSYS; return -1; }
+int __nl_openpty(long out[2], int cloexec) { (void)out; (void)cloexec; errno = ENOSYS; return -1; }
+long __nl_devcmd(long h, unsigned long cmd, unsigned long arg) { (void)h; (void)cmd; (void)arg; errno = ENOSYS; return -1; }
+void *__nl_map_mmio(long h) { (void)h; errno = ENOSYS; return 0; }
+
 int __nl_tty_winsize(long h, unsigned short ws[4])
 {
     return (int)ret(lsc(L_IOCTL, h, 0x5413 /* TIOCGWINSZ */, (long)ws));
@@ -654,4 +668,15 @@ void __nl_exit(int status)
     (void)lsc(L_EXIT_GROUP, status, 0, 0);
     for (;;)
         ;
+}
+
+/* ---------------- 서비스 채널: Linux 에는 svc:/ 가 없다 ---------------- */
+long __nl_channel_create(const char *path, int public_) { (void)path; (void)public_; errno = ENOSYS; return -1; }
+long __nl_channel_open(const char *path) { (void)path; errno = ENOSYS; return -1; }
+long __nl_channel_send(long h, const void *buf, size_t len) { (void)h; (void)buf; (void)len; errno = ENOSYS; return -1; }
+long __nl_channel_receive(long h, void *buf, size_t cap, unsigned long sender[3], long timeout_ms)
+{
+    (void)h; (void)buf; (void)cap; (void)sender; (void)timeout_ms;
+    errno = ENOSYS;
+    return -1;
 }

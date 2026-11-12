@@ -5,6 +5,7 @@
 #include "kernel/syscall/uaccess.h"
 #include "kernel/paging/paging.h"
 #include "kernel/process/process.h"
+#include "kernel/process/umem.h"
 
 /* uaccess.s */
 extern long nx_uaccess_copy(void *dst, const void *src, unsigned long len);
@@ -20,6 +21,7 @@ Nstatus copy_from_user(void *dst, u64 user_src, usize len)
     if (!current_process)
         return NnotInitialized;
 
+    umem_prefault(current_process, user_src, len);      /* 요구 페이징 영역의 아직 없는 페이지 */
     if (!paging_is_user_range(&current_process->addrspace, (const void *)(usize)user_src, len, false))
         return NinvalidPointer;
 
@@ -38,6 +40,7 @@ Nstatus copy_to_user(u64 user_dst, const void *src, usize len)
     if (!current_process)
         return NnotInitialized;
 
+    umem_prefault(current_process, user_dst, len);
     if (!paging_is_user_range(&current_process->addrspace, (const void *)(usize)user_dst, len, true))
         return NinvalidPointer;
 

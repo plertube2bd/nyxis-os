@@ -43,6 +43,7 @@ Nstatus exec_fork(struct trap_frame *frame, process_t **out_child)
         process_release(child);
         return status;
     }
+    process_set_ctty(child, parent->ctty);      /* 제어 터미널은 그대로 */
     *out_child = child;
     return NSTATUS_OK;
 }
@@ -88,6 +89,9 @@ Nstatus exec_replace(struct trap_frame *frame, const char *path, const spawn_arg
 
     /* 3. 핸들: CLOEXEC 를 닫고 세대를 0 으로 (새 프로그램에서 핸들 값 = 슬롯 번호) */
     nx_handles_exec(&self->handles);
+    process_set_name(self, path);
+    /* 0 번 핸들이 pty 종속 끝이면 그것이 새 프로그램의 제어 터미널 (fork -> dup2 -> exec 로 띄운 경우) */
+    process_adopt_ctty(self, self->ctty, false);
     signal_exec_reset(self);                /* 옛 이미지의 처리기 주소는 새 이미지에서 뜻이 없다 */
 
     /* 4. FPU/SSE 를 새 프로그램의 시작 상태로 */

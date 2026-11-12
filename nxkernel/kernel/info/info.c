@@ -7,6 +7,8 @@
 #include "kernel/mm/kheap.h"
 #include "kernel/mm/pfa.h"
 #include "kernel/paging/paging.h"
+#include "kernel/kernel.h"
+#include "boot_info.h"
 #include "kernel/timer/pit/pit_base.h"
 #include "drivers/filesystem/vfs.h"
 #include "nyx_abi.h"
@@ -213,6 +215,56 @@ static Nstatus gen_mem_free(char *buf, usize max, usize *len)
     return NSTATUS_IS_ERR(status) ? status : put_str(buf, max, len, "\n");
 }
 
+/*
+ * 물리 RAM 전체: 메모리 맵 중 RAM 인 종류의 합 (MMIO/예약/불량 제외). 커널 이미지, initrd, tmp:/, 펌웨어
+ * Runtime/ACPI 영역처럼 할당기(pfa)가 관리하지 않는 RAM 도 포함한다.
+ */
+static u64 ram_pages(void)
+{
+    const NTBLI *info = get_kernel_info();
+    u64 n;
+    u64 i;
+    u64 pages = 0;
+
+    if (!info)
+        return 0;
+    n = ntbli_memmap_count(info);
+    for (i = 0; i < n; i++) {
+        const ntbli_memdesc_t *d = ntbli_memmap_at(info, i);
+
+        if (!d)
+            break;
+        switch (d->type) {
+        case NTBLI_MEM_LOADER_CODE: case NTBLI_MEM_LOADER_DATA:
+        case NTBLI_MEM_BOOT_CODE: case NTBLI_MEM_BOOT_DATA:
+        case NTBLI_MEM_RUNTIME_CODE: case NTBLI_MEM_RUNTIME_DATA:
+        case NTBLI_MEM_CONVENTIONAL: case NTBLI_MEM_ACPI_RECLAIM: case NTBLI_MEM_ACPI_NVS:
+        case NTBLI_MEM_PERSISTENT:
+            if (d->num_pages <= (0x1000000000000UL / NTBLI_PAGE_SIZE))
+                pages += d->num_pages * (NTBLI_PAGE_SIZE / PAGE_SIZE);
+            break;
+        default:
+            break;
+        }
+    }
+    /* 맵이 없거나 이상해도 total 보다 작게 보이지는 않게 */
+    return pages < pfa_total_count() ? pfa_total_count() : pages;
+}
+
+static Nstatus gen_mem_ram(char *buf, usize max, usize *len)
+{
+    Nstatus status = put_u64(buf, max, len, ram_pages() * (PAGE_SIZE / 1024U));
+
+    return NSTATUS_IS_ERR(status) ? status : put_str(buf, max, len, "\n");
+}
+
+static Nstatus gen_mem_reserved(char *buf, usize max, usize *len)
+{
+    Nstatus status = put_u64(buf, max, len, (ram_pages() - pfa_total_count()) * (PAGE_SIZE / 1024U));
+
+    return NSTATUS_IS_ERR(status) ? status : put_str(buf, max, len, "\n");
+}
+
 /* ---------------- 표 ---------------- */
 
 /* 디렉터리는 자기 항목보다 앞에 둔다. 나열 순서 = 표 순서 */
@@ -227,6 +279,8 @@ static const struct info_node g_nodes[] = {
     { "memory",           INFO_NODE_DIR,  nNULL },
     { "memory/total_kib", INFO_NODE_FILE, gen_mem_total },
     { "memory/free_kib",  INFO_NODE_FILE, gen_mem_free },
+    { "memory/ram_kib",   INFO_NODE_FILE, gen_mem_ram },
+    { "memory/reserved_kib", INFO_NODE_FILE, gen_mem_reserved },
 };
 
 #define INFO_NODE_COUNT (sizeof(g_nodes) / sizeof(g_nodes[0]))

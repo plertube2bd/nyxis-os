@@ -5,6 +5,8 @@
 #   make os         부팅 가능한 ESP 디스크 이미지    (out/esp.img)
 #   make run        QEMU(OVMF, q35+AHCI) 로 실행     (GTK 창 + 시리얼 stdio)
 #   make run-nographic  화면 없이 시리얼만으로 실행
+#   make run-sata   SATA 로 부팅: q35 내장 AHCI 의 포트 0 = ESP(부팅), 포트 1 = disk.img (disk:/). 연결을 명시한다
+#                   (QEMU_DISPLAY / QEMU_SERIAL / QEMU_EXTRA 로 화면, 시리얼, 추가 옵션을 바꿀 수 있다)
 #   make iso        GRUB(Multiboot2) 부팅 ISO (BIOS/UEFI 겸용)   (out/nyxis.iso)
 #   make run-grub-bios / run-grub-uefi   GRUB 으로 부팅
 #   make run-usb    usb-storage 부팅 디스크 + std VGA 로 실행 (예전 virtio-gpu 는 BltOnly GOP 라 프레임버퍼가 없어 제거)
@@ -20,6 +22,8 @@
 #   make clean
 #
 #   옵션:  DEBUG=1     부트로더 프레임버퍼 테스트 패턴 활성화 (-DNYTB_DEBUG)
+#          RES=WxH     화면 해상도 (기본 1600x900). 부트로더가 정확히 그 모드를, 없으면 그 안에 드는 가장 큰
+#                      모드를 고른다. 바꾸면 부트로더/ISO 만 다시 만든다 (예: make RES=1280x800 run)
 #          SELFTEST=1  커널 부팅 후 자체 점검(kernel/selftest.c) 실행 (-DNYX_SELFTEST)
 #
 # [수정 이력 요약]
@@ -89,6 +93,21 @@ CFLAGS = \
 ifeq ($(DEBUG),1)
 CFLAGS += -DNYTB_DEBUG
 endif
+
+# 화면 해상도 (부트로더의 GOP 모드 선택, GRUB 의 gfxmode)
+RES   ?= 1600x900
+RES_W := $(word 1,$(subst x, ,$(RES)))
+RES_H := $(word 2,$(subst x, ,$(RES)))
+ifeq ($(RES_H),)
+$(error RES must look like 1600x900)
+endif
+CFLAGS += -DNYTB_PREF_W=$(RES_W) -DNYTB_PREF_H=$(RES_H)
+# RES 가 바뀌면 부트로더를 다시 컴파일하도록 (Makefile 은 CFLAGS 변경을 추적하지 않는다)
+RES_STAMP = $(BUILD)/.res-$(RES)
+$(RES_STAMP):
+	@mkdir -p $(BUILD)
+	@rm -f $(BUILD)/.res-*
+	@touch $@
 
 # =========================
 # Kernel (64-bit)
@@ -247,7 +266,7 @@ all: $(BOOTLOADER) $(KERNEL)
 kernel: $(KERNEL)
 
 # Bootloader
-$(BOOTLOADER_OBJ): $(BOOTLOADER_SRC)
+$(BOOTLOADER_OBJ): $(BOOTLOADER_SRC) $(RES_STAMP)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -312,7 +331,11 @@ USER_CFLAGS = \
 	$(OPT) -m64 -ffreestanding -nostdinc -fno-builtin -fno-stack-protector \
 	-fno-pie -fno-pic -fcf-protection=none -fno-asynchronous-unwind-tables \
 	-fno-tree-loop-distribute-patterns -mgeneral-regs-only \
+	-ffunction-sections -fdata-sections \
 	-I$(INCLUDE_DIR) -I$(ROOT)/userland/nlibc/library
+# -ffunction-sections -fdata-sections: 함수/변수마다 섹션을 따로 두어 링커의 --gc-sections 가 쓰지 않는 것을
+#   버리게 한다 (정적 링크가 .o 단위가 아니라 함수 단위가 된다: 예) printf 만 쓰는 앱에 scanf/strtod 가 딸려 오지 않음).
+#   NLIBC_CFLAGS 도 이것을 물려받는다. 앱 쪽은 nlcc 드라이버가 같은 옵션을 넣는다.
 
 # 사용자 프로그램 (라이브러리가 아닌 것: init/login/sudo/..., elftest, coreutils, nysh, ntui 등 userland/ 의 앱)은
 #   C99 까지의 문법을 쓴다 (선언과 문장 섞기, // 주석, for 안의 선언, 지정 초기화 등). -pedantic 이 C11 이후의
@@ -328,7 +351,7 @@ ULIB_DIR    = $(ROOT)/userland/lib
 USER_LDS    = $(ELFTEST_DIR)/linker.lds
 USR_DIR     = $(BUILD)/usr
 ELFTEST_ELF = $(USR_DIR)/elftest.run
-USER_LD     = $(LD) -m elf_x86_64 -nostdlib -z max-page-size=0x1000 -z noexecstack --no-warn-rwx-segments -T $(USER_LDS)
+USER_LD     = $(LD) -m elf_x86_64 -nostdlib -z max-page-size=0x1000 -z noexecstack --no-warn-rwx-segments --gc-sections -T $(USER_LDS)
 
 # 공용 런타임 (crt0 + 시스템 콜 래퍼/문자열/콘솔)
 ULIB_OBJS = $(BUILD)/obj/ulib/crt0.o $(BUILD)/obj/ulib/nyx.o
@@ -372,10 +395,13 @@ NLIBC_DIR    = $(ROOT)/userland/nlibc
 #   커널이 프로세스마다 FPU/SSE 상태를 저장하므로(process.h 의 fpu_state) nlibc 프로그램은 부동소수점을 쓴다:
 #   -mgeneral-regs-only 를 뺀다.
 NLIBC_CFLAGS = $(filter-out -I% -mgeneral-regs-only,$(USER_CFLAGS)) -D_NYX_SOURCE -I$(NLIBC_DIR)/library -I$(INCLUDE_DIR)
-NLIBC_MODS   = ctype dirent env fpconv locale malloc math poll posix_fd posix_path printf process scanf signal start stdio stdlib string termios time
+NLIBC_MODS   = ctype dirent env fpconv locale malloc math nyxapp poll posix_fd posix_path printf process scanf signal start stdio stdlib string termios time
 NLIBC_ASM_MODS = setjmp sigtramp
 NLIBC_HDRS   = $(wildcard $(NLIBC_DIR)/library/*.h $(NLIBC_DIR)/library/sys/*.h) $(NLIBC_DIR)/src/nl_internal.h $(INCLUDE_DIR)/nyx_abi.h
-NLIBC_OBJS   = $(patsubst %,$(BUILD)/obj/nlibc/%.o,$(NLIBC_MODS) $(NLIBC_ASM_MODS) nxsys)
+# nx64api (<nx64.h>: TUI + 비 POSIX). 시스템 콜은 플랫폼 계층(nxsys / sys_linux)으로 부르므로 호스트 검사용
+#   nlibc 에도 들어간다 (svc:/, info:/ 는 -1). libnlibc.a 에 있으니 nlcc(호스트/Nyxis 안 모두)로 링크 옵션 없이 쓴다
+NX64_MODS    = nx64_tui nx64_sys
+NLIBC_OBJS   = $(patsubst %,$(BUILD)/obj/nlibc/%.o,$(NLIBC_MODS) $(NLIBC_ASM_MODS) $(NX64_MODS) nxsys)
 NLIBC_A      = $(BUILD)/obj/nlibc/libnlibc.a
 NLIBC_CRT0   = $(BUILD)/obj/nlibc/nlcrt0.o
 
@@ -445,7 +471,7 @@ $(HELLO_ELF): $(NLIBC_DIR)/examples/hello.c $(NLIBC_STAMP)
 
 # 명령어 (userland/coreutils): 각각 fs:/usr/<이름>.run (= nysh 에서 이름만으로 실행)
 COREUTILS_DIR  = $(ROOT)/userland/coreutils
-COREUTILS      = cat echo clear rm touch mkdir rmdir ls cp mv chmod head tail wc pwd sleep true false cmp nyfetch
+COREUTILS      = cat echo clear rm touch mkdir rmdir ls cp mv chmod head tail wc pwd sleep true false cmp nyfetch kill
 COREUTILS_ELFS = $(addprefix $(USR_DIR)/,$(addsuffix .run,$(COREUTILS)))
 
 # nlibc 앱 (userland/<이름>/*.c -> fs:/usr/<이름>.run): 셸 nysh, ntui ... (위의 USERLAND_DIRS 참고)
@@ -612,15 +638,20 @@ test-disk: $(NYFS_PACK)
 	@if [ ! -f $(BUILD)/test-password ]; then echo "build a test image first: make clean && make SELFTEST=1 os" >&2; exit 1; fi
 	python3 $(ROOT)/tools/e2e_disk_test.py $(BUILD) $(NYFS_PACK)
 
-$(NYFS_PACK):
+# nyfs-utils 의 소스가 바뀌면 다시 만든다 (이 규칙에 의존성이 없으면 옛 nyfs-pack 으로 이미지를 만들게 된다)
+NYFS_PACK_SRCS = $(wildcard $(ROOT)/tools/nyfs-utils/src/*.c $(ROOT)/tools/nyfs-utils/include/*.h)
+$(NYFS_PACK): $(NYFS_PACK_SRCS)
 	$(MAKE) -C $(ROOT)/tools/nyfs-utils pack
 
 # 루트 파일시스템 = nyfs 이미지 (커널이 fs:/ 로 마운트)
 ROI_SRC   = $(ROOT)/rootfs/roi
 ROI_FILES = $(shell find $(ROI_SRC) -type f 2>/dev/null)
+# 앱 기본 설정: rootfs/app/<이름>/... -> app:/<이름>.run/... (앱이 ELF 를 내용으로 가진 디렉터리 오브젝트가 된다)
+APP_SRC   = $(ROOT)/rootfs/app
+APP_FILES = $(shell find $(APP_SRC) 2>/dev/null)
 
-$(INITRD_IMG): $(ROOTFS_EXTRA_DEPS) $(USER_PROG_ELFS) $(ELFTEST_ELF) $(NLIBC_TEST_ELF) $(FPUTEST_ELF) $(HELLO_ELF) $(COREUTILS_ELFS) $(NLIBC_APP_ELFS) $(KILO_ELF) $(NLCC_ELF) $(NLCC_STAMP) $(INITRD_RUN) $(ROOT_USERS_DB) $(NYFS_PACK) $(ROOT)/tools/mkrootfs.py $(ROI_FILES)
-	python3 $(ROOT)/tools/mkrootfs.py --users $(ROOT_USERS_DB) --bin $(USR_DIR) --roi $(ROI_SRC) \
+$(INITRD_IMG): $(ROOTFS_EXTRA_DEPS) $(USER_PROG_ELFS) $(ELFTEST_ELF) $(NLIBC_TEST_ELF) $(FPUTEST_ELF) $(HELLO_ELF) $(COREUTILS_ELFS) $(NLIBC_APP_ELFS) $(KILO_ELF) $(NLCC_ELF) $(NLCC_STAMP) $(INITRD_RUN) $(ROOT_USERS_DB) $(NYFS_PACK) $(ROOT)/tools/mkrootfs.py $(ROI_FILES) $(APP_FILES)
+	python3 $(ROOT)/tools/mkrootfs.py --users $(ROOT_USERS_DB) --bin $(USR_DIR) --roi $(ROI_SRC) --app $(APP_SRC) \
 		--file /usr/hellowld.run=$(INITRD_RUN):0644 --tree /usr/lib=$(NLCC_ROOT)/lib --tree /usr/src=$(NLCC_ROOT)/src \
 		$(ROOTFS_EXTRA) > $(ROOTFS_MANIFEST)
 	$(NYFS_PACK) -s $(ROOTFS_SIZE) -o $@ $(ROOTFS_MANIFEST)
@@ -688,6 +719,32 @@ run-nographic: prepare-run $(DISK_IMG)
 		-display none \
 		-serial mon:stdio
 
+# SATA 부팅. -drive 기본값에 맡기지 않고 q35 의 ICH9 AHCI(00:1f.2) 포트에 직접 붙인다.
+#   예) 화면 없이 + QEMU 모니터 소켓:  make run-sata QEMU_DISPLAY="-display none" QEMU_EXTRA="-monitor unix:/tmp/mon,server=on,wait=off"
+QEMU_DISPLAY ?= -display gtk
+QEMU_SERIAL  ?= -serial stdio
+QEMU_EXTRA   ?=
+
+run-sata: prepare-run $(DISK_IMG)
+	env -i \
+		PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+		DISPLAY=$(DISPLAY) \
+		XAUTHORITY=$(XAUTHORITY) \
+		WAYLAND_DISPLAY=$(WAYLAND_DISPLAY) \
+		XDG_RUNTIME_DIR=$(XDG_RUNTIME_DIR) \
+		DBUS_SESSION_BUS_ADDRESS=$(DBUS_SESSION_BUS_ADDRESS) \
+		qemu-system-x86_64 \
+			-machine q35 \
+			$(QEMU_COMMON) \
+			-drive file=$(OS_IMG),format=raw,if=none,id=sata-esp \
+			-device ide-hd,drive=sata-esp,bus=ide.0,bootindex=0 \
+			-drive file=$(DISK_IMG),format=raw,if=none,id=sata-disk \
+			-device ide-hd,drive=sata-disk,bus=ide.1 \
+			-vga std \
+			$(QEMU_SERIAL) \
+			$(QEMU_DISPLAY) \
+			$(QEMU_EXTRA)
+
 run-usb: prepare-run
 	env -i \
 		PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
@@ -720,7 +777,7 @@ $(ISO_IMG): $(KERNEL) $(INITRD_IMG)
 	mkdir -p $(ISO_DIR)/boot/grub
 	cp $(KERNEL) $(ISO_DIR)/boot/kernel.elf
 	cp $(INITRD_IMG) $(ISO_DIR)/boot/initrd.img
-	printf 'insmod all_video\nset timeout=0\nset default=0\nset gfxmode=1024x768x32\nset gfxpayload=keep\nmenuentry "Nyxis OS" {\n\tmultiboot2 /boot/kernel.elf\n\tmodule2 /boot/initrd.img initrd\n\tboot\n}\n' > $(ISO_DIR)/boot/grub/grub.cfg
+	printf 'insmod all_video\nset timeout=0\nset default=0\nset gfxmode=$(RES)x32,1024x768x32,auto\nset gfxpayload=keep\nmenuentry "Nyxis OS" {\n\tmultiboot2 /boot/kernel.elf\n\tmodule2 /boot/initrd.img initrd\n\tboot\n}\n' > $(ISO_DIR)/boot/grub/grub.cfg
 	grub-mkrescue -o $@ $(ISO_DIR) >/dev/null 2>&1
 
 # BIOS(SeaBIOS) + GRUB
@@ -782,8 +839,8 @@ test-host: $(FAT16_TEST_IMG)
 # 정적 Linux 바이너리로 링크해 실행한다 (커널 없이 수 초 만에 libc 회귀 확인)
 NLIBC_HOST_OUT = $(HOST_OUT)/nlibc
 NLIBC_HOST_APP_CFLAGS = $(USER_PROG_STD) $(filter-out $(C99_FILTER),$(NLIBC_CFLAGS))   # 앱(coreutils/nysh)은 C99 까지
-NLIBC_HOST_SRCS = $(patsubst %,$(NLIBC_DIR)/src/%.c,$(NLIBC_MODS)) $(HOST_DIR)/nlibc/sys_linux.c
-NLIBC_HOST_LIB  = $(patsubst %,$(NLIBC_HOST_OUT)/%.o,$(NLIBC_MODS) $(NLIBC_ASM_MODS)) $(NLIBC_HOST_OUT)/sys_linux.o
+NLIBC_HOST_SRCS = $(patsubst %,$(NLIBC_DIR)/src/%.c,$(NLIBC_MODS) $(NX64_MODS)) $(HOST_DIR)/nlibc/sys_linux.c
+NLIBC_HOST_LIB  = $(patsubst %,$(NLIBC_HOST_OUT)/%.o,$(NLIBC_MODS) $(NX64_MODS) $(NLIBC_ASM_MODS)) $(NLIBC_HOST_OUT)/sys_linux.o
 
 # 호스트용 nlibc 오브젝트 (crt0.o + 모듈들 + Linux 플랫폼 계층)
 nlibc-host-lib:
@@ -833,6 +890,13 @@ test-coreutils: nlibc-host-lib
 	$(LD) -static -nostdlib -o $(CU_HOST_OUT)/bin/nysh $(NLIBC_HOST_OUT)/crt0.o $(CU_HOST_OUT)/nysh.o $(NLIBC_HOST_LIB)
 	sh $(HOST_DIR)/nysh/run.sh $(CU_HOST_OUT)/bin $(CU_HOST_OUT)/work-nysh
 
+# ntui 의 터미널 에뮬레이터(vt.c)를 호스트에서 검사한다 (libc 만 쓰므로 호스트 컴파일러 + 새니타이저)
+test-ntui:
+	@mkdir -p $(HOST_OUT)/ntui
+	$(CC) -std=c99 -Wall -Wextra -Werror -Wshadow $(HOST_SAN) -I$(ROOT)/userland/ntui \
+		$(HOST_DIR)/ntui/vt_test.c $(ROOT)/userland/ntui/vt.c -o $(HOST_OUT)/ntui/vt_test
+	$(HOST_OUT)/ntui/vt_test
+
 # =========================
 # Check: C89 준수/경고 검사
 # =========================
@@ -847,4 +911,4 @@ check:
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: test-disk disk disk-reset all kernel os iso run run-nographic run-usb run-grub-bios run-grub-uefi prepare-run check test-host test-nlibc test-coreutils nlibc-host-lib nlibc-sdk nlcc clean users test-e2e
+.PHONY: test-disk disk disk-reset all kernel os iso run run-nographic run-sata run-usb run-grub-bios run-grub-uefi prepare-run check test-host test-nlibc test-coreutils test-ntui nlibc-host-lib nlibc-sdk nlcc clean users test-e2e

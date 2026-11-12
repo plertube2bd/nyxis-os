@@ -33,6 +33,13 @@ struct process;
  * code 는 지금 쓰지 않는다 (전달할 때 신호와 sender 로 정한다) */
 void signal_post(struct process *p, u32 sig, i32 code, u32 sender);
 
+/*
+ * 보호 프로세스(process->critical)에 sender_pid 가 sig 를 보내면 안 되면 true. 막지 않는 것: 확인(sig 0), 해가 없는 신호
+ * (SIGCHLD SIGCONT SIGURG SIGWINCH), 자기 자신, 부모(init -> login). 커널이 보내는 신호(sender 0: Ctrl-C 등)는 막는다.
+ * signal_post 는 막힌 신호를 조용히 버리고, 시스템 콜(NxSignalSend/SendPid/ProcessKill)은 Npermission 을 돌려준다.
+ */
+bool signal_protected(const struct process *target, u32 sig, u32 sender_pid);
+
 /* 그룹 pgid 의 살아 있는 사용자 프로세스 모두에게 보낸다. 보낸(살아 있던) 프로세스 수 */
 u32 signal_post_group(u32 pgid, u32 sig, i32 code);
 
@@ -58,6 +65,7 @@ void signal_fork_copy(struct process *child, const struct process *parent);
 i64 sys_signal_action(const u64 *a);
 i64 sys_signal_mask(const u64 *a);
 i64 sys_signal_send(const u64 *a);
+i64 sys_signal_send_pid(const u64 *a);
 i64 sys_signal_return(const u64 *a);
 i64 sys_signal_suspend(const u64 *a);
 i64 sys_signal_pending(const u64 *a);

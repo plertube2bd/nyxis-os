@@ -62,6 +62,14 @@ static void check_fmt(const char *expect, const char *fmt, long a, long b)
     }
 }
 
+/* Nyxis 안에서 도는지 (같은 검사가 Linux 호스트에서도 돈다: make test-nlibc) */
+static int on_nyxis(void)
+{
+    struct stat st;
+
+    return stat("info:/version", &st) == 0;
+}
+
 static void test_string(void)
 {
     char buf[64];
@@ -1345,7 +1353,8 @@ static void test_posix_dir(const char *dir)
     (void)rmdir(base);
     CHECK(mkdir(base, 0755) == 0);
     CHECK(mkdir(base, 0755) == -1 && errno == EEXIST);
-    CHECK(stat(base, &st) == 0 && S_ISDIR(st.st_mode));
+    /* Nyxis: 자식이 없는 노드는 파일로 보인다 (노드 = 오브젝트, 종류는 "자식이 있는지") */
+    CHECK(stat(base, &st) == 0 && (on_nyxis() ? !S_ISDIR(st.st_mode) : S_ISDIR(st.st_mode)));
     CHECK(chdir(base) == 0 && getcwd(cwd, sizeof(cwd)) && ends_with(cwd, "nl_posix_dir"));
     CHECK(getcwd(cwd, 3) == NULL && errno == ERANGE);
 
@@ -1376,13 +1385,45 @@ static void test_posix_dir(const char *dir)
             ;
         CHECK(n == 3 && closedir(d) == 0);
     }
-    CHECK(opendir("a.txt") == NULL && errno == ENOTDIR);
-    CHECK(opendir("nope") == NULL && errno == ENOENT);
+    if (on_nyxis()) {
+        /* Nyxis: 노드는 파일/디렉터리 구분이 없는 오브젝트 (ABI 2.5). 자식이 없는 노드도 목록(빈)과 cd 가 되고,
+         * 자식이 있는 노드에도 내용을 읽고 쓴다. 종류(S_ISDIR)는 "지금 자식이 있는지" */
+        char got[8];
+        FILE *f;
 
-    CHECK(rmdir("a.txt") == -1 && errno == ENOTDIR);
+        d = opendir("a.txt");
+        CHECK(d != NULL && readdir(d) == NULL);
+        if (d)
+            closedir(d);
+        CHECK(chdir("a.txt") == 0 && chdir("..") == 0);
+        f = fopen("sub", "w");                                   /* 자식(c.txt)이 있는 노드의 내용 */
+        CHECK(f != NULL && fputs("SUB", f) >= 0 && fclose(f) == 0);
+        f = fopen("sub", "r");
+        CHECK(f != NULL && fgets(got, sizeof(got), f) != NULL && strcmp(got, "SUB") == 0);
+        if (f)
+            fclose(f);
+        f = fopen("sub/c.txt", "r");                             /* 자식은 그대로 */
+        CHECK(f != NULL && fgetc(f) == 'C');
+        if (f)
+            fclose(f);
+        f = fopen("sub", "w");                                   /* 자르기(O_TRUNC)도 자식을 지우지 않는다 */
+        CHECK(f != NULL && fclose(f) == 0 && stat("sub", &st) == 0 && st.st_size == 0 && S_ISDIR(st.st_mode));
+        CHECK(stat("sub/c.txt", &st) == 0);
+        CHECK(stat("a.txt", &st) == 0 && !S_ISDIR(st.st_mode));  /* 자식이 생기면 디렉터리로 보인다 */
+        /* 자식을 만들고 찾으려면 그 노드에 통과 권한(x)이 있어야 한다 (UNIX 와 같은 보안 규칙) */
+        CHECK(chmod("a.txt", 0755) == 0);
+        write_file("a.txt/kid", "K");
+        CHECK(stat("a.txt", &st) == 0 && S_ISDIR(st.st_mode) && st.st_size == 1);
+        CHECK(unlink("a.txt") == -1 && errno == EISDIR);         /* 자식이 있으면 unlink 하지 않는다 */
+        CHECK(unlink("a.txt/kid") == 0 && stat("a.txt", &st) == 0 && !S_ISDIR(st.st_mode));
+    } else {
+        CHECK(opendir("a.txt") == NULL && errno == ENOTDIR);
+        CHECK(rmdir("a.txt") == -1 && errno == ENOTDIR);
+        CHECK(chdir("a.txt") == -1 && errno == ENOTDIR);
+    }
+    CHECK(opendir("nope") == NULL && errno == ENOENT);
     CHECK(unlink("sub") == -1 && errno == EISDIR);
     CHECK(rmdir("sub") == -1 && errno == ENOTEMPTY);
-    CHECK(chdir("a.txt") == -1 && errno == ENOTDIR);
     CHECK(chdir("nope") == -1 && errno == ENOENT);
 
     CHECK(chdir("sub") == 0 && getcwd(cwd, sizeof(cwd)) && ends_with(cwd, "nl_posix_dir/sub"));
@@ -1811,7 +1852,7 @@ static void test_modes(const char *dir)
     fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     CHECK(fd >= 0 && fstat(fd, &st) == 0 && (st.st_mode & 0777) == 0640 && st.st_uid == getuid());
     close(fd);
-    CHECK(mkdir(d, 0777) == 0 && stat(d, &st) == 0 && S_ISDIR(st.st_mode) && (st.st_mode & 0777) == 0750);
+    CHECK(mkdir(d, 0777) == 0 && stat(d, &st) == 0 && (on_nyxis() || S_ISDIR(st.st_mode)) && (st.st_mode & 0777) == 0750);
     CHECK(umask(old) == 027);
 
     /* 새로 만든 파일은 모드가 읽기 전용이어도 요청한 접근으로 열린다 (POSIX) */

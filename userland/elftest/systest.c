@@ -70,6 +70,32 @@ static int file_tests(void)
     CHECK(nx_remove_node("tmp:/et") < 0, 111);                       /* 비어 있지 않다 */
     CHECK(nx_remove_node("tmp:/et/b.txt") == 0 && nx_remove_node("tmp:/et") == 0, 112);
 
+    /* 노드 = 오브젝트 (ABI 2.5): 파일/디렉터리 구분 없이 내용과 자식을 함께 가진다. 종류는 "지금 자식이 있는지" */
+    {
+        struct nx_stat ost;
+        struct nx_dirent ode;
+        char obuf[8];
+        long oh;
+
+        CHECK(nx_create_node("tmp:/ob", NX_NODE_FILE, 0644) == 0 &&
+              nx_create_node("tmp:/ob/kid", NX_NODE_FILE, 0644) == 0, 125);       /* 파일 아래에 자식 */
+        oh = nx_open("tmp:/ob", NX_O_WRITE);                                      /* 자식이 있는 노드에 쓰기 */
+        CHECK(oh >= 0 && nx_write(oh, "xyz", 3) == 3, 126);
+        (void)nx_close(oh);
+        oh = nx_open("tmp:/ob", NX_O_READ);
+        CHECK(oh >= 0 && nx_stat(oh, &ost) == 0 && ost.type == NX_TYPE_DIR && ost.size == 3 &&
+              nx_read(oh, obuf, sizeof(obuf)) == 3 && nx_memcmp(obuf, "xyz", 3) == 0, 127);
+        (void)nx_close(oh);
+        oh = nx_open("tmp:/ob", NX_O_WRITE | NX_O_TRUNC);                         /* 자르기: 내용만 */
+        CHECK(oh >= 0 && nx_stat(oh, &ost) == 0 && ost.size == 0 &&
+              nx_read_dir("tmp:/ob", 0, &ode) == 0 && nx_strcmp(ode.name, "kid") == 0 && ode.type == NX_TYPE_FILE &&
+              nx_open("tmp:/ob", NX_O_READ | NX_O_TRUNC) == NX_E_INVALID_ARG, 128);
+        (void)nx_close(oh);
+        CHECK(nx_remove_node("tmp:/ob") < 0 && nx_remove_node("tmp:/ob/kid") == 0 &&   /* 자식이 있으면 못 지운다 */
+              (oh = nx_open("tmp:/ob", NX_O_READ)) >= 0 && nx_stat(oh, &ost) == 0 && ost.type == NX_TYPE_FILE &&
+              nx_close(oh) == 0 && nx_remove_node("tmp:/ob") == 0, 129);
+    }
+
     /* root 의 이름공간 */
     h = nx_open("fs:/usr/hellowld.run", NX_O_READ);
     CHECK(h >= 0, 113);
@@ -164,6 +190,187 @@ static int device_tests(void)
 
     /* 허가 없이 포트에 접근하면 그 프로세스만 #GP 로 죽는다 */
     CHECK(wait_code(spawn_self("ioport", NX_NO_TOKEN)) == NX_EXIT_FAULT, 223);
+
+    /* dev:/console: 프레임버퍼 + 키보드 (root 는 연다). fb0 과 배타적 */
+    {
+        static unsigned char font[95 * 16 * 16];
+        struct nx_fontinfo fi;
+        struct nx_pollfd pf;
+
+        h = nx_open("dev:/console", NX_O_READ | NX_O_WRITE);
+        CHECK(h >= 0, 230);
+        CHECK(nx_device_command(h, NX_DEVCMD_INFO, (unsigned long)&info) == 0 &&
+              info.kind == NX_DEV_CONSOLE && info.width > 0 &&
+              (info.format == NX_FB_FORMAT_XRGB || info.format == NX_FB_FORMAT_XBGR), 231);
+        CHECK(nx_open("dev:/fb0", NX_O_READ | NX_O_WRITE) == NX_E_BUSY &&
+              nx_open("dev:/console", NX_O_READ | NX_O_WRITE) == NX_E_BUSY, 232);
+        nx_memset(&fi, 0, sizeof(fi));
+        CHECK(nx_device_command(h, NX_DEVCMD_CONSOLE_FONT, (unsigned long)&fi) == 0 &&
+              fi.first == 32 && fi.count == 95 && fi.cell_w > 0 && fi.cell_h > 0 &&
+              fi.count * fi.cell_w * fi.cell_h <= sizeof(font), 233);
+        fi.buf = (unsigned long)font;
+        fi.cap = 10;
+        CHECK(nx_device_command(h, NX_DEVCMD_CONSOLE_FONT, (unsigned long)&fi) == NX_E_BUF_OVERFLOW, 234);
+        fi.cap = sizeof(font);
+        CHECK(nx_device_command(h, NX_DEVCMD_CONSOLE_FONT, (unsigned long)&fi) == 0, 235);
+        {
+            /* 'M'(0x4D) 에는 칠한 픽셀이 있고, ' ' 는 비어 있다 */
+            unsigned long cell = fi.cell_w * fi.cell_h;
+            unsigned long k;
+            int inked = 0;
+            int blank = 1;
+
+            for (k = 0; k < cell; k++) {
+                inked |= font[('M' - 32) * cell + k] != 0;
+                blank &= font[k] == 0;
+            }
+            CHECK(inked && blank, 236);
+        }
+        CHECK(nx_device_map(h, &addr) == 0 && addr != 0, 237);
+        pf.handle = (unsigned long)h;
+        pf.events = NX_POLL_IN;
+        pf.revents = 0;
+        CHECK(nx_poll(&pf, 1, 0) == 0, 238);                              /* 키 이벤트 없음 */
+        CHECK(nx_read(h, buf, 4) == NX_E_INVALID_ARG, 239);                 /* 이벤트 하나(8)보다 작다 */
+        CHECK(nx_close(h) == 0, 240);
+        h = nx_open("dev:/fb0", NX_O_READ | NX_O_WRITE);                    /* 콘솔로 돌아왔다 */
+        CHECK(h >= 0 && nx_close(h) == 0, 241);
+    }
+    return 0;
+}
+
+/* ---------------- 의사 터미널 (root) ---------------- */
+
+static long pty_create(long h[2])
+{
+    unsigned long out[2];
+    long r = nx_syscall(NX_SYS_PTY_CREATE, (unsigned long)out, 0, 0, 0, 0);
+
+    h[0] = (long)out[0];
+    h[1] = (long)out[1];
+    return r;
+}
+
+/* 주 끝에서 정확히 want 가 나오는지 (조각으로 와도 모은다) */
+static int master_says(long m, const char *want)
+{
+    char got[128];
+    unsigned long n = nx_strlen(want);
+    unsigned long have = 0;
+    struct nx_pollfd pf;
+
+    while (have < n) {
+        long r;
+
+        pf.handle = (unsigned long)m;
+        pf.events = NX_POLL_IN;
+        pf.revents = 0;
+        if (nx_poll(&pf, 1, 1000) != 1)
+            return 0;
+        r = nx_read(m, got + have, sizeof(got) - have);
+        if (r <= 0)
+            return 0;
+        have += (unsigned long)r;
+    }
+    return have == n && nx_memcmp(got, want, n) == 0;
+}
+
+static int pty_tests(void)
+{
+    struct nx_stat st;
+    struct nx_winsize ws;
+    struct nx_pollfd pf;
+    char buf[64];
+    long h[2];
+
+    CHECK(pty_create(h) == 0 && h[0] >= 0 && h[1] >= 0, 700);
+    CHECK(nx_stat(h[0], &st) == 0 && st.type == NX_TYPE_PTY, 701);
+    CHECK(nx_stat(h[1], &st) == 0 && st.type == NX_TYPE_CONSOLE, 702);
+
+    /* cooked: 주 끝에 친 줄이 종속 끝에서 한 줄로 읽히고, 에코는 주 끝으로 */
+    CHECK(nx_write(h[0], "ab\r", 3) == 3, 703);
+    CHECK(nx_read(h[1], buf, sizeof(buf)) == 3 && nx_memcmp(buf, "ab\n", 3) == 0, 704);
+    CHECK(master_says(h[0], "ab\r\n"), 705);
+    /* 줄 편집: Ctrl-U 로 지우고 다시 */
+    CHECK(nx_write(h[0], "xy\025z\r", 5) == 5, 706);
+    CHECK(nx_read(h[1], buf, sizeof(buf)) == 2 && nx_memcmp(buf, "z\n", 2) == 0, 707);
+    CHECK(master_says(h[0], "xy\b\b  \b\bz\r\n"), 708);
+    /* Ctrl-D: 빈 줄이면 EOF */
+    CHECK(nx_write(h[0], "\004", 1) == 1 && nx_read(h[1], buf, sizeof(buf)) == 0, 709);
+
+    /* 종속 끝 출력은 걸러지지 않고 주 끝으로 */
+    CHECK(nx_write(h[1], "\033[1mok", 6) == 6 && master_says(h[0], "\033[1mok"), 710);
+    pf.handle = (unsigned long)h[0];
+    pf.events = NX_POLL_IN;
+    pf.revents = 0;
+    CHECK(nx_poll(&pf, 1, 0) == 0, 711);                                  /* 더 읽을 것이 없다 */
+
+    /* 창 크기: 주 끝이 정하고 종속 끝이 읽는다. 콘솔(stdin)에는 정할 수 없다 */
+    ws.rows = 30;
+    ws.cols = 100;
+    ws.xpixel = 0;
+    ws.ypixel = 0;
+    CHECK(nx_device_command(h[0], NX_DEVCMD_TTY_SET_WINSIZE, (unsigned long)&ws) == 0, 712);
+    nx_memset(&ws, 0, sizeof(ws));
+    CHECK(nx_device_command(h[1], NX_DEVCMD_TTY_WINSIZE, (unsigned long)&ws) == 0 && ws.rows == 30 && ws.cols == 100, 713);
+    CHECK(nx_device_command(0, NX_DEVCMD_TTY_SET_WINSIZE, (unsigned long)&ws) == NX_E_UNSUPPORTED, 714);
+
+    /* raw: 바이트 그대로, 에코 없음, Ctrl-C 도 바이트 */
+    CHECK(nx_device_command(h[1], NX_DEVCMD_TTY_MODE, NX_TTY_MODE_RAW) == 0, 715);
+    CHECK(nx_write(h[0], "\003q\r", 3) == 3, 716);
+    CHECK(nx_read(h[1], buf, sizeof(buf)) == 3 && buf[0] == 3 && buf[1] == 'q' && buf[2] == '\r', 717);
+    CHECK(nx_poll(&pf, 1, 0) == 0, 718);                                  /* 에코 없음 */
+    CHECK(nx_device_command(h[1], NX_DEVCMD_TTY_MODE, NX_TTY_MODE_COOKED) == 0, 719);
+
+    /* 주 끝을 닫으면 끊김: 종속 끝 읽기는 EOF, 쓰기는 Ndisconnected, poll 은 HUP */
+    CHECK(nx_close(h[0]) == 0, 720);
+    CHECK(nx_read(h[1], buf, sizeof(buf)) == 0, 721);
+    CHECK(nx_write(h[1], "x", 1) == NX_E_DISCONNECTED, 722);
+    pf.handle = (unsigned long)h[1];
+    pf.revents = 0;
+    CHECK(nx_poll(&pf, 1, 0) == 1 && (pf.revents & NX_POLL_HUP), 723);
+    CHECK(nx_close(h[1]) == 0, 724);
+
+    /* NxProcessList: 자기 자신이 실행 파일 이름으로 보인다 (argv[0] 이 아니라 경로에서) */
+    {
+        static struct nx_procent pe[32];
+        struct nx_procinfo me;
+        long n = nx_syscall(NX_SYS_PROCESS_LIST, (unsigned long)pe, 32, 0, 0, 0);
+        long k;
+        int seen = 0;
+        int idle = 0;
+
+        CHECK(n >= 2 && nx_process_info(NX_PID_SELF, &me) == 0, 730);   /* 자체 점검 중에는 idle 과 elftest 뿐일 수 있다 */
+        for (k = 0; k < n && k < 32; k++) {
+            if (pe[k].pid == me.pid && nx_strcmp(pe[k].name, "elftest") == 0 && pe[k].uid == 0 &&
+                (pe[k].flags & NX_PROCENT_USER) && pe[k].mem_kib > 0)
+                seen = 1;
+            if (pe[k].pid == 0 && nx_strcmp(pe[k].name, "idle") == 0 && !(pe[k].flags & NX_PROCENT_USER))
+                idle = 1;
+        }
+        CHECK(seen && idle, 731);
+        CHECK(nx_syscall(NX_SYS_PROCESS_LIST, 0, 0, 0, 0, 0) == n, 732);            /* max 0: 수만 */
+        CHECK(nx_syscall(NX_SYS_SIGNAL_SEND_PID, me.pid, 0, 0, 0, 0) == 0, 733);     /* 확인만 */
+        CHECK(nx_syscall(NX_SYS_SIGNAL_SEND_PID, 0, 0, 0, 0, 0) == NX_E_PERMISSION, 734);   /* idle */
+        CHECK(nx_syscall(NX_SYS_SIGNAL_SEND_PID, 0x7FFFFFF0UL, 0, 0, 0, 0) == NX_E_NOT_FOUND, 735);
+        /* 보호 프로세스는 보호 프로세스(init)만 만든다: root 라도 elftest 는 아니다 */
+        {
+            const char *av[2];
+
+            av[0] = "hellowld";
+            av[1] = 0;
+            CHECK(nx_spawn_ex("app:/hellowld.run", av, 0, NX_NO_TOKEN, NX_SPAWN_CRITICAL) == NX_E_PERMISSION, 736);
+        }
+    }
+
+    /* 종속 끝이 모두 닫히면 주 끝은 남은 출력을 다 읽은 뒤 EOF */
+    CHECK(pty_create(h) == 0, 725);
+    CHECK(nx_write(h[1], "bye", 3) == 3 && nx_close(h[1]) == 0, 726);
+    CHECK(nx_read(h[0], buf, sizeof(buf)) == 3 && nx_read(h[0], buf, sizeof(buf)) == 0, 727);
+    pf.handle = (unsigned long)h[0];
+    pf.revents = 0;
+    CHECK(nx_poll(&pf, 1, 0) == 1 && (pf.revents & NX_POLL_HUP), 728);
+    CHECK(nx_close(h[0]) == 0, 729);
     return 0;
 }
 
@@ -327,7 +534,9 @@ static int registry_tests(void)
     CHECK(nx_read_dir("info:/", 7, &de) == NX_E_NOT_FOUND, 507);
     CHECK(nx_read_dir("info:/memory", 0, &de) == 0 && nx_strcmp(de.name, "total_kib") == 0 &&
           nx_read_dir("info:/memory", 1, &de) == 0 && nx_strcmp(de.name, "free_kib") == 0 &&
-          nx_read_dir("info:/memory", 2, &de) == NX_E_NOT_FOUND, 508);
+          nx_read_dir("info:/memory", 2, &de) == 0 && nx_strcmp(de.name, "ram_kib") == 0 &&
+          nx_read_dir("info:/memory", 3, &de) == 0 && nx_strcmp(de.name, "reserved_kib") == 0 &&
+          nx_read_dir("info:/memory", 4, &de) == NX_E_NOT_FOUND, 508);
     CHECK(nx_read_dir("info:/hostname", 0, &de) == NX_E_INVALID_ARG, 509);
 
     /* 스냅샷: 열 때 만든 값은 그대로, 다시 열면 새 값 */
@@ -355,6 +564,15 @@ static int registry_tests(void)
     CHECK(nx_read_value("info:/memory/free_kib", buf, sizeof(buf)) > 0, 522);
     avail = parse_ul(buf);
     CHECK(total > 0 && avail > 0 && avail <= total, 523);
+    {
+        unsigned long ram, rsv;
+
+        CHECK(nx_read_value("info:/memory/ram_kib", buf, sizeof(buf)) > 0, 533);
+        ram = parse_ul(buf);
+        CHECK(nx_read_value("info:/memory/reserved_kib", buf, sizeof(buf)) > 0, 534);
+        rsv = parse_ul(buf);
+        CHECK(ram >= total && rsv == ram - total, 535);      /* total 이 그 사이에 바뀌지 않는다 (부팅 때 고정) */
+    }
 
     h = nx_open("info:/memory", NX_O_READ);                                   /* 디렉터리도 열 수는 있다 */
     CHECK(h >= 0 && nx_stat(h, &st) == 0 && st.type == NX_TYPE_DIR && nx_read(h, buf, 1) == NX_E_INVALID_ARG, 524);
@@ -507,6 +725,22 @@ int elftest_user_mode(void)
     (void)nx_close(h);
 
     CHECK(nx_power_off() == NX_E_PERMISSION, 16);                             /* 끄는 건 root(init)만 */
+    /* 화면/키보드는 콘솔 세션(로그인이 띄운 셸)과 root 만, 콘솔 세션은 root 만 만든다 */
+    CHECK(nx_open("dev:/console", NX_O_READ | NX_O_WRITE) == NX_E_PERMISSION, 37);
+    {
+        const char *av[2];
+
+        av[0] = "hellowld";
+        av[1] = 0;
+        CHECK(nx_spawn_ex("app:/hellowld.run", av, 0, NX_NO_TOKEN, NX_SPAWN_CONSOLE_SESSION) == NX_E_PERMISSION, 38);
+    }
+    /* 남(root)의 프로세스에는 pid 로 신호를 못 보낸다: 부모(root 의 elftest) */
+    {
+        struct nx_procinfo me;
+
+        CHECK(nx_process_info(NX_PID_SELF, &me) == 0 &&
+              nx_syscall(NX_SYS_SIGNAL_SEND_PID, me.parent_pid, 15, 0, 0, 0) == NX_E_PERMISSION, 39);
+    }
 
     /* roi:/<자기 uid>/ 만 */
     {
@@ -525,7 +759,7 @@ int elftest_user_mode(void)
         CHECK(nx_create_node("roi:/1000/app/sub", NX_NODE_DIR, 0700) == 0 && nx_remove_node("roi:/1000/app/sub") == 0, 22);
         CHECK(nx_remove_node("roi:/1000/app/editor") == 0, 23);
         for (i = 0; i < 8 && nx_read_dir("roi:/1000", i, &de) == 0; i++) {
-            if (nx_strcmp(de.name, "app") == 0 && de.type == NX_TYPE_DIR)
+            if (nx_strcmp(de.name, "app") == 0)     /* 자식이 없으면 파일로 보인다 (노드 = 오브젝트, ABI 2.5) */
                 saw_app = 1;
             if (nx_strcmp(de.name, "shell") == 0)
                 saw_shell = 1;
@@ -540,6 +774,35 @@ int elftest_user_mode(void)
         CHECK(nx_create_node("roi:/1001", NX_NODE_DIR, 0700) == NX_E_PERMISSION, 27);
         CHECK(value_is("info:/hostname", "nyxis") && nx_read_value("info:/uptime_ms", buf, sizeof(buf)) > 0, 28);
         CHECK(nx_open("info:/hostname", NX_O_WRITE) == NX_E_PERMISSION, 29);
+    }
+
+    /* 앱 오브젝트: app:/<이름>.run 은 ELF 를 내용으로, 기본 설정을 자식으로 가진 디렉터리 (rootfs/app/) */
+    {
+        struct nx_dirent de;
+        struct nx_stat st;
+        char buf[64];
+        char elf[4];
+        long ho = nx_open("app:/init.run", NX_O_READ);
+
+        CHECK(ho >= 0 && nx_stat(ho, &st) == 0 && st.type == NX_TYPE_DIR && st.size > 4 &&
+              nx_read(ho, elf, 4) == 4 && elf[0] == 0x7F && elf[1] == 'E' && elf[2] == 'L' && elf[3] == 'F', 30);
+        if (ho >= 0)
+            (void)nx_close(ho);
+        CHECK(value_is("app:/init.run/welcome", "Welcome to Nyxis OS!") &&
+              nx_read_dir("app:/init.run", 0, &de) == 0 && nx_strcmp(de.name, "welcome") == 0, 31);
+        /* 기본값은 root 소유: 사용자는 읽기만 */
+        CHECK(nx_open("app:/nysh.run/mark", NX_O_WRITE) == NX_E_PERMISSION &&
+              nx_create_node("app:/nysh.run/mine", NX_NODE_FILE, 0644) == NX_E_PERMISSION, 32);
+        /* 사용자 값이 기본값보다 먼저, 지우면 기본값 */
+        CHECK(nx_setting_get("nysh", "mark", buf, sizeof(buf)) == 1 && nx_strcmp(buf, "*") == 0, 33);
+        CHECK(nx_create_node("roi:/1000/app/nysh", NX_NODE_DIR, 0700) == 0 &&
+              put_file("roi:/1000/app/nysh/mark", ">\n", 0600) &&
+              nx_setting_get("nysh", "mark", buf, sizeof(buf)) == 1 && nx_strcmp(buf, ">") == 0, 34);
+        CHECK(nx_remove_node("roi:/1000/app/nysh/mark") == 0 && nx_remove_node("roi:/1000/app/nysh") == 0 &&
+              nx_setting_get("nysh", "mark", buf, sizeof(buf)) == 1 && nx_strcmp(buf, "*") == 0, 35);
+        CHECK(nx_setting_get("nysh", "../x", buf, sizeof(buf)) == NX_E_INVALID_ARG &&
+              nx_setting_get("..", "mark", buf, sizeof(buf)) == NX_E_INVALID_ARG &&
+              nx_setting_get("nysh", "nope", buf, sizeof(buf)) < 0, 36);
     }
     return 0;
 }
@@ -565,6 +828,9 @@ int elftest_system_tests(void)
     if (r)
         return r;
     r = channel_tests();
+    if (r)
+        return r;
+    r = pty_tests();
     if (r)
         return r;
     r = registry_tests();

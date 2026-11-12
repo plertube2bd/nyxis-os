@@ -155,7 +155,9 @@ Nstatus nsp_translate(const char *user_path, char *out, usize out_max, u32 *out_
         if (depth == 0 && kind != NSP_KIND_INFO && kind != NSP_KIND_DEV)
             return NnotFound;
         /* dev:/ 자체(이름 "")는 누구나 나열할 수 있다: 목록에는 그 사용자가 열 수 있는 것만 나온다 */
-        if (kind == NSP_KIND_DEV && self->uid != 0 && depth != 0 && !nsp_dev_is_public(out))
+        /* dev:/console 은 누구나 해석까지는 된다: 여는 권한(콘솔 세션 또는 root)은 device_open 이 본다 */
+        if (kind == NSP_KIND_DEV && self->uid != 0 && depth != 0 && !nsp_dev_is_public(out) &&
+            strcmp(out, "console") != 0)
             return Npermission;
         *out_kind = kind;
         return NSTATUS_OK;

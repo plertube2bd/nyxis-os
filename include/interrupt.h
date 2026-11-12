@@ -168,4 +168,7 @@ void interrupt_dispatch(struct trap_frame *frame);
 /* 예외 벡터 이름 (디버그 출력용) */
 const char *exception_name(u64 vector);
 
+/* 트랩 프레임(벡터, RIP, 레지스터 전부)을 printk 로 찍는다 (예외, 커널 패닉) */
+void trap_frame_dump(const struct trap_frame *f);
+
 #endif /* NYXIS_INTERRUPT_H */

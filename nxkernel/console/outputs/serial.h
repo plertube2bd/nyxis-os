@@ -25,5 +25,7 @@ void serial_disable_rx_interrupt(void);
 /* 수신 버퍼에 바이트가 있는지 / 하나 읽기 (serial_rx_ready() 가 true 일 때만 의미 있음) */
 bool serial_rx_ready(void);
 char serial_getc_nowait(void);
+/* 바이트 하나와 BREAK 여부 (SysRq: BREAK 다음 글자). 받은 것이 없으면 false */
+bool serial_rx_byte(char *c, bool *brk);
 
 #endif /* SERIAL_H */

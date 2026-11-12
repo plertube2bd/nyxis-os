@@ -190,6 +190,8 @@ static long raw_open(const char *path, int flags)
         nf |= NX_O_WRITE;
     if (flags & NL_O_APPEND)
         nf |= NX_O_APPEND;      /* 커널이 열린 파일에 기억한다: exec 한 프로그램(셸의 >>)에도 이어진다 */
+    if ((flags & NL_O_TRUNC) && (flags & NL_O_WRITE))
+        nf |= NX_O_TRUNC;       /* 커널이 내용만 자른다 (모드/소유자/자식은 그대로. 장치에서는 무시) */
     return nx_sc(NX_SYS_OPEN, (unsigned long)path, nf, 0);
 }
 
@@ -234,15 +236,12 @@ static long create_open(const char *path, int flags, unsigned int mode, int may_
 }
 
 /*
- * NxOpen 에는 "만들기"/"자르기" 가 없다: NxCreateNode 와 NxRemoveNode 로 흉내 낸다.
- * 자르기는 지우고 다시 만드는 것이라 파일의 모드/ACL 은 새 파일의 기본값이 된다.
- * TODO(kernel): NX_O_CREATE / NX_O_TRUNC 가 생기면 그것을 쓴다 (원자적이고 속성도 보존).
+ * 노드는 파일/디렉터리 구분이 없는 하나의 오브젝트다 (ABI 2.5): 어느 노드든 open/read/write 로 내용을 다루고,
+ * 자식이 있어도 그대로 열린다. 자르기는 커널(NX_O_TRUNC)이, 만들기는 NxCreateNode 로 한다.
  */
 long __nl_open(const char *path, int flags, unsigned int mode)
 {
     long h;
-    long r;
-    struct nx_stat st;
 
     if ((flags & (NL_O_CREAT | NL_O_EXCL)) == (NL_O_CREAT | NL_O_EXCL)) {
         return create_open(path, flags, mode, 0);   /* 만들기가 곧 "없었음" 의 확인이다 (원자적) */
@@ -253,23 +252,6 @@ long __nl_open(const char *path, int flags, unsigned int mode)
         if (!(flags & NL_O_CREAT) || nst_code(h) != NST_NOT_FOUND)
             return ret(h);
         return create_open(path, flags, mode, 1);
-    }
-
-    r = nx_sc(NX_SYS_STAT, (unsigned long)h, (unsigned long)&st, 0);
-    if (r >= 0 && st.type == NX_TYPE_DIR) {
-        (void)nx_sc(NX_SYS_CLOSE, (unsigned long)h, 0, 0);
-        errno = EISDIR;
-        return -1;
-    }
-    /* 장치 이름(dev:/stdout 등)으로 연 파일은 이름이 파일의 경로가 아니므로 지우고 다시 만들 수 없다:
-     * 자르지 않고 그대로 쓴다 */
-    if ((flags & NL_O_TRUNC) && r >= 0 && st.type == NX_TYPE_FILE && st.size > 0 &&
-        strncmp(path, "dev:", 4) != 0) {
-        (void)nx_sc(NX_SYS_CLOSE, (unsigned long)h, 0, 0);
-        r = nx_sc(NX_SYS_REMOVE_NODE, (unsigned long)path, 0, 0);
-        if (r < 0)
-            return ret(r);
-        return create_open(path, flags, mode, 0);
     }
     fd_register(h, flags);
     return h;
@@ -429,6 +411,48 @@ int __nl_pipe(long out[2], int cloexec)
     return 0;
 }
 
+int __nl_openpty(long out[2], int cloexec)
+{
+    unsigned long h[2];
+    long r = nx_sc(NX_SYS_PTY_CREATE, (unsigned long)h, cloexec ? NX_DUP_CLOEXEC : 0, 0);
+
+    if (r < 0)
+        return (int)ret(r);
+    fd_register((long)h[0], NL_O_READ | NL_O_WRITE);
+    fd_register((long)h[1], NL_O_READ | NL_O_WRITE);
+    out[0] = (long)h[0];
+    out[1] = (long)h[1];
+    return 0;
+}
+
+int __nl_tty_set_winsize(long h, const unsigned short ws[4])
+{
+    struct nx_winsize w;
+
+    w.rows = ws[0];
+    w.cols = ws[1];
+    w.xpixel = ws[2];
+    w.ypixel = ws[3];
+    return (int)ret(nx_sc(NX_SYS_DEVICE_COMMAND, (unsigned long)h, NX_DEVCMD_TTY_SET_WINSIZE, (unsigned long)&w));
+}
+
+long __nl_devcmd(long h, unsigned long cmd, unsigned long arg)
+{
+    return ret(nx_sc(NX_SYS_DEVICE_COMMAND, (unsigned long)h, cmd, arg));
+}
+
+void *__nl_map_mmio(long h)
+{
+    unsigned long va = 0;
+    long r = nx_sc(NX_SYS_DEVICE_MAP_MMIO, (unsigned long)h, (unsigned long)&va, 0);
+
+    if (r < 0) {
+        (void)ret(r);
+        return NULL;
+    }
+    return (void *)va;
+}
+
 static int type_of(unsigned int t)
 {
     switch (t) {
@@ -437,6 +461,7 @@ static int type_of(unsigned int t)
     case NX_TYPE_CONSOLE: return NL_T_CHR;
     case NX_TYPE_CHANNEL: return NL_T_FIFO;
     case NX_TYPE_DEVICE:  return NL_T_CHR;
+    case NX_TYPE_PTY:     return NL_T_CHR;
     default:              return NL_T_OTHER;
     }
 }
@@ -495,7 +520,7 @@ int __nl_stat_path(const char *path, struct __nl_stat *st)
         st->uid = ns.uid;
         st->gid = ns.gid;
         st->readable = __nl_access(path, R_OK) == 0;
-        st->writable = st->type != NL_T_DIR && __nl_access(path, W_OK) == 0;
+        st->writable = __nl_access(path, W_OK) == 0;
         return 0;
     }
     /* info:/ 처럼 NxStatPath 가 다루지 않는 곳 */
@@ -544,12 +569,9 @@ int __nl_rmdir(const char *path)
     struct __nl_stat st;
     long r;
 
+    /* 노드는 파일/디렉터리 구분이 없다: 자식이 없는 노드면 무엇이든 지운다 (자식이 있으면 ENOTEMPTY) */
     if (__nl_stat_path(path, &st) < 0)
         return -1;
-    if (st.type != NL_T_DIR) {
-        errno = ENOTDIR;
-        return -1;
-    }
     r = nx_sc(NX_SYS_REMOVE_NODE, (unsigned long)path, 0, 0);
     if (r < 0) {
         struct nx_dirent de;
@@ -567,6 +589,7 @@ int __nl_unlink(const char *path)
 {
     struct __nl_stat st;
 
+    /* 자식이 있는 노드(= 디렉터리로 보이는 노드)는 unlink 로 지우지 않는다 (rm -r 이 자식부터 지운다) */
     if (__nl_stat_path(path, &st) == 0 && st.type == NL_T_DIR) {
         errno = EISDIR;
         return -1;
@@ -934,6 +957,76 @@ long __nl_tty_foreground(long h, long pgid)
                      pgid < 0 ? NX_PGID_QUERY : (unsigned long)pgid));
 }
 
+int __nl_proc_list(struct __nl_procent *out, int max)
+{
+    struct nx_procent buf[64];
+    long r;
+    int i;
+
+    if (max < 0 || (max > 0 && out == NULL)) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (max > 64)
+        max = 64;
+    r = nx_sc(NX_SYS_PROCESS_LIST, (unsigned long)buf, (unsigned long)max, 0);
+    if (r < 0)
+        return (int)ret(r);
+    for (i = 0; i < max && i < (int)r; i++) {
+        out[i].pid = buf[i].pid;
+        out[i].ppid = buf[i].parent_pid;
+        out[i].pgid = buf[i].pgid;
+        out[i].uid = buf[i].uid;
+        out[i].state = (int)buf[i].state;
+        out[i].flags = buf[i].flags;
+        out[i].cpu_ticks = buf[i].cpu_ticks;
+        out[i].start_tick = buf[i].start_tick;
+        out[i].mem_kib = buf[i].mem_kib;
+        memcpy(out[i].name, buf[i].name, sizeof(out[i].name));
+        out[i].name[sizeof(out[i].name) - 1] = '\0';
+        memcpy(out[i].user, buf[i].user, sizeof(out[i].user));
+        out[i].user[sizeof(out[i].user) - 1] = '\0';
+    }
+    return (int)r;
+}
+
+int __nl_signal_pid(unsigned long pid, int sig)
+{
+    long r = nx_sc(NX_SYS_SIGNAL_SEND_PID, pid, (unsigned long)sig, 0);
+
+    if (r < 0 && nst_code(r) == 1U) {           /* NnotFound: 없는 pid */
+        errno = ESRCH;
+        return -1;
+    }
+    if (r < 0 && nst_code(r) == 4U) {           /* Npermission: 남의 것이거나 보호 프로세스 (POSIX kill 은 EPERM) */
+        errno = EPERM;
+        return -1;
+    }
+    return (int)ret(r);
+}
+
+int __nl_check_password(const char *name, const char *password)
+{
+    long r = nx_sc(NX_SYS_AUTHENTICATE, (unsigned long)name, (unsigned long)password, 0);
+
+    if (r < 0) {
+        (void)ret(r);
+        errno = EACCES;
+        return -1;
+    }
+    (void)nx_sc(NX_SYS_CLOSE, (unsigned long)r, 0, 0);     /* 토큰은 쓰지 않는다: 확인만 */
+    return 0;
+}
+
+unsigned long __nl_timer_hz(void)
+{
+    struct nx_sysinfo si;
+
+    if (nx_sc(NX_SYS_SYSINFO, (unsigned long)&si, 0, 0) < 0 || si.timer_hz == 0)
+        return 100;
+    return si.timer_hz;
+}
+
 void __nl_proc_release(long h)
 {
     (void)nx_sc(NX_SYS_CLOSE, (unsigned long)h, 0, 0);
@@ -999,4 +1092,37 @@ void __nl_exit(int status)
     (void)nx_sc(NX_SYS_PROCESS_EXIT, (unsigned long)(unsigned int)status, 0, 0);
     for (;;)
         ;
+}
+
+/* ---------------- 서비스 채널 (svc:/) ---------------- */
+
+long __nl_channel_create(const char *path, int public_)
+{
+    return ret(nx_sc(NX_SYS_CHANNEL_CREATE, (unsigned long)path, public_ ? NX_CHAN_PUBLIC : 0UL, 0));
+}
+
+long __nl_channel_open(const char *path)
+{
+    return ret(nx_sc(NX_SYS_OPEN, (unsigned long)path, NX_O_WRITE, 0));
+}
+
+long __nl_channel_send(long h, const void *buf, size_t len)
+{
+    return ret(nx_sc(NX_SYS_CHANNEL_SEND, (unsigned long)h, (unsigned long)buf, (unsigned long)len));
+}
+
+long __nl_channel_receive(long h, void *buf, size_t cap, unsigned long sender[3], long timeout_ms)
+{
+    struct nx_msginfo info;
+    long r;
+
+    memset(&info, 0, sizeof(info));
+    r = ret(nx_sc5(NX_SYS_CHANNEL_RECEIVE, (unsigned long)h, (unsigned long)buf, (unsigned long)cap,
+                   (unsigned long)&info, timeout_ms < 0 ? NX_WAIT_INFINITE : (unsigned long)timeout_ms));
+    if (r >= 0 && sender != NULL) {
+        sender[0] = info.sender_pid;
+        sender[1] = info.sender_uid;
+        sender[2] = info.sender_gid;
+    }
+    return r;
 }

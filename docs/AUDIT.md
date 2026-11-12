@@ -652,7 +652,7 @@ PFA + HHDM 위의 크기별 slab: 16~2048 바이트 8 클래스, 페이지 머�
 - `info:/` 는 **커널이 만드는 가상 파일**이다 (`kernel/info/`). 누구나 읽고 아무도 쓸 수 없다(쓰기 열기·만들기·지우기·이름
   바꾸기·실행은 `Npermission`). 내용은 **열 때 한 번 만들어** 핸들(`NX_HANDLE_INFO`, 최대 256B)에 보관한다: read/seek/stat/dup 은
   일반 파일과 같고, 새 값은 다시 열어서 읽는다. 항목은 고정 표:
-  `hostname`, `version`, `abi`, `uptime_ms`, `memory/total_kib`, `memory/free_kib`. 디렉터리는 `NxReadDir` 로 나열한다.
+  `hostname`, `version`, `abi`, `uptime_ms`, `memory/total_kib`, `memory/free_kib`, `memory/ram_kib`, `memory/reserved_kib`. 디렉터리는 `NxReadDir` 로 나열한다.
 - `info:/hostname` 은 `fs:/roi/hostname` 을 **커널 신원(uid 0)으로** 읽는다 (원본의 모드와 무관하게 공개). 시스템 콜 안은
   IRQ 꺼짐 + 커널 비선점 + RAM 읽기는 잠들지 않으므로, 호출자 uid 를 잠깐 0 으로 바꿨다 되돌리는 사이에 다른 일이 끼지 않는다.
   끝의 `\n` 하나를 떼고 1~63 자 `[a-z0-9-]`, `-` 로 시작하지 않음을 검사한다. 없거나 틀리면 `nyxis`.

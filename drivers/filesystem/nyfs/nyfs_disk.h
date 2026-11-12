@@ -14,6 +14,8 @@
  *  - 저널링은 없다. 그러나 슈퍼블록에 journal_* 필드와 inode 에 last_txn_id 필드를
  *    지금부터 예약해 두어, 나중에 저널을 추가할 때 온디스크 레이아웃(따라서 이미 만들어진
  *    볼륨과의 호환성)을 깨지 않게 한다. journal_version == 0 이면 "저널 없음"이다.
+ *  - 노드 = 하나의 오브젝트: 파일과 디렉터리의 구분이 없다. 어느 노드든 내용과 자식을 함께 가지고,
+ *    자식이 있으면 디렉터리로 보인다 (커널 nyfs.c 의 nyfs_node_kind). 그래서
  *  - inode 는 데이터 스트림(data_extent_root/size)과 디렉터리 자식 목록
  *    (dir_hash_root/dir_entry_count)이 완전히 독립된 필드다. 그래서 디렉터리도
  *    일반 파일처럼 read()/write() 로 내용을 가질 수 있고("cat ." 가능), 그 내용은
@@ -225,7 +227,8 @@ NX_STATIC_ASSERT(nyfs_ace_size_is_12, sizeof(nyfs_ace_t) == 12);
 
 typedef struct nyfs_inode {
     u64 ino;               /* 자기 자신의 inode 번호(교차 검증/오류 탐지용) */
-    u16 type;                /* NYFS_INO_TYPE_* */
+    u16 type;                /* NYFS_INO_TYPE_*: 만들 때의 힌트일 뿐이다. 커널은 노드를 하나의 오브젝트로 다루며
+                              * (내용 + 자식), 디렉터리로 보이는지는 dir_entry_count > 0 으로 정한다 */
     u16 unix_mode;           /* NYFS_MODE_* 비트 조합 */
     u32 uid;
     u32 gid;
@@ -255,7 +258,7 @@ typedef struct nyfs_inode {
     u8  reserved2[7];
 
     /*
-     * 자식 목록(디렉터리 전용). type != NYFS_INO_TYPE_DIR 이면 항상 0 이어야 한다.
+     * 자식 목록. 어느 노드든 가질 수 있다 (파일/디렉터리 구분 없음, 처음 자식을 넣을 때 만든다).
      * dir_hash_root 는 nyfs_dirhash_header_t 블록(+뒤따르는 버킷 배열/체인)을 가리킨다.
      */
     nyfs_blkno_t dir_hash_root;

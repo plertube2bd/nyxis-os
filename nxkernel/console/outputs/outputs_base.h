@@ -41,6 +41,9 @@ u32 font_cell_height(void);
 /* TrueType 폰트로 그리고 있는가 */
 bool font_is_ttf(void);
 
+/* 글꼴을 알파 비트맵으로 내보낸다 (글자 ' '..'~', 글자마다 셀 폭 x 셀 높이 바이트). 필요한 바이트 수 */
+usize font_export(u8 *out, usize cap);
+
 /* 범위 검사 없음: 호출자가 (x + 셀 폭, y + 셀 높이) 가 화면 안임을 보장해야 함 */
 Nstatus draw_char_fast(
     u32 *fb,

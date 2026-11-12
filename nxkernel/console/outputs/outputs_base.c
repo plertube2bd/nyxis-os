@@ -386,3 +386,40 @@ Nstatus draw_char_bounded(
 
     return draw_char_fast(fb, pixels_per_scanline, x, y, c, fg, bg);
 }
+
+/*
+ * 글꼴을 알파 비트맵으로 내보낸다 (dev:/console 의 NX_DEVCMD_CONSOLE_FONT).
+ * 글자 FONT_FIRST_CHAR..FONT_LAST_CHAR 를 차례로, 글자마다 셀 폭 x 셀 높이 바이트 (0 = 배경, 255 = 글자색).
+ * 필요한 바이트 수를 돌려준다. out 이 NULL 이거나 cap 이 모자라면 쓰지 않는다.
+ */
+usize font_export(u8 *out, usize cap)
+{
+    u32 w = font_cell_width();
+    u32 h = font_cell_height();
+    usize need = (usize)FONT_CHAR_COUNT * w * h;
+    u32 i;
+
+    if (!out || cap < need)
+        return need;
+#ifdef CONFIG_FONT_8x16
+    if (g_use_ttf) {
+        memcpy(out, g_ttf_glyphs, need);
+        return need;
+    }
+#endif
+    for (i = 0; i < FONT_CHAR_COUNT; i++) {
+        const u8 *glyph = FONTS[i];
+        u8 *dst = out + (usize)i * w * h;
+        u32 row;
+        u32 bit;
+
+        for (row = 0; row < 16U; row++) {
+            for (bit = 0; bit < 16U; bit++) {
+                u8 b = glyph[row * 2U + bit / 8U];
+
+                dst[row * 16U + bit] = (b & (0x80U >> (bit % 8U))) ? 255U : 0U;
+            }
+        }
+    }
+    return need;
+}

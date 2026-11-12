@@ -30,6 +30,7 @@ import tempfile
 COMPILE_FLAGS = [
     "-m64", "-nostdinc", "-fno-pie", "-fno-pic", "-fno-plt", "-fno-stack-protector",
     "-fcf-protection=none", "-fno-asynchronous-unwind-tables", "-fno-unwind-tables",
+    "-ffunction-sections", "-fdata-sections",   # 링크의 --gc-sections 가 함수 단위로 버릴 수 있도록
 ]
 LINK_FLAGS = [
     "-m", "elf_x86_64", "-static", "-nostdlib", "-z", "max-page-size=0x1000", "-z", "noexecstack",

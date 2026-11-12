@@ -6,6 +6,8 @@
 #include <string.h>
 #include <termios.h>
 #include <sys/ioctl.h>
+#include <unistd.h>
+#include <pty.h>
 #include "nl_internal.h"
 
 static struct termios g_tio;
@@ -124,16 +126,36 @@ int ioctl(int fd, unsigned long request, ...)
     unsigned short v[4];
     long h;
 
-    h = tty_handle(fd);
-    if (h < 0)
-        return -1;
+    va_start(ap, request);
+    ws = va_arg(ap, struct winsize *);
+    va_end(ap);
+    if (request == TIOCSWINSZ) {
+        /* pty 주 끝은 콘솔(isatty)이 아니므로 핸들만 확인한다: 터미널이 아니면 커널이 거절한다 */
+        h = __nl_fd_to_handle(fd);
+        if (h < 0)
+            return -1;
+        if (!ws) {
+            errno = EFAULT;
+            return -1;
+        }
+        v[0] = ws->ws_row;
+        v[1] = ws->ws_col;
+        v[2] = ws->ws_xpixel;
+        v[3] = ws->ws_ypixel;
+        if (__nl_tty_set_winsize(h, v) < 0) {
+            if (errno == ENOSYS || errno == EBADF)
+                errno = ENOTTY;
+            return -1;
+        }
+        return 0;
+    }
     if (request != TIOCGWINSZ) {
         errno = EINVAL;
         return -1;
     }
-    va_start(ap, request);
-    ws = va_arg(ap, struct winsize *);
-    va_end(ap);
+    h = tty_handle(fd);
+    if (h < 0)
+        return -1;
     if (!ws) {
         errno = EFAULT;
         return -1;
@@ -144,5 +166,33 @@ int ioctl(int fd, unsigned long request, ...)
     ws->ws_col = v[1];
     ws->ws_xpixel = v[2];
     ws->ws_ypixel = v[3];
+    return 0;
+}
+
+int openpty(int *amaster, int *aslave, char *name, const struct termios *termp, const struct winsize *winp)
+{
+    long h[2];
+    int m;
+    int sl;
+
+    if (!amaster || !aslave) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (__nl_openpty(h, 0) < 0)
+        return -1;
+    m = __nl_handle_to_fd(h[0]);
+    sl = __nl_handle_to_fd(h[1]);
+    if (name)
+        strcpy(name, "pty");                /* Nyxis 의 pty 에는 경로 이름이 없다 */
+    if (termp && !(termp->c_lflag & ICANON))
+        (void)__nl_tty_mode(h[1], 1);
+    if (winp && ioctl(m, TIOCSWINSZ, winp) < 0) {
+        (void)close(m);
+        (void)close(sl);
+        return -1;
+    }
+    *amaster = m;
+    *aslave = sl;
     return 0;
 }

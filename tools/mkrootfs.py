@@ -2,11 +2,15 @@
 """
 mkrootfs.py - NyxisOS 루트 파일시스템(fs:/) 매니페스트를 만든다 (tools/nyfs-utils 의 nyfs-pack 입력)
 
-  python3 tools/mkrootfs.py --users <db> --bin <dir> --roi <dir> [--file <이미지경로>=<호스트파일>[:<모드>]]... > manifest
+  python3 tools/mkrootfs.py --users <db> --bin <dir> --roi <dir> [--app <dir>] [--file <이미지경로>=<호스트파일>[:<모드>]]... > manifest
 
 만드는 구조:
   /                0755 root      fs:/
   /usr             0755 root      app:/   <- --bin 디렉터리의 *.run (0755)
+  /usr/<이름>.run/ 0755 root      --app <dir>/<이름>/ 이 있는 앱: 디렉터리 오브젝트 = ELF 를 내용으로, 그 아래에
+                                  기본 설정 (app:/<이름>.run/<키>, 디렉터리 0755, 파일 0644, root 소유: 누구나 읽기만).
+                                  nyfs 의 노드는 파일/디렉터리 구분 없는 오브젝트라 디렉터리도 내용을 가진다.
+                                  사용자 값은 roi:/<uid>/app/<이름>/<키> 에 두고 기본값보다 먼저 읽는다 (nyxapp.h).
   /roi             0711 root      roi:/   (들어가기만 허용, 목록은 root 만)
   /roi/users       0600 root      사용자 DB (커널 전용: 실행 중에는 아무도 열 수 없다)
   /roi/hostname    0644 root      <roi>/hostname   (info:/hostname 으로 공개)
@@ -89,7 +93,7 @@ def emit_template(out, entries, dest, uid, gid):
 
 
 def main():
-    users_db, bin_dir, roi_dir, extra, trees, overrides = None, None, None, [], [], {}
+    users_db, bin_dir, roi_dir, app_dir, extra, trees, overrides = None, None, None, None, [], [], {}
     args = sys.argv[1:]
     while args:
         a = args.pop(0)
@@ -99,6 +103,8 @@ def main():
             bin_dir = args.pop(0)
         elif a == "--roi":
             roi_dir = args.pop(0)
+        elif a == "--app":
+            app_dir = args.pop(0)
         elif a == "--template-file":
             rel, src = args.pop(0).split("=", 1)
             overrides[os.path.normpath(rel)] = os.path.abspath(src)
@@ -124,9 +130,33 @@ def main():
             users.append((name, uid, gid))
 
     out = ["d / 0755 0 0", "d /usr 0755 0 0"]
-    for name in sorted(os.listdir(bin_dir)):
-        if name.endswith(".run"):
-            out.append(f"f /usr/{name} 0755 0 0 {os.path.abspath(os.path.join(bin_dir, name))}")
+    runs = sorted(n for n in os.listdir(bin_dir) if n.endswith(".run"))
+    defaults = set()
+    if app_dir and os.path.isdir(app_dir):
+        defaults = {n for n in os.listdir(app_dir) if os.path.isdir(os.path.join(app_dir, n))}
+        unknown = sorted(defaults - {r[:-4] for r in runs})
+        if unknown:
+            sys.exit(f"--app: no program for default settings: {', '.join(unknown)} (expected <name>.run in {bin_dir})")
+    for name in runs:
+        elf = os.path.abspath(os.path.join(bin_dir, name))
+        app = name[:-4]
+        if app not in defaults:
+            out.append(f"f /usr/{name} 0755 0 0 {elf}")
+            continue
+        out.append(f"d /usr/{name} 0755 0 0 {elf}")        # 오브젝트: 내용 = ELF, 자식 = 기본 설정
+        root = os.path.join(app_dir, app)
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames.sort()
+            rel = os.path.relpath(dirpath, root)
+            base = f"/usr/{name}" if rel == "." else f"/usr/{name}/{rel}"
+            if rel != ".":
+                out.append(f"d {base} 0755 0 0")
+            for fn in sorted(filenames):
+                if fn in IGNORED:
+                    continue
+                if any(c.isspace() for c in fn):
+                    sys.exit(f"--app: whitespace in setting name: {os.path.join(dirpath, fn)}")
+                out.append(f"f {base}/{fn} 0644 0 0 {os.path.abspath(os.path.join(dirpath, fn))}")
 
     out += ["d /roi 0711 0 0", f"f /roi/users 0600 0 0 {os.path.abspath(users_db)}"]
     for value in ("hostname", "timezone"):          # 커널이 info:/<이름> 으로 공개하는 값

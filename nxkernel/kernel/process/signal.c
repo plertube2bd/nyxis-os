@@ -80,6 +80,17 @@ static void wake_for_signal(process_t *p)
     sched_request_resched();
 }
 
+bool signal_protected(const process_t *target, u32 sig, u32 sender_pid)
+{
+    if (!target || !target->critical)
+        return false;
+    if (sig == 0 || sig == NX_SIGCHLD || sig == NX_SIGCONT || sig == NX_SIGURG || sig == NX_SIGWINCH)
+        return false;
+    if (sender_pid != 0 && (sender_pid == target->pid || sender_pid == target->parent_pid))
+        return false;
+    return true;
+}
+
 void signal_post(process_t *p, u32 sig, i32 code, u32 sender)
 {
     u64 flags;
@@ -87,6 +98,8 @@ void signal_post(process_t *p, u32 sig, i32 code, u32 sender)
     (void)code;
     if (!p || !valid_sig(sig) || sig == NX_SIGKILL || sig == NX_SIGSTOP)
         return;
+    if (signal_protected(p, sig, sender))
+        return;                         /* 보호 프로세스 */
 
     flags = irq_save();
     if (p->in_use && p->addrspace.pml4 && p->state != PROCESS_TERMINATED && !is_ignored(p, sig)) {
@@ -109,7 +122,7 @@ u32 signal_post_group(u32 pgid, u32 sig, i32 code)
     flags = irq_save();
     for (p = process_list; p; p = p->next) {
         if (p->in_use && p->pid != 0 && p->addrspace.pml4 && p->pgid == pgid &&
-            p->state != PROCESS_TERMINATED) {
+            p->state != PROCESS_TERMINATED && !signal_protected(p, sig, 0)) {
             signal_post(p, sig, code, 0);
             n++;
         }
@@ -357,12 +370,49 @@ i64 sys_signal_send(const u64 *a)
         if (NSTATUS_IS_ERR(status))
             return (i64)status;
     }
+    if (signal_protected(target, (u32)a[1], p->pid))
+        return (i64)Npermission;            /* 보호 프로세스 (init, login) */
     if (a[1] == 0)
         return 0;
     if (a[1] == NX_SIGKILL || a[1] == NX_SIGSTOP) {
         /* 멈춤은 지원하지 않는다: SIGSTOP 도 종료로 다룬다 (가로챌 수 없는 신호의 뜻은 지킨다) */
         return (i64)process_kill(target, (i32)NX_EXIT_KILLED);   /* 자기 자신이면 돌아오지 않는다 */
     }
+    signal_post(target, (u32)a[1], NX_SI_USER, p->pid);
+    return 0;
+}
+
+/* NxSignalSendPid(pid, sig): root 는 누구에게나, 그 밖에는 같은 uid 의 사용자 프로세스에게만 */
+i64 sys_signal_send_pid(const u64 *a)
+{
+    process_t *p = current_process;
+    process_t *target = nNULL;
+    process_t *q;
+
+    if (!p)
+        return (i64)NnotInitialized;
+    if (a[1] != 0 && !valid_sig(a[1]))
+        return (i64)NinvalidArg;
+    if (a[0] > 0xFFFFFFFFUL)
+        return (i64)NinvalidArg;
+    for (q = process_list; q; q = q->next) {
+        if (q->in_use && q->state != PROCESS_TERMINATED && q->pid == (u32)a[0]) {
+            target = q;
+            break;
+        }
+    }
+    if (!target)
+        return (i64)NnotFound;
+    if (!target->addrspace.pml4)
+        return (i64)Npermission;            /* 커널 스레드 */
+    if (p->uid != 0 && target->uid != p->uid)
+        return (i64)Npermission;
+    if (signal_protected(target, (u32)a[1], p->pid))
+        return (i64)Npermission;            /* 보호 프로세스 (init, login): root 도 */
+    if (a[1] == 0)
+        return 0;
+    if (a[1] == NX_SIGKILL || a[1] == NX_SIGSTOP)
+        return (i64)process_kill(target, (i32)NX_EXIT_KILLED);   /* 자기 자신이면 돌아오지 않는다 */
     signal_post(target, (u32)a[1], NX_SI_USER, p->pid);
     return 0;
 }

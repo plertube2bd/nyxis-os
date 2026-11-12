@@ -108,6 +108,9 @@ void paging_addrspace_destroy(addr_space_t *as);
  * 그 소유권은 자식에게 넘어가지 않는다. 실패하면(메모리 부족) dst 에 일부만 남는다: 호출자가 dst 를 파기한다.
  * 쓰기 시 복사(COW)가 아니라 즉시 복사다.
  */
+/* 사용자 영역에 매핑된 페이지 수 (장치 MMIO 처럼 이 주소 공간의 소유가 아닌 페이지는 빼고) */
+u64 paging_count_user_pages(const addr_space_t *as);
+
 Nstatus paging_addrspace_clone_user(const addr_space_t *src, addr_space_t *dst);
 
 /*

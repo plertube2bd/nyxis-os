@@ -31,6 +31,11 @@
  *         처리기가 없는 프로그램은 끝나고 $? 는 130 (SIGQUIT 은 131). 프롬프트에서는 포그라운드 그룹이 없으므로(0)
  *         쓰던 줄만 버려진다. 백그라운드 작업(&)과 셸 자신은 신호를 받지 않는다.
  *
+ * 설정 (nx64api nx64_setting_*: 사용자 값 roi:/<uid>/app/nysh/<키> 가 기본값 app:/nysh.run/<키> 보다 먼저):
+ *   mark   프롬프트 기호 (기본 "*", 출력 가능한 ASCII 1~8 자)
+ *   rc     대화형 셸이 시작할 때 실행하는 명령들. 기본(app:/nysh.run/rc)을 먼저, 그다음 사용자 것
+ *          (roi:/<uid>/app/nysh/rc) 을 실행한다 (둘 다 있으면 둘 다: 시스템 설정 위에 사용자 설정)
+ *
  * 실행: nysh            대화형 (표준 입력이 콘솔이면 프롬프트를 보인다)
  *       nysh -c 명령    한 줄 실행
  *       nysh 파일       파일의 줄들을 실행
@@ -45,6 +50,7 @@
 #include <signal.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <nx64.h>
 
 #define LINE_MAX_LEN 1024
 #define MAX_TOKENS   256
@@ -795,13 +801,14 @@ static int b_source(int argc, char **argv)
     return run_file(argv[1]);
 }
 
+/* 커널이 아는 신원 (nx64_whoami): sudo 아래에서는 root. 환경 변수 USER/LOGNAME 은 보지 않는다 */
 static int b_whoami(int argc, char **argv)
 {
-    const char *me = getlogin();
+    struct nx64_identity me;
 
     (void)argc;
     (void)argv;
-    puts(me ? me : "?");
+    puts(nx64_whoami(&me) == 0 && me.name[0] != '\0' ? me.name : "?");
     return 0;
 }
 
@@ -1199,15 +1206,53 @@ static void prompt_name(char *out, size_t cap)
     out[cap - 1] = '\0';
 }
 
+/* 프롬프트 기호 (설정 mark). 출력 가능한 ASCII 1~8 자가 아니면 "*" */
+static char g_mark[9] = "*";
+
+static void load_mark(void)
+{
+    char v[16];
+    long n = nx64_setting_get("nysh", "mark", v, sizeof(v));
+    long i;
+
+    if (n < 1 || n > 8)
+        return;
+    for (i = 0; i < n; i++) {
+        if ((unsigned char)v[i] < 0x21 || (unsigned char)v[i] > 0x7E)
+            return;
+    }
+    memcpy(g_mark, v, (size_t)n + 1U);
+}
+
 static void show_prompt(void)
 {
     char name[256];
 
     prompt_name(name, sizeof(name));
-    if (g_color)        /* 디렉터리: 굵은 파랑, '*': 직전 명령이 성공하면 초록, 실패하면 빨강 */
-        fprintf(stderr, "\033[1;34m%s\033[0m\033[1;%dm*\033[0m ", name, g_last == 0 ? 32 : 31);
+    if (g_color)        /* 디렉터리: 굵은 파랑, 기호: 직전 명령이 성공하면 초록, 실패하면 빨강 */
+        fprintf(stderr, "\033[1;34m%s\033[0m\033[1;%dm%s\033[0m ", name, g_last == 0 ? 32 : 31, g_mark);
     else
-        fprintf(stderr, "%s* ", name);
+        fprintf(stderr, "%s%s ", name, g_mark);
+}
+
+/* 시작 스크립트 (설정 rc): 기본, 그다음 사용자 것. 없는 것은 조용히 건너뛴다 */
+static void run_rc(void)
+{
+    static const int where[2] = { NX64_SETTING_DEFAULT, NX64_SETTING_USER };
+    char path[256];
+    int i;
+
+    for (i = 0; i < 2; i++) {
+        FILE *f;
+
+        if (nx64_setting_path(where[i], "nysh", "rc", path, sizeof(path)) != 0)
+            continue;
+        f = fopen(path, "r");
+        if (!f)
+            continue;
+        (void)run_stream(f);
+        fclose(f);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -1241,8 +1286,12 @@ int main(int argc, char **argv)
         return run_file(argv[1]);
 
     g_interactive = isatty(0);
-    if (g_interactive)
+    if (g_interactive) {
         (void)tcsetpgrp(0, 0);              /* 이 셸을 띄운 셸의 작업 그룹에서 벗어난다: 프롬프트의 Ctrl-C 로 죽지 않게 */
+        load_mark();
+        run_rc();
+        g_last = 0;                         /* rc 의 마지막 결과가 첫 프롬프트 색을 정하지 않게 */
+    }
     for (;;) {
         reap_bg();
         if (g_interactive)

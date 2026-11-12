@@ -18,6 +18,7 @@
 #include "kernel/error_handling/panic.h"
 #include "kernel/process/process.h"
 #include "kernel/process/signal.h"
+#include "kernel/process/umem.h"
 #include "nyx_abi.h"
 #include "kernel/syscall/syscall.h"
 #include "kernel/syscall/uaccess.h"
@@ -140,11 +141,11 @@ const char *exception_name(u64 vector)
     case VEC_ALIGNMENT_CHECK:      return "#AC Alignment Check";
     case VEC_MACHINE_CHECK:        return "#MC Machine Check";
     case VEC_SIMD_FP:              return "#XM SIMD Floating-Point";
-    default:                       return "Reserved/Unknown exception";
+    default:                       return vector >= 32 ? "hardware interrupt" : "Reserved/Unknown exception";
     }
 }
 
-static void dump_frame(const struct trap_frame *f)
+void trap_frame_dump(const struct trap_frame *f)
 {
     printk("vector=%lu (%s) error=0x%lx\n", (unsigned long)f->vector,
            exception_name(f->vector), (unsigned long)f->error_code);
@@ -182,6 +183,12 @@ static void exception_default(struct trap_frame *f)
     if (f->vector == VEC_PAGE_FAULT && uaccess_fixup(f))
         return;
 
+    /* 요구 페이징: 사용자 모드에서 스택/힙의 아직 없는 페이지를 건드렸다 -> 매핑하고 같은 명령을 다시 실행.
+     * (커널 모드의 사용자 메모리 접근은 uaccess 가 미리 매핑한다: 여기서는 사용자 모드만) */
+    if (f->vector == VEC_PAGE_FAULT && (f->cs & 3UL) == 3UL && !(f->error_code & 1UL) &&
+        umem_demand_page(current_process, read_cr2()))
+        return;
+
     if ((f->cs & 3UL) == 3UL) {
         /* 유저 모드 프로세스의 오류: 커널은 살리고 해당 프로세스만 종료한다 */
         u32 sig = 0;
@@ -203,13 +210,13 @@ static void exception_default(struct trap_frame *f)
         if (sig && signal_fault(f, sig, f->vector == VEC_PAGE_FAULT ? read_cr2() : f->rip))
             return;
         printk("\nUser-mode fault, terminating process:\n");
-        dump_frame(f);
+        trap_frame_dump(f);
         process_exit_with_code((i32)NX_EXIT_FAULT);
         /* 반환하지 않는다 */
     }
 
     printk("\n*** KERNEL EXCEPTION ***\n");
-    dump_frame(f);
+    trap_frame_dump(f);
     kernel_panic_simple("Unhandled CPU exception in kernel mode", NkernelFault);
 }
 

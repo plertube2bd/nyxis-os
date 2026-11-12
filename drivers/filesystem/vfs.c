@@ -923,6 +923,23 @@ Nstatus vfs_open(const char *path, u32 flags, handle_t *out_handle)
     return Nok;
 }
 
+Nstatus vfs_truncate(handle_t *handle)
+{
+    Nstatus status;
+
+    if (!handle) {
+        return NinvalidArg;
+    }
+    if (!handle->vnode || !handle->vnode->ops || !handle->vnode->ops->truncate) {
+        return Nunsupported;
+    }
+    status = handle->vnode->ops->truncate(handle);
+    if (!NSTATUS_IS_ERR(status)) {
+        handle->offset = 0;
+    }
+    return status;
+}
+
 Nstatus vfs_read(handle_t *handle, void *buffer, usize size, usize *bytes_read)
 {
     Nstatus status;

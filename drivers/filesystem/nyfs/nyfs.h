@@ -18,6 +18,8 @@
 
 typedef Nstatus (*nyfs_disk_read_fn)(u32 diskno, usize offset, void *buffer, usize size, NTBLI *info);
 typedef Nstatus (*nyfs_disk_write_fn)(u32 diskno, usize offset, const void *buffer, usize size, NTBLI *info);
+/* 선택: 해제한 블록의 내용을 버려도 된다고 장치에 알린다 (희소 램디스크가 메모리를 돌려받는다) */
+typedef Nstatus (*nyfs_disk_discard_fn)(u32 diskno, usize offset, usize size, NTBLI *info);
 
 /*
  * format()/mount() 에 넘기는 파라미터.
@@ -31,6 +33,7 @@ typedef struct {
     NTBLI *info;
     nyfs_disk_read_fn read;
     nyfs_disk_write_fn write;
+    nyfs_disk_discard_fn discard;   /* mount() 선택 항목 (NULL 이면 안 부른다). 블록을 해제할 때마다 그 블록 범위로 */
     u64 total_blocks;           /* format() 전용 */
     u64 inode_count;            /* format() 전용. 0 = 자동 */
     u8  block_size_shift;       /* format() 전용. NYFS_BLOCK_SIZE_SHIFT_MIN..MAX */

@@ -22,7 +22,8 @@
 #include "types.h"
 
 /*
- * 사용 가능한 메모리 맵(info)에서, 아래 물리 범위들을 제외한 나머지를 자유 프레임으로 등록한다.
+ * 사용 가능한 메모리 맵(info)에서(CONVENTIONAL + UEFI BootServices/Loader 코드·데이터: pfa.c usable_type),
+ * 아래 물리 범위들을 제외한 나머지를 자유 프레임으로 등록한다.
  *   - 0 ~ 1MiB (레거시 영역: BIOS/EBDA/일부 펌웨어 예약, 신뢰하지 않고 항상 제외)
  *   - [kernel_phys_start, kernel_phys_end) : 실행 중인 커널 이미지 자신
  *   - [initrd_phys_start, initrd_phys_end) : initrd (있는 경우)
@@ -42,15 +43,6 @@ Nstatus pfa_init(
     u64 initrd_phys_end,
     u64 hhdm_limit
 );
-
-/*
- * 부팅 때 한 번, 연속된 물리 메모리를 떼어 둔다 (RAM 디스크처럼 연속 영역이 필요한 곳: tmp:/).
- * pfa_init() 전에 크기를 정하면 pfa_init() 이 사용 가능한 구간 하나의 끝에서 그만큼을 자유 리스트에 넣지 않고
- * 남겨 둔다. 자유 리스트 방식이라 실행 중에는 연속 영역을 찾을 수 없어서 이렇게 한다.
- * pfa_boot_reserve() 는 그 물리 주소 (못 떼었으면 NoutOfMemory). 내용은 0 이 아닐 수 있다.
- */
-void pfa_set_boot_reserve(u64 bytes);
-Nstatus pfa_boot_reserve(u64 *out_phys);
 
 /*
  * 0 으로 채워진 4KiB 프레임 하나를 할당해 물리 주소를 돌려준다.

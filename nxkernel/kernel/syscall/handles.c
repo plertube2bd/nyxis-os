@@ -12,6 +12,7 @@
 #include "kernel/mm/kheap.h"
 #include "kernel/ipc/pipe.h"
 #include "kernel/info/info.h"
+#include "console/inputs/tty.h"
 
 /* 핸들 값 = (세대 << 32) | 슬롯 번호 */
 static u64 make_handle(u32 generation, u32 index)
@@ -109,6 +110,10 @@ Nstatus nx_handle_close(nx_handle_table_t *table, u64 handle)
         }
     } else if (slot->type == NX_HANDLE_PIPE && slot->pipe)
         pipe_release(slot->pipe, slot->pipe_write);
+    else if (slot->type == NX_HANDLE_CONSOLE && slot->tty)
+        tty_release(slot->tty);
+    else if (slot->type == NX_HANDLE_PTY && slot->pty)
+        pty_master_release(slot->pty);
     else if (slot->type == NX_HANDLE_PROCESS && slot->proc)
         process_release(slot->proc);      /* 마지막 참조였고 이미 끝났으면 슬롯이 여기서 회수된다 */
     else if (slot->type == NX_HANDLE_TOKEN && slot->token) {
@@ -193,6 +198,12 @@ Nstatus nx_handle_share(const nx_handle_t *src, nx_handle_t *dst, bool share)
     switch (src->type) {
     case NX_HANDLE_CONSOLE:
         dst->console_fd = src->console_fd;
+        dst->tty = src->tty;
+        tty_retain(dst->tty);
+        return NSTATUS_OK;
+    case NX_HANDLE_PTY:
+        dst->pty = src->pty;
+        pty_master_retain(dst->pty);
         return NSTATUS_OK;
     case NX_HANDLE_FILE:
         if (share) {

@@ -818,3 +818,41 @@ bool paging_is_user_range(const addr_space_t *as, const void *virt, usize len, b
 
     return true;
 }
+
+u64 paging_count_user_pages(const addr_space_t *as)
+{
+    u32 i4, i3, i2, i1;
+    u64 n = 0;
+
+    if (!as || !as->pml4)
+        return 0;
+    for (i4 = 0; i4 < HHDM_PML4_INDEX; i4++) {
+        u64 e4 = as->pml4[i4];
+        u64 *pdpt;
+
+        if (!(e4 & PAGE_PRESENT))
+            continue;
+        pdpt = table_of_dyn(e4);
+        for (i3 = 0; i3 < ENTRIES_PER_TABLE; i3++) {
+            u64 e3 = pdpt[i3];
+            u64 *pd;
+
+            if (!(e3 & PAGE_PRESENT) || (e3 & PAGE_HUGE))
+                continue;
+            pd = table_of_dyn(e3);
+            for (i2 = 0; i2 < ENTRIES_PER_TABLE; i2++) {
+                u64 e2 = pd[i2];
+                u64 *pt;
+
+                if (!(e2 & PAGE_PRESENT) || (e2 & PAGE_HUGE))
+                    continue;
+                pt = table_of_dyn(e2);
+                for (i1 = 0; i1 < ENTRIES_PER_TABLE; i1++) {
+                    if ((pt[i1] & PAGE_PRESENT) && !(pt[i1] & PAGE_NOFREE))
+                        n++;
+                }
+            }
+        }
+    }
+    return n;
+}

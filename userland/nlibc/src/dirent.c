@@ -13,18 +13,26 @@ struct __nl_dir {
     struct dirent ent;
 };
 
+/*
+ * path 의 자식 목록을 읽을 수 있는지 (opendir/chdir). Nyxis 의 노드는 파일/디렉터리 구분 없이 자식을 가질 수
+ * 있으므로 자식이 없는 노드도 된다 (빈 목록). 다른 OS(호스트 검사)에서는 디렉터리가 아니면 ENOTDIR.
+ */
+int __nl_can_list(const char *abs)
+{
+    char name[2];
+    int type;
+
+    return __nl_readdir(abs, 0, name, sizeof(name), &type) < 0 ? -1 : 0;
+}
+
 DIR *opendir(const char *path)
 {
     char abs[NL_PATH_MAX];
     struct __nl_stat st;
     DIR *d;
 
-    if (__nl_resolve(path, abs, sizeof(abs)) < 0 || __nl_stat_path(abs, &st) < 0)
+    if (__nl_resolve(path, abs, sizeof(abs)) < 0 || __nl_stat_path(abs, &st) < 0 || __nl_can_list(abs) < 0)
         return NULL;
-    if (st.type != NL_T_DIR) {
-        errno = ENOTDIR;
-        return NULL;
-    }
     d = (DIR *)malloc(sizeof(*d));
     if (d == NULL)
         return NULL;

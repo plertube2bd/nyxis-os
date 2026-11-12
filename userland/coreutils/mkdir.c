@@ -14,7 +14,7 @@ static int make_one(const char *path, int parents)
 {
     if (mkdir(path, 0777) == 0)
         return 0;
-    if (parents && errno == EEXIST && cu_is_dir(path))
+    if (parents && errno == EEXIST && cu_can_hold(path))
         return 1;                                   /* 이미 있다: 성공, 모드는 바꾸지 않는다 */
     return -1;
 }

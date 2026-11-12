@@ -53,8 +53,14 @@ long nx_power_off(void) { return SC0(NX_SYS_POWER_OFF); }
 
 long nx_spawn(const char *path, const char *const *argv, const char *const *envp, long token)
 {
+    return nx_spawn_ex(path, argv, envp, token, 0);
+}
+
+long nx_spawn_ex(const char *path, const char *const *argv, const char *const *envp, long token,
+                 unsigned long flags)
+{
     return nx_syscall(NX_SYS_PROCESS_CREATE, (unsigned long)path, (unsigned long)argv,
-                      (unsigned long)envp, (unsigned long)token, 0);
+                      (unsigned long)envp, (unsigned long)token, flags);
 }
 
 long nx_wait(long h, unsigned long timeout_ms, int *code)
@@ -234,4 +240,84 @@ long nx_read_value(const char *path, char *buf, unsigned long max)
         total--;
     buf[total] = '\0';
     return total;
+}
+
+/* 설정 이름 구성요소 [A-Za-z0-9._-]+ ("." / ".." 아님). key 면 '/' 로 나뉜 여러 구성요소 */
+static int setting_name_ok(const char *s, int allow_slash)
+{
+    unsigned long n = 0;
+    unsigned long i;
+
+    for (i = 0;; i++) {
+        char c = s[i];
+
+        if (c == '\0' || (allow_slash && c == '/')) {
+            if (n == 0 || (n == 1 && s[i - 1] == '.') || (n == 2 && s[i - 1] == '.' && s[i - 2] == '.'))
+                return 0;
+            if (c == '\0')
+                return 1;
+            n = 0;
+            continue;
+        }
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+              c == '.' || c == '_' || c == '-'))
+            return 0;
+        n++;
+    }
+}
+
+/* out 에 s 를 이어 붙인다 (넘치면 0) */
+static int path_add(char *out, unsigned long cap, unsigned long *len, const char *s)
+{
+    unsigned long n = nx_strlen(s);
+
+    if (*len + n + 1 > cap)
+        return 0;
+    nx_memcpy(out + *len, s, n + 1);
+    *len += n;
+    return 1;
+}
+
+long nx_setting_get(const char *app, const char *key, char *buf, unsigned long max)
+{
+    struct nx_identity id;
+    char path[256];
+    char digits[11];
+    unsigned long len = 0;
+    unsigned long uid;
+    int d = 0;
+    long r;
+
+    if (!app || !key || !setting_name_ok(app, 0) || !setting_name_ok(key, 1))
+        return NX_E_INVALID_ARG;
+
+    /* 사용자 값: roi:/<uid>/app/<app>/<key> */
+    if (nx_identity(&id) == 0) {
+        uid = id.uid;
+        do {
+            digits[d++] = (char)('0' + (uid % 10UL));
+            uid /= 10UL;
+        } while (uid && d < 10);
+        path[0] = '\0';
+        if (path_add(path, sizeof(path), &len, "roi:/")) {
+            while (d > 0 && len + 2 <= sizeof(path)) {
+                path[len++] = digits[--d];
+                path[len] = '\0';
+            }
+            if (path_add(path, sizeof(path), &len, "/app/") && path_add(path, sizeof(path), &len, app) &&
+                path_add(path, sizeof(path), &len, "/") && path_add(path, sizeof(path), &len, key)) {
+                r = nx_read_value(path, buf, max);
+                if (r >= 0 || r == NX_E_BUF_OVERFLOW)
+                    return r;
+            }
+        }
+    }
+
+    /* 기본값: app:/<app>.run/<key> */
+    len = 0;
+    path[0] = '\0';
+    if (!path_add(path, sizeof(path), &len, "app:/") || !path_add(path, sizeof(path), &len, app) ||
+        !path_add(path, sizeof(path), &len, ".run/") || !path_add(path, sizeof(path), &len, key))
+        return NX_E_INVALID_ARG;
+    return nx_read_value(path, buf, max);
 }

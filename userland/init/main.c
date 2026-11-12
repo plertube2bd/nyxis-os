@@ -21,6 +21,7 @@
  *               거부/실패면 "deny <이유>" 를 보낸다. 비밀번호가 틀리면 NxAuthenticate 가 1초 잠들고 그동안
  *               init 의 다른 요청도 기다린다 (무차별 대입을 늦추는 효과도 된다).
  * init 이 끝나면 커널은 멈춘다 (패닉) — 로그인도 전원 끄기도 할 수 없게 되기 때문이다.
+ * 설정 welcome (nx_setting_get: app:/init.run/welcome): 부팅 후 로그인 전에 보이는 문구 (기본 "Welcome to Nyxis OS!").
  */
 #include "nyx.h"
 
@@ -42,7 +43,8 @@ static struct sudo_job g_jobs[SUDO_JOBS];
 static long spawn_login(void)
 {
     static const char *const argv[] = { "login", 0 };
-    long h = nx_spawn(LOGIN_PATH, argv, 0, NX_NO_TOKEN);
+    /* login 은 보호 프로세스: init 말고는 root 도 신호로 끝낼 수 없다 (로그인 화면이 사라지지 않게) */
+    long h = nx_spawn_ex(LOGIN_PATH, argv, 0, NX_NO_TOKEN, NX_SPAWN_CRITICAL);
 
     if (h < 0) {
         nx_puts("init: cannot start " LOGIN_PATH " (status ");
@@ -303,7 +305,17 @@ int main(int argc, char **argv, char **envp)
         nx_puts(")\n");
     }
 
-    nx_puts("Welcome to Nyxis OS!\n");
+    {
+        /* 설정 welcome (app:/init.run/welcome, root 의 사용자 값 roi:/0/app/init/welcome 이 먼저). 없으면 기본 문구 */
+        char welcome[512];
+
+        if (nx_setting_get("init", "welcome", welcome, sizeof(welcome)) >= 0) {
+            nx_puts(welcome);
+            nx_puts("\n");
+        } else {
+            nx_puts("Welcome to Nyxis OS!\n");
+        }
+    }
     login = spawn_login();
 
     for (;;) {

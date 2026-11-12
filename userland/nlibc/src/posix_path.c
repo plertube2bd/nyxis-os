@@ -135,12 +135,8 @@ int chdir(const char *path)
 
     if (__nl_resolve(path, abs, sizeof(abs)) < 0)
         return -1;
-    if (__nl_stat_path(abs, &st) < 0)
-        return -1;
-    if (st.type != NL_T_DIR) {
-        errno = ENOTDIR;
-        return -1;
-    }
+    if (__nl_stat_path(abs, &st) < 0 || __nl_can_list(abs) < 0)
+        return -1;                              /* 노드면 어디든 (자식이 없어도): __nl_can_list */
     strcpy(cwd, abs);
     __nl_cwd_changed(cwd);
     return 0;

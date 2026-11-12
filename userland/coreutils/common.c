@@ -1,6 +1,7 @@
 /*
  * common.c - coreutils 공용 도우미 (common.h 참고)
  */
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
@@ -126,13 +127,28 @@ int cu_join(char *out, size_t cap, const char *dir, const char *name)
     return 0;
 }
 
+int cu_can_hold(const char *path)
+{
+    int e = errno;
+    DIR *d = opendir(path);
+
+    if (d)
+        closedir(d);
+    errno = e;
+    return d != NULL;
+}
+
 int cu_is_dir(const char *path)
 {
     struct stat st;
     int e = errno;
+    size_t n = strlen(path);
     int r = stat(path, &st) == 0 && S_ISDIR(st.st_mode);
 
     errno = e;
+    /* 끝의 '/' 는 "그 안으로" 라는 뜻: 자식이 아직 없는 노드도 담는 곳으로 (Nyxis 노드는 무엇이든 자식을 가진다) */
+    if (!r && n > 1 && path[n - 1] == '/')
+        r = cu_can_hold(path);
     return r;
 }
 

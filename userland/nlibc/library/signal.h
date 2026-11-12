@@ -56,7 +56,7 @@ int raise(int sig);
 #define SIGTTIN   21
 #define SIGTTOU   22
 #define SIGURG    23
-#define SIGWINCH  28   /* 창 크기 바뀜. Nyxis 콘솔은 크기가 바뀌지 않아 보내지 않는다 */
+#define SIGWINCH  28   /* 창 크기 바뀜 (pty 의 크기가 바뀌면 포그라운드 그룹에. 물리 콘솔은 바뀌지 않는다) */
 #define NSIG      32
 
 typedef unsigned long sigset_t;    /* 비트 (sig - 1) */

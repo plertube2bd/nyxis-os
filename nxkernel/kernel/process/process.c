@@ -11,6 +11,7 @@
 #include "kernel/kernel.h"
 #include "interrupt.h"
 #include "memory.h"
+#include "string.h"
 #include "phys.h"
 #include "kernel/timer/pit/pit_base.h"
 #include "kernel/process/waitq.h"
@@ -220,6 +221,7 @@ static process_t *alloc_process_locked(process_entry_t entry, void *arg)
     proc->kernel_stack = kstack_bottom(slot);
     proc->slice_ticks = SCHED_SLICE_TICKS;
     proc->in_use = true;
+    proc->start_tick = timer_get_tick();
     waitq_init(&proc->exit_waiters);
     nx_handles_init(&proc->handles);
 
@@ -344,6 +346,7 @@ Nstatus process_create_forked(addr_space_t as, const struct trap_frame *frame, p
     proc->heap_start = parent->heap_start;
     proc->heap_brk = parent->heap_brk;
     proc->umask = parent->umask;
+    memcpy(proc->name, parent->name, sizeof(proc->name));
     signal_fork_copy(proc, parent);
     proc->fork_frame = *frame;
     proc->fork_frame.rax = 0;              /* 자식에게 fork 는 0 을 돌려준다 */
@@ -421,6 +424,9 @@ static Nstatus terminate_locked(process_t *proc, i32 code)
 
     /* 콘솔을 raw 모드로 두고 끝났으면 되돌린다 (셸이 먹통이 되지 않도록) */
     tty_process_terminated(proc->pid);
+
+    /* 제어 터미널 참조를 놓는다 (pty 의 마지막 사용자였으면 주 끝이 EOF 를 본다) */
+    process_set_ctty(proc, nNULL);
 
     /* 이 프로세스를 기다리던 모두를 깨운다 (NxProcessWait) */
     (void)waitq_wake_all(&proc->exit_waiters);
@@ -654,4 +660,105 @@ u32 process_count(void)
 void process_thread_exit(void)
 {
     process_exit();
+}
+
+void process_set_ctty(process_t *proc, struct tty *t)
+{
+    struct tty *old;
+    u64 flags = irq_save();
+
+    old = proc->ctty;
+    tty_retain(t);
+    proc->ctty = t;
+    tty_release(old);
+    irq_restore(flags);
+}
+
+void process_hangup_ctty(struct tty *t)
+{
+    process_t *p;
+
+    for (p = process_list; p; p = p->next) {
+        if (p->in_use && p->state != PROCESS_TERMINATED && p->ctty == t)
+            signal_post(p, NX_SIGHUP, NX_SI_KERNEL, 0);
+    }
+}
+
+void process_adopt_ctty(process_t *proc, struct tty *inherited, bool fresh_console)
+{
+    const nx_handle_t *in = &proc->handles.slots[0];
+    struct tty *t = inherited;
+    u32 i;
+
+    if (!fresh_console && in->type == NX_HANDLE_CONSOLE && in->tty)
+        t = in->tty;
+    process_set_ctty(proc, t);
+    if (!fresh_console || !t)
+        return;
+    for (i = 0; i < 3U; i++) {
+        nx_handle_t *s = &proc->handles.slots[i];
+
+        if (s->type == NX_HANDLE_CONSOLE && !s->tty) {
+            s->tty = t;
+            tty_retain(t);
+        }
+    }
+}
+
+void process_set_name(process_t *proc, const char *path)
+{
+    const char *base = path;
+    const char *p;
+    usize n;
+
+    for (p = path; *p; p++) {
+        if (*p == '/' || *p == ':')
+            base = p + 1;
+    }
+    n = strlen(base);
+    if (n > 4 && strcmp(base + n - 4, ".run") == 0)
+        n -= 4;
+    if (n >= NX_PROC_NAME_MAX)
+        n = NX_PROC_NAME_MAX - 1U;
+    memcpy(proc->name, base, n);
+    proc->name[n] = '\0';
+}
+
+u32 process_list_snapshot(struct nx_procent *out, u32 max)
+{
+    process_t *p;
+    u32 n = 0;
+    u64 flags = irq_save();
+
+    for (p = process_list; p; p = p->next) {
+        struct nx_procent *e;
+
+        if (!p->in_use || p->state == PROCESS_TERMINATED)
+            continue;
+        if (n < max) {
+            e = &out[n];
+            memset(e, 0, sizeof(*e));
+            e->pid = p->pid;
+            e->parent_pid = p->parent_pid;
+            e->pgid = p->pgid;
+            e->uid = p->uid;
+            e->state = p->state;
+            e->flags = (p->addrspace.pml4 ? NX_PROCENT_USER : 0U) |
+                       (p->console_session ? NX_PROCENT_SESSION : 0U) |
+                       (p->critical ? NX_PROCENT_CRITICAL : 0U) |
+                       (p->ctty ? NX_PROCENT_PTY : 0U);
+            e->cpu_ticks = p->cpu_ticks;
+            e->start_tick = p->start_tick;
+            e->mem_kib = paging_count_user_pages(&p->addrspace) * (PAGE_SIZE / 1024U);
+            if (p->name[0])
+                memcpy(e->name, p->name, sizeof(e->name));
+            else
+                memcpy(e->name, p->pid == 0 ? "idle" : "kernel", p->pid == 0 ? 5U : 7U);
+            memcpy(e->user, p->user_name, sizeof(e->user) < sizeof(p->user_name) ? sizeof(e->user) : sizeof(p->user_name));
+            e->user[sizeof(e->user) - 1U] = '\0';
+        }
+        n++;
+    }
+    irq_restore(flags);
+    return n;
 }

@@ -13,7 +13,8 @@
  * NxDuplicateHandleEx(NX_DUP_SHARE)/NxProcessFork/상속으로 생긴 핸들들은 같은 열린 파일을 공유한다
  * (POSIX 의 open file description). 파이프/채널/프로세스도 참조 수로 공유된다.
  *
- * 물려줄 수 있는 종류 (fork, NX_SPAWN_INHERIT): 콘솔, 파일, 파이프, 채널 송신 끝, info 스냅샷(사본).
+ * 물려줄 수 있는 종류 (fork, NX_SPAWN_INHERIT): 콘솔(pty 종속 끝 포함), pty 주 끝, 파일, 파이프, 채널 송신 끝,
+ * info 스냅샷(사본).
  * 물려주지 않는 종류: 프로세스(자식 관계는 물려받지 않는다), 토큰(일회용 비밀), 장치(독점 소유),
  * 채널 수신 끝(받는 쪽은 하나).
  */
@@ -33,12 +34,15 @@
 #define NX_HANDLE_DEVICE   6U   /* dev:/ 장치. 복제 불가 (소유권) */
 #define NX_HANDLE_INFO     7U   /* info:/ 가상 파일: 열 때 만든 스냅샷 (읽기 전용) */
 #define NX_HANDLE_PIPE     8U   /* 파이프의 한쪽 끝 (kernel/ipc/pipe.h) */
+#define NX_HANDLE_PTY      9U   /* 의사 터미널의 주 끝 (console/inputs/tty.h). 종속 끝은 NX_HANDLE_CONSOLE */
 
 struct process;
 struct auth_identity;
 struct channel;
 struct nx_device;
 struct nx_pipe;
+struct tty;
+struct pty;
 
 /* 열린 파일 (공유 가능). refs 가 0 이 되면 VFS 핸들을 닫고 해제한다 */
 typedef struct nx_ofile {
@@ -54,6 +58,8 @@ typedef struct nx_handle {
     u32 rights;             /* NX_RIGHT_* 조합 */
     u32 generation;         /* 슬롯 재사용 횟수 */
     u32 console_fd;         /* 콘솔 핸들일 때: 0=in 1=out 2=err */
+    struct tty *tty;        /* 콘솔 핸들일 때 터미널: NULL = 물리 콘솔, 아니면 pty 종속 끝 (참조 1 개) */
+    struct pty *pty;        /* pty 주 끝 핸들 (주 끝 참조 1 개) */
     u32 hflags;             /* NX_HFLAG_* (NX_HFLAG_CLOEXEC) */
     nx_ofile_t *of;         /* 파일 핸들일 때 열린 파일 (참조 1 개) */
     struct nx_pipe *pipe;   /* 파이프 핸들일 때 (그 끝의 참조 1 개) */

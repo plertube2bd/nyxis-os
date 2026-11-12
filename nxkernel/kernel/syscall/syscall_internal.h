@@ -26,6 +26,7 @@ i64 sys_handle_flags(const u64 *a);
 i64 sys_process_fork(const u64 *a);
 i64 sys_process_exec(const u64 *a);
 i64 sys_pipe_create(const u64 *a);
+i64 sys_pty_create(const u64 *a);
 i64 sys_stat_path(const u64 *a);
 i64 sys_set_mode(const u64 *a);
 i64 sys_set_umask(const u64 *a);

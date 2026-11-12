@@ -41,6 +41,9 @@ long nx_identity(struct nx_identity *out);
 long nx_token_identity(long token, struct nx_identity *out);   /* 토큰이 담은 신원 (소모하지 않음) */
 long nx_authenticate(const char *name, const char *password);
 long nx_spawn(const char *path, const char *const *argv, const char *const *envp, long token);
+/* flags: NX_SPAWN_* (NX_SPAWN_CONSOLE_SESSION 은 uid 0 만) */
+long nx_spawn_ex(const char *path, const char *const *argv, const char *const *envp, long token,
+                 unsigned long flags);
 long nx_wait(long h, unsigned long timeout_ms, int *code);
 long nx_kill(long h);
 long nx_process_info(long h, struct nx_procinfo *out);
@@ -79,5 +82,10 @@ long nx_readline(char *buf, unsigned long max);
 /* 작은 파일(roi:/ 값, info:/ 항목)을 통째로 읽는다. 끝의 '\n' 하나는 떼고 NUL 로 끝낸다.
  * 반환: 길이, 파일이 max-1 보다 길면 NX_E_BUF_OVERFLOW, 그 밖의 오류는 음수 Nstatus */
 long nx_read_value(const char *path, char *buf, unsigned long max);
+
+/* 앱 설정 (nlibc 의 nyxapp.h 와 같은 규칙): 사용자 값 roi:/<uid>/app/<app>/<key>, 없으면 기본값
+ * app:/<app>.run/<key> (앱 오브젝트의 자식). 이름은 [A-Za-z0-9._-]+ 구성요소 ("." ".." 안 됨, key 는 '/' 허용).
+ * 반환: nx_read_value 와 같다 (길이 또는 음수 Nstatus). 이름이 틀리면 NX_E_INVALID_ARG */
+long nx_setting_get(const char *app, const char *key, char *buf, unsigned long max);
 
 #endif /* NYX_USER_H */

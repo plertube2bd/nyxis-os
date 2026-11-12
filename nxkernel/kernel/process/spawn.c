@@ -13,27 +13,20 @@
 #include "phys.h"
 #include "memory.h"
 
-/* 스택 페이지들을 할당·매핑한다. 가드 페이지(NX_USER_STACK_GUARD)는 일부러 매핑하지 않는다. */
-static Nstatus map_user_stack(addr_space_t *as)
+/* 스택 페이지 하나를 할당·매핑한다. 스택은 요구 페이징이라(umem.h) 초기 스택(인자/환경 문자열)이 놓이는
+ * 맨 위 페이지들만 write_to_addrspace 가 이것으로 만든다. 가드 페이지(NX_USER_STACK_GUARD)는 매핑하지 않는다. */
+static Nstatus map_stack_page(addr_space_t *as, u64 page)
 {
-    u64 page;
+    u64 phys;
+    Nstatus status = pfa_alloc(&phys);    /* 0 으로 채워져 있다 */
 
-    for (page = NX_USER_STACK_BASE; page < NX_USER_STACK_TOP; page += PAGE_SIZE) {
-        u64 phys;
-        Nstatus status = pfa_alloc(&phys);    /* 0 으로 채워져 있다 */
-
-        if (NSTATUS_IS_ERR(status))
-            return status;          /* 이미 매핑된 앞쪽 페이지는 호출자가 주소 공간째 파기한다 */
-
-        status = paging_map_page(as, (void *)(usize)phys, (void *)(usize)page,
-                                 (u64)(PAGE_USER | PAGE_RW | PAGE_NX));
-        if (NSTATUS_IS_ERR(status)) {
-            (void)pfa_free(phys);
-            return status;
-        }
-    }
-
-    return NSTATUS_OK;
+    if (NSTATUS_IS_ERR(status))
+        return status;          /* 이미 매핑된 페이지는 호출자가 주소 공간째 파기한다 */
+    status = paging_map_page(as, (void *)(usize)phys, (void *)(usize)page,
+                             (u64)(PAGE_USER | PAGE_RW | PAGE_NX));
+    if (NSTATUS_IS_ERR(status))
+        (void)pfa_free(phys);
+    return status;
 }
 
 /* 아직 CR3 에 실리지 않은 주소 공간 as 의 [vaddr, vaddr+len) 에 HHDM 을 통해 쓴다 (페이지 경계 처리) */
@@ -46,6 +39,11 @@ static Nstatus write_to_addrspace(addr_space_t *as, u64 vaddr, const void *src, 
         usize chunk = (usize)(PAGE_SIZE - (vaddr & (PAGE_SIZE - 1)));
         Nstatus status = paging_translate(as, vaddr, &phys);
 
+        if (status == NnotFound && vaddr >= NX_USER_STACK_BASE && vaddr < NX_USER_STACK_TOP) {
+            status = map_stack_page(as, vaddr & ~(PAGE_SIZE - 1));
+            if (!NSTATUS_IS_ERR(status))
+                status = paging_translate(as, vaddr, &phys);
+        }
         if (NSTATUS_IS_ERR(status))
             return status;
         if (chunk > len)
@@ -172,12 +170,7 @@ Nstatus spawn_build_image(const char *path, const spawn_args_t *args, spawn_imag
         return status;
     }
 
-    status = map_user_stack(&as);
-    if (NSTATUS_IS_ERR(status)) {
-        paging_addrspace_destroy(&as);
-        return status;
-    }
-
+    /* 스택은 요구 페이징: build_initial_stack 이 쓰는 맨 위 페이지만 지금 생긴다 (write_to_addrspace) */
     status = build_initial_stack(&as, args, &rsp);
     if (NSTATUS_IS_ERR(status)) {
         paging_addrspace_destroy(&as);
@@ -206,5 +199,6 @@ Nstatus process_spawn(const char *path, const spawn_args_t *args, process_t **ou
         paging_addrspace_destroy(&img.as);
         return status;
     }
+    process_set_name(*out_proc, path);
     return NSTATUS_OK;
 }

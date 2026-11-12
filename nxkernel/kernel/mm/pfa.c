@@ -16,8 +16,6 @@ static u64 g_free_count = 0;
 static u64 g_total_count = 0;    /* 초기화 직후 자유 프레임 수 (info:/memory/total_kib) */
 static bool g_initialized = false;
 static spinlock_t g_pfa_lock;
-static u64 g_reserve_size = 0;    /* pfa_set_boot_reserve: 떼어 둘 크기 (페이지 정렬) */
-static u64 g_reserve_phys = 0;    /* 떼어 둔 곳 (0 = 없음) */
 
 static u64 align_up(u64 v, u64 a)
 {
@@ -47,20 +45,18 @@ static void push_free_locked(u64 phys)
     g_free_count++;
 }
 
-void pfa_set_boot_reserve(u64 bytes)
+/*
+ * 커널이 쓸 수 있는 메모리 종류. CONVENTIONAL 외에 UEFI 의 BootServices 코드/데이터와 부트로더(Loader) 코드/데이터도
+ * ExitBootServices 이후에는 OS 의 것이다 (UEFI 규격). pfa_init 시점에 커널은 이미
+ *   - 부트 정보(NTBLI)와 메모리 맵을 커널 이미지 안으로 복사했고 (kernel.c boot_info_from_uefi),
+ *   - 자체 GDT/IDT/페이지 테이블/스택으로 옮겼고, ACPI 에서 필요한 값도 읽어 두었으며 (acpi_init),
+ *   - UEFI Runtime Services 는 부르지 않는다 (RuntimeServices* 영역은 회수하지 않는다).
+ * Loader 데이터 중 커널 이미지와 initrd 는 아래에서 범위로 제외한다 (Multiboot2 맵에는 이 종류들이 나오지 않는다).
+ */
+static bool usable_type(u32 type)
 {
-    if (!g_initialized)
-        g_reserve_size = (bytes + PFA_PAGE_SIZE - 1) & ~(PFA_PAGE_SIZE - 1);
-}
-
-Nstatus pfa_boot_reserve(u64 *out_phys)
-{
-    if (!out_phys)
-        return NinvalidArg;
-    if (g_reserve_phys == 0)
-        return NoutOfMemory;
-    *out_phys = g_reserve_phys;
-    return NSTATUS_OK;
+    return type == NTBLI_MEM_CONVENTIONAL || type == NTBLI_MEM_BOOT_CODE || type == NTBLI_MEM_BOOT_DATA ||
+           type == NTBLI_MEM_LOADER_CODE || type == NTBLI_MEM_LOADER_DATA;
 }
 
 Nstatus pfa_init(
@@ -91,7 +87,7 @@ Nstatus pfa_init(
 
         if (!d)
             break;
-        if (d->type != NTBLI_MEM_CONVENTIONAL)
+        if (!usable_type(d->type))
             continue;
         if (d->num_pages > (0x1000000000000UL / NTBLI_PAGE_SIZE))
             continue;              /* 비정상적으로 큰 값: 오버플로 방지를 위해 건너뜀 */
@@ -110,19 +106,8 @@ Nstatus pfa_init(
         start = align_up(start, PFA_PAGE_SIZE);
         end = align_down(end, PFA_PAGE_SIZE);
 
-        /* 연속 영역 떼어 두기: 이 구간의 끝에서, 커널/initrd/낮은 영역과 겹치지 않으면 */
-        if (g_reserve_size && !g_reserve_phys && end - start >= g_reserve_size) {
-            u64 w = end - g_reserve_size;
-
-            if (w >= PFA_LOW_RESERVED && !ranges_overlap(w, end, kernel_phys_start, kernel_phys_end) &&
-                !(initrd_phys_start < initrd_phys_end && ranges_overlap(w, end, initrd_phys_start, initrd_phys_end)))
-                g_reserve_phys = w;
-        }
-
         for (; start < end; start += PFA_PAGE_SIZE) {
             if (start < PFA_LOW_RESERVED)
-                continue;
-            if (g_reserve_phys && start >= g_reserve_phys && start < g_reserve_phys + g_reserve_size)
                 continue;
             if (ranges_overlap(start, start + PFA_PAGE_SIZE, kernel_phys_start, kernel_phys_end))
                 continue;

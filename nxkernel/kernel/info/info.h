@@ -14,8 +14,11 @@
  *   info:/version           운영체제 버전
  *   info:/abi               시스템 콜 ABI "주.부"
  *   info:/uptime_ms         부팅 후 밀리초
- *   info:/memory/total_kib  관리하는 물리 메모리 (KiB)
- *   info:/memory/free_kib   남은 물리 메모리 (KiB)
+ *   info:/memory/total_kib  할당기(pfa)가 관리하는 물리 메모리 (KiB)
+ *   info:/memory/free_kib   그중 남은 것 (KiB)
+ *   info:/memory/ram_kib    물리 RAM 전체 (메모리 맵의 RAM 종류 합, KiB)
+ *   info:/memory/reserved_kib  RAM 중 할당기 밖에 있는 것 = ram - total (커널 이미지, initrd(fs:/), tmp:/,
+ *                           펌웨어 Runtime/ACPI 영역, 1MiB 아래). 쓰는 중인 RAM = ram - free
  */
 #ifndef KERNEL_INFO_INFO_H
 #define KERNEL_INFO_INFO_H

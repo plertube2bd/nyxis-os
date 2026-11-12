@@ -22,6 +22,7 @@
 #include "kernel/process/spawn.h"
 #include "kernel/process/waitq.h"
 #include "kernel/mm/kheap.h"
+#include "drivers/ramdisk/ramdisk.h"
 #include "console/inputs/tty.h"
 #include "kernel/crypto/sha256.h"
 #include "kernel/syscall/nspath.h"
@@ -478,7 +479,8 @@ static void namespace_tests(void)
               info_readdir("", 1, name, sizeof(name), &type) == Nok && strcmp(name, "timezone") == 0 &&
               info_readdir("", 2, name, sizeof(name), &type) == Nok && strcmp(name, "utc_offset") == 0 &&
               info_readdir("memory", 1, name, sizeof(name), &type) == Nok && strcmp(name, "free_kib") == 0 &&
-              info_readdir("memory", 2, name, sizeof(name), &type) == NnotFound, "info_readdir lists direct children");
+              info_readdir("memory", 3, name, sizeof(name), &type) == Nok && strcmp(name, "reserved_kib") == 0 &&
+              info_readdir("memory", 4, name, sizeof(name), &type) == NnotFound, "info_readdir lists direct children");
         check(info_hostname_valid("nyxis", 5) && info_hostname_valid("a-1", 3) && !info_hostname_valid("-a", 2) &&
               !info_hostname_valid("A", 1) && !info_hostname_valid("a b", 3) && !info_hostname_valid("a_b", 3) &&
               !info_hostname_valid("", 0), "hostname format rule");
@@ -586,6 +588,59 @@ static void kheap_tests(void)
           "kpage_alloc returns a zeroed, page-aligned page");
     kpage_free(pg);
     check(pfa_free_count() == pfa0, "kpage_free returned the page");
+}
+
+/* 희소 램디스크 (tmp:/): 쓸 때 할당, 0 쓰기는 할당 안 함, discard 로 반납 */
+#define ST_RD_DISKNO 0x5E1FU
+static void *st_rd_alloc(void) { return kpage_alloc(); }
+static void st_rd_free(void *p) { kpage_free(p); }
+
+static void sparse_ramdisk_tests(void)
+{
+    static void *pages[4];
+    static u8 buf[2 * 4096];
+    u64 pfa0 = pfa_free_count();
+    u32 i;
+    bool ok;
+
+    memset(pages, 0, sizeof(pages));
+    check(ramdisk_init_sparse(ST_RD_DISKNO, 4 * 4096, pages, st_rd_alloc, st_rd_free) == Nok &&
+          ramdisk_pages_in_use(ST_RD_DISKNO) == 0 && pfa_free_count() == pfa0, "sparse ramdisk starts with no pages");
+
+    memset(buf, 0, sizeof(buf));
+    check(ramdisk_write(ST_RD_DISKNO, 0, buf, sizeof(buf), nNULL) == Nok && ramdisk_pages_in_use(ST_RD_DISKNO) == 0,
+          "writing zeros to an empty sparse ramdisk allocates nothing");
+
+    for (i = 0; i < 100; i++)
+        buf[i] = (u8)(i + 1);
+    check(ramdisk_write(ST_RD_DISKNO, 4096 - 50, buf, 100, nNULL) == Nok && ramdisk_pages_in_use(ST_RD_DISKNO) == 2 &&
+          pfa_free_count() == pfa0 - 2, "a write across a page boundary allocates both pages");
+
+    memset(buf, 0xEE, sizeof(buf));
+    ok = ramdisk_read(ST_RD_DISKNO, 4096 - 60, buf, 120, nNULL) == Nok;
+    for (i = 0; i < 120; i++) {
+        u8 want = (i >= 10 && i < 110) ? (u8)(i - 9) : 0;
+
+        if (buf[i] != want)
+            ok = false;
+    }
+    check(ok, "sparse ramdisk reads back data and zeros around it");
+    check(ramdisk_read(ST_RD_DISKNO, 3 * 4096, buf, 4096, nNULL) == Nok && buf[0] == 0 && buf[4095] == 0,
+          "an unallocated page reads as zeros");
+
+    check(ramdisk_discard(ST_RD_DISKNO, 4096, 4096, nNULL) == Nok && ramdisk_pages_in_use(ST_RD_DISKNO) == 1 &&
+          ramdisk_read(ST_RD_DISKNO, 4096, buf, 50, nNULL) == Nok && buf[0] == 0 && buf[49] == 0,
+          "discard of a whole page returns it and it reads as zeros");
+    check(ramdisk_discard(ST_RD_DISKNO, 4096 - 50, 10, nNULL) == Nok && ramdisk_pages_in_use(ST_RD_DISKNO) == 1 &&
+          ramdisk_read(ST_RD_DISKNO, 4096 - 50, buf, 11, nNULL) == Nok && buf[9] == 0 && buf[10] == 11,
+          "partial discard zeroes only the range");
+    memset(buf, 0, 4096);
+    check(ramdisk_write(ST_RD_DISKNO, 0, buf, 4096, nNULL) == Nok && ramdisk_pages_in_use(ST_RD_DISKNO) == 0,
+          "overwriting a whole page with zeros returns it");
+    check(ramdisk_write(ST_RD_DISKNO, 4 * 4096 - 1, buf, 2, nNULL) == Noverflow, "sparse ramdisk rejects writes past the end");
+    buf[0] = 1;
+    (void)ramdisk_write(ST_RD_DISKNO, 2 * 4096, buf, 1, nNULL);
+    check(ramdisk_deinit(ST_RD_DISKNO) == Nok && pfa_free_count() == pfa0, "deinit returns every page");
 }
 
 /* 대기 큐: 깨울 때까지 잠들기, 시간 제한, idle 은 잠들 수 없음 */
@@ -755,6 +810,7 @@ static void functional_tests(void)
     }
 
     kheap_tests();
+    sparse_ramdisk_tests();
     waitq_tests();
     crypto_tests();
     namespace_tests();

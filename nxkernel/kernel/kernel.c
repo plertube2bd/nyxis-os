@@ -22,6 +22,7 @@
 #include "kernel/process/process.h"
 #include "kernel/paging/paging.h"
 #include "kernel/mm/pfa.h"
+#include "kernel/mm/kheap.h"
 #include "console/inputs/tty.h"
 #include "kernel/timer/pit/pit_base.h"
 #include "kernel/error_handling/panic.h"
@@ -40,6 +41,7 @@
 #include "kernel/dev/device.h"
 #include "drivers/pic/pic.h"
 #include "kernel/boot/multiboot2.h"
+#include "kernel/acpi/acpi.h"
 #include "kernel/syscall/syscall.h"
 #include "boot_info.h"
 #include "phys.h"
@@ -200,8 +202,22 @@ static void console_init_from_boot_info(const NTBLI *info)
 #define TMP_SIZE           (16U * 1024U * 1024U)  /* tmp:/ 16 MiB (컴파일 작업 공간으로도 쓴다) */
 #define TMP_BLOCK_SHIFT    12U
 
-/* tmp:/ 의 RAM 은 커널 이미지(BSS)에 두지 않는다: 부트로더가 커널을 고정 주소에 올릴 때 그만큼 연속된
- * 메모리가 필요해져 부팅이 실패할 수 있다. 대신 pfa 가 부팅 때 떼어 둔 연속 영역을 쓴다 (pfa_set_boot_reserve) */
+/* tmp:/ 는 희소 램디스크다 (ramdisk_init_sparse): 블록을 처음 쓸 때 페이지를 할당하고(kpage_alloc), 파일을 지워
+ * nyfs 가 블록을 해제하면 돌려준다(discard). 그래서 tmp:/ 는 담고 있는 만큼만 RAM 을 쓴다. 여기 있는 것은
+ * 페이지 표뿐이다 (16MiB / 4KiB * 8 = 32KiB). 크기는 상한이며, 그만큼의 RAM 이 남아 있다고 보장하지는 않는다
+ * (RAM 이 모자라면 쓰기가 NoutOfMemory 로 실패한다). */
+static void *g_tmp_pages[TMP_SIZE / RAMDISK_PAGE_SIZE];
+
+static void *tmp_page_alloc(void)
+{
+    return kpage_alloc();       /* 0 으로 채워져 있다 */
+}
+
+static void tmp_page_free(void *page)
+{
+    kpage_free(page);
+}
+
 static process_t *g_init = nNULL;
 
 static bool mount_root(NTBLI *info)
@@ -237,17 +253,7 @@ static void mount_tmp(NTBLI *info)
     nyfs_mount_params_t params;
     Nstatus status;
 
-    {
-        u64 phys;
-
-        status = pfa_boot_reserve(&phys);
-        if (NSTATUS_IS_ERR(status)) {
-            printk_warn("tmp: no contiguous memory for tmp:/ (%r)\n", status);
-            return;
-        }
-        memset((void *)(usize)phys_to_virt(phys), 0, TMP_SIZE);
-        status = ramdisk_init(TMP_DISKNO, (usize)phys_to_virt(phys), TMP_SIZE, info);
-    }
+    status = ramdisk_init_sparse(TMP_DISKNO, TMP_SIZE, g_tmp_pages, tmp_page_alloc, tmp_page_free);
     if (NSTATUS_IS_ERR(status)) {
         printk_warn("tmp: ramdisk init failed: %r\n", status);
         return;
@@ -257,6 +263,7 @@ static void mount_tmp(NTBLI *info)
     params.info = info;
     params.read = ramdisk_read;
     params.write = ramdisk_write;
+    params.discard = ramdisk_discard;
     params.total_blocks = TMP_SIZE / (1U << TMP_BLOCK_SHIFT);
     params.block_size_shift = (u8)TMP_BLOCK_SHIFT;
     params.root_mode = 0777;
@@ -340,6 +347,7 @@ static void start_init(void)
         g_init = nNULL;
         return;
     }
+    g_init->critical = true;            /* 보호 프로세스: root 도 신호로 끝낼 수 없다 (signal_protected) */
     printk_ok("init started (pid %u)\n", g_init->pid);
 }
 
@@ -401,6 +409,7 @@ extern void nyx_selftest(void);
 void kernel_main(u32 boot_kind, u64 boot_info_phys)
 {
     Nstatus status;
+    Nstatus acpi_status;
 
     cli();
 
@@ -439,6 +448,10 @@ void kernel_main(u32 boot_kind, u64 boot_info_phys)
     paging_enable();
     boot_info_relocate();
 
+    /* ACPI 테이블은 pfa_init 이 펌웨어 영역을 회수하기 전에 읽어 둔다 (acpi.h). 결과는 콘솔이 생긴 뒤 출력 */
+    acpi_status = acpi_init(g_boot_info.Rsdp);
+    g_boot_info.Rsdp = nNULL;           /* 이후로 RSDP 를 가리키는 메모리는 보장되지 않는다 */
+
     /* 4.5. 물리 프레임 할당자: HHDM 이 막 켜졌으므로 이제부터 물리 페이지를 동적으로 내줄 수
      * 있다. 커널 이미지 자신과 initrd 의 물리 범위는 절대 자유 목록에 들어가면 안 된다 —
      * Multiboot2(E820 기반) 는 그 두 영역도 "사용 가능"으로 보고할 수 있으므로 메모리 타입과
@@ -449,7 +462,6 @@ void kernel_main(u32 boot_kind, u64 boot_info_phys)
         u64 initrd_phys_start = g_boot_info.initrd_base ? virt_to_phys(g_boot_info.initrd_base) : 0;
         u64 initrd_phys_end = g_boot_info.initrd_base ? initrd_phys_start + g_boot_info.initrd_size : 0;
 
-        pfa_set_boot_reserve(TMP_SIZE);    /* tmp:/ 의 연속 RAM (mount_tmp) */
         status = pfa_init(&g_boot_info, kernel_phys_start, kernel_phys_end,
                           initrd_phys_start, initrd_phys_end, paging_hhdm_limit());
         if (NSTATUS_IS_ERR(status))
@@ -465,8 +477,11 @@ void kernel_main(u32 boot_kind, u64 boot_info_phys)
            (unsigned long)g_boot_info.initrd_size,
            g_boot_info.width, g_boot_info.height);
     printk_ok("GDT/IDT/PIC ready, paging enabled (higher-half, HHDM, W^X, NX, WP)\n");
-    printk_ok("Physical frame allocator ready: %lu free pages (%lu MiB)\n",
+    printk_ok("Physical frame allocator ready: %lu free pages (%lu MiB, incl. reclaimed firmware boot memory)\n",
            (unsigned long)pfa_free_count(), (unsigned long)(pfa_free_count() * PAGE_SIZE / (1024UL * 1024UL)));
+    if (NSTATUS_IS_ERR(acpi_status))
+        printk_warn("acpi: %s: power off falls back to emulator ports\n",
+                    acpi_status == NnotFound ? "no usable RSDP/FADT" : "\\_S5 or PM1 control block not found");
 
     /* 6. 프로세스 / 타이머 */
     status = process_init();

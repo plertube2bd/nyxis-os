@@ -8,7 +8,10 @@
  * roi:/<uid>/shell (관리자가 정한 로그인 셸, 사용자는 읽기만)을 읽고, 그 셸을 토큰으로 실행한다 (셸은 그
  * 사용자의 신원으로 시작하고 토큰은 소모된다). 값이 없거나 app:/ 실행 파일이 아니면 app:/nysh.run. 셸이 끝나면
  * 다시 로그인 프롬프트로 돌아간다 — 다시 쓰려면 다시 인증해야 한다.
+ * 셸은 콘솔 세션(NX_SPAWN_CONSOLE_SESSION)으로 띄운다: 그 셸 프로세스 자신은 dev:/console(화면 + 키보드)을 열어
+ * ntui 같은 데스크톱을 직접 그릴 수 있다. 셸이 끝나면 커널이 화면/키보드를 콘솔로 돌려준다.
  * 비밀번호가 틀리면 커널이 1초 지연시킨다 (사용자가 없어도 같은 메시지와 같은 지연).
+ * 설정 prompt (nx_setting_get: app:/login.run/prompt): 로그인 프롬프트 문구 (기본 "nyxis os login: ").
  */
 #include "nyx.h"
 
@@ -74,11 +77,31 @@ static void shell_name(const char *shell, char *name, unsigned long max)
     name[n] = '\0';
 }
 
+/* 설정 prompt (app:/login.run/prompt). 없거나 제어 문자가 있으면 기본 "nyxis os login: " */
+static void load_prompt(char *prompt, unsigned long max)
+{
+    long n = nx_setting_get("login", "prompt", prompt, max);
+    long i;
+
+    for (i = 0; n > 0 && i < n; i++) {
+        if ((unsigned char)prompt[i] < ' ' || (unsigned char)prompt[i] == 0x7F)
+            n = -1;
+    }
+    if (n <= 0) {
+        static const char def[] = "nyxis os login: ";
+
+        nx_memcpy(prompt, def, sizeof(def));
+    }
+}
+
 int main(int argc, char **argv, char **envp)
 {
+    char prompt[80];
+
     (void)argc;
     (void)argv;
     (void)envp;
+    load_prompt(prompt, sizeof(prompt));
 
     for (;;) {
         char name[64];
@@ -91,7 +114,8 @@ int main(int argc, char **argv, char **envp)
         long n;
         int code = 0;
 
-        nx_puts("\nnyxis os login: ");
+        nx_puts("\n");
+        nx_puts(prompt);
         n = nx_readline(name, sizeof(name));
         if (n <= 0)
             continue;                      /* 빈 줄 / EOF */
@@ -116,7 +140,7 @@ int main(int argc, char **argv, char **envp)
         shell_name(shell_path, shell_arg0, sizeof(shell_arg0));
         shell_argv[0] = shell_arg0;
         shell_argv[1] = 0;
-        shell = nx_spawn(shell_path, shell_argv, 0, token);
+        shell = nx_spawn_ex(shell_path, shell_argv, 0, token, NX_SPAWN_CONSOLE_SESSION);
         if (shell < 0 && nx_strcmp(shell_path, DEFAULT_SHELL) != 0) {
             /* 정해진 셸을 못 띄우면(없는 파일 등) 기본 셸로 (실패한 spawn 은 토큰을 소모하지 않는다) */
             nx_puts("login: cannot start ");
@@ -124,7 +148,7 @@ int main(int argc, char **argv, char **envp)
             nx_puts(", using " DEFAULT_SHELL "\n");
             nx_memcpy(shell_path, DEFAULT_SHELL, sizeof(DEFAULT_SHELL));
             nx_memcpy(shell_arg0, "nysh", 5);
-            shell = nx_spawn(shell_path, shell_argv, 0, token);
+            shell = nx_spawn_ex(shell_path, shell_argv, 0, token, NX_SPAWN_CONSOLE_SESSION);
         }
         if (shell < 0) {
             nx_puts("login: cannot start ");

@@ -8,6 +8,7 @@
 #include "kernel/syscall/nspath.h"
 #include "kernel/exec/exec.h"
 #include "kernel/ipc/pipe.h"
+#include "console/inputs/tty.h"
 #include "kernel/security/perm.h"
 #include "kernel/mm/kheap.h"
 #include "kernel/process/process.h"
@@ -238,6 +239,52 @@ i64 sys_pipe_create(const u64 *a)
     if (NSTATUS_IS_ERR(status)) {
         (void)nx_handle_close(table, h[0]);     /* 두 끝을 닫으면 파이프도 해제된다 */
         (void)nx_handle_close(table, h[1]);
+        return (i64)status;
+    }
+    return 0;
+}
+
+/* NxPtyCreate(u64 out[2], flags) -> 0. out[0] = 주 끝, out[1] = 종속 끝 (콘솔 핸들) */
+i64 sys_pty_create(const u64 *a)
+{
+    nx_handle_table_t *table = cur_handles();
+    nx_handle_t *ms;
+    nx_handle_t *ss;
+    u64 h[2];
+    struct pty *p;
+    u32 rights = (u32)(NX_RIGHT_READ | NX_RIGHT_WRITE | NX_RIGHT_STAT | NX_RIGHT_DUP);
+    u32 hflags = (a[1] & NX_DUP_CLOEXEC) ? (u32)NX_HFLAG_CLOEXEC : 0U;
+    Nstatus status;
+
+    if (!table)
+        return (i64)NnotInitialized;
+    if (a[1] & ~NX_DUP_CLOEXEC)
+        return (i64)NinvalidArg;
+
+    status = nx_handle_alloc(table, NX_HANDLE_PTY, rights, &h[0], &ms);
+    if (NSTATUS_IS_ERR(status))
+        return (i64)status;
+    status = nx_handle_alloc(table, NX_HANDLE_CONSOLE, rights, &h[1], &ss);
+    if (NSTATUS_IS_ERR(status)) {
+        nx_handle_discard(ms);
+        return (i64)status;
+    }
+    status = pty_create(&p);                /* 주 끝 참조 1, 종속 끝 참조 1 */
+    if (NSTATUS_IS_ERR(status)) {
+        nx_handle_discard(ss);
+        nx_handle_discard(ms);
+        return (i64)status;
+    }
+    ms->pty = p;
+    ms->hflags = hflags;
+    ss->tty = pty_tty(p);
+    ss->console_fd = 0;                     /* 입력을 받는 쪽 (poll, 에코 설정) */
+    ss->hflags = hflags;
+
+    status = copy_to_user(a[0], h, sizeof(h));
+    if (NSTATUS_IS_ERR(status)) {
+        (void)nx_handle_close(table, h[1]);
+        (void)nx_handle_close(table, h[0]);     /* 두 끝을 닫으면 pty 도 해제된다 */
         return (i64)status;
     }
     return 0;

@@ -44,6 +44,9 @@ void sched_timer_tick(void)
 {
     process_t *self = current_process;
 
+    if (self)
+        self->cpu_ticks++;              /* ntop: 이 틱 동안 CPU 를 쓰고 있던 프로세스 (idle 포함) */
+
     /* idle(pid 0)은 사용자 모드가 아니라서 선점 대상이 아니다. idle 루프는 스스로 schedule() 한다. */
     if (!self || self->pid == 0)
         return;

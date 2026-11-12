@@ -10,6 +10,10 @@
 #include "console/outputs/conout.h"
 #include "console/outputs/serial.h"
 #include "console/inputs/tty.h"
+#include "console/inputs/inputs_base.h"
+#include "console/outputs/outputs_base.h"
+#include "console/outputs/ansi.h"
+#include "kernel/syscall/uaccess.h"
 #include "drivers/ramdisk/ramdisk.h"
 #include "interrupt.h"
 #include "phys.h"
@@ -25,6 +29,8 @@ static nx_device_t g_devices[DEV_MAX];
 static u32 g_device_count = 0;
 static u8 g_rd0[RD0_SIZE] __attribute__((aligned(4096)));
 static NTBLI *g_info = nNULL;
+static nx_device_t *g_fb0 = nNULL;
+static nx_device_t *g_console_dev = nNULL;
 
 static nx_device_t *add_device(const char *name, u32 kind)
 {
@@ -54,6 +60,22 @@ void device_init(const NTBLI *info, u32 rootdisk_no, u64 rootdisk_size)
             d->height = info->height;
             d->pitch = info->pixels_per_scan_line * 4U;
             d->bpp = 32;
+            d->format = info->pixel_format == NTBLI_PIXEL_RGB ? NX_FB_FORMAT_XBGR : NX_FB_FORMAT_XRGB;
+            g_fb0 = d;
+        }
+        /* 같은 프레임버퍼 + 키보드 (콘솔 세션용) */
+        if (g_fb0 && (info->pixel_format == NTBLI_PIXEL_RGB || info->pixel_format == NTBLI_PIXEL_BGR)) {
+            d = add_device("console", NX_DEV_CONSOLE);
+            if (d) {
+                d->phys = g_fb0->phys;
+                d->size = g_fb0->size;
+                d->width = g_fb0->width;
+                d->height = g_fb0->height;
+                d->pitch = g_fb0->pitch;
+                d->bpp = 32;
+                d->format = g_fb0->format;
+                g_console_dev = d;
+            }
         }
     }
 
@@ -126,8 +148,19 @@ Nstatus device_open(const char *name, bool write, nx_device_t **out)
             else
                 d->readers++;
         }
+    } else if (d->kind == NX_DEV_CONSOLE) {
+        /* 콘솔 세션 자신(자식은 아니다)이나 root 만. fb0 과 배타적 */
+        if (current_process->uid != 0 && !current_process->console_session) {
+            status = Npermission;
+        } else if (d->owner || (g_fb0 && g_fb0->owner)) {
+            status = Nbusy;
+        } else {
+            d->owner = current_process;
+            conout_set_fb_enabled(false);
+            keyboard_claim(true);
+        }
     } else {
-        if (d->owner) {
+        if (d->owner || (d->kind == NX_DEV_FRAMEBUFFER && g_console_dev && g_console_dev->owner)) {
             status = Nbusy;
         } else {
             d->owner = current_process;
@@ -168,7 +201,7 @@ void device_close(nx_device_t *dev, struct process *owner, bool write)
         return;
     }
 
-    if (dev->kind == NX_DEV_FRAMEBUFFER) {
+    if (dev->kind == NX_DEV_FRAMEBUFFER || dev->kind == NX_DEV_CONSOLE) {
         if (dev->mapped_va && owner->addrspace.pml4) {
             u64 off;
 
@@ -177,6 +210,14 @@ void device_close(nx_device_t *dev, struct process *owner, bool write)
         }
         dev->mapped_va = 0;
         conout_set_fb_enabled(true);
+        if (dev->kind == NX_DEV_CONSOLE) {
+            /* 키보드를 콘솔 터미널로 돌려주고, 세션이 그린 화면을 지운다 (다음 로그인 화면이 깨끗하게) */
+            keyboard_claim(false);
+            ansi_reset();
+            conout_erase_display(2);
+            conout_set_cursor(0, 0);
+            conout_set_cursor_visible(true);
+        }
     } else {
         if (owner->io_count) {
             owner->io_base = 0;
@@ -277,7 +318,7 @@ Nstatus device_map_mmio(nx_device_t *dev, struct process *p, u64 *out_va)
     u64 off;
     u64 pages;
 
-    if (dev->kind != NX_DEV_FRAMEBUFFER)
+    if (dev->kind != NX_DEV_FRAMEBUFFER && dev->kind != NX_DEV_CONSOLE)
         return Nunsupported;
     if (dev->owner != p || !p->addrspace.pml4)
         return Npermission;
@@ -320,6 +361,7 @@ void device_info(const nx_device_t *dev, struct nx_devinfo *out)
     out->height = dev->height;
     out->pitch = dev->pitch;
     out->bpp = dev->bpp;
+    out->format = dev->format;
     out->io_base = dev->io_base;
     out->io_count = dev->io_count;
 }
@@ -336,4 +378,73 @@ Nstatus device_ioperm(nx_device_t *dev, struct process *p, bool on)
     if (p == current_process)
         gdt_set_io_permission(p->io_base, p->io_count);
     return NSTATUS_OK;
+}
+
+i64 device_console_read_user(nx_device_t *dev, struct process *p, u64 ubuf, u64 len)
+{
+    struct nx_keyevent ev[16];
+    u64 max = len / sizeof(ev[0]);
+    u64 flags;
+    u32 n;
+
+    if (dev->kind != NX_DEV_CONSOLE)
+        return (i64)Nunsupported;
+    if (dev->owner != p)
+        return (i64)Npermission;
+    if (max == 0)
+        return (i64)NinvalidArg;
+    if (max > sizeof(ev) / sizeof(ev[0]))
+        max = sizeof(ev) / sizeof(ev[0]);
+
+    flags = irq_save();
+    while (!keyboard_events_ready()) {
+        Nstatus status = waitq_sleep_locked(keyboard_waitq(), 0);
+
+        if (NSTATUS_IS_ERR(status)) {
+            irq_restore(flags);
+            return (i64)status;
+        }
+    }
+    n = keyboard_take_events(ev, (u32)max);
+    irq_restore(flags);
+    {
+        Nstatus status = copy_to_user(ubuf, ev, (usize)n * sizeof(ev[0]));
+
+        if (NSTATUS_IS_ERR(status))
+            return (i64)status;
+    }
+    return (i64)((u64)n * sizeof(ev[0]));
+}
+
+Nstatus device_console_font(nx_device_t *dev, struct process *p, u64 uarg)
+{
+    static u8 g_font_copy[FONT_CHAR_COUNT * 16U * 16U];     /* 셀이 가장 클 때 (16x16 비트맵) */
+    struct nx_fontinfo fi;
+    usize need;
+    Nstatus status;
+
+    if (dev->kind != NX_DEV_CONSOLE)
+        return Nunsupported;
+    if (dev->owner != p)
+        return Npermission;
+    status = copy_from_user(&fi, uarg, sizeof(fi));
+    if (NSTATUS_IS_ERR(status))
+        return status;
+
+    need = font_export(nNULL, 0);
+    if (need > sizeof(g_font_copy))
+        return Noverflow;
+    fi.cell_w = font_cell_width();
+    fi.cell_h = font_cell_height();
+    fi.first = FONT_FIRST_CHAR;
+    fi.count = FONT_CHAR_COUNT;
+    if (fi.buf) {
+        if (fi.cap < need)
+            return NbufferOverflow;
+        (void)font_export(g_font_copy, sizeof(g_font_copy));
+        status = copy_to_user(fi.buf, g_font_copy, need);
+        if (NSTATUS_IS_ERR(status))
+            return status;
+    }
+    return copy_to_user(uarg, &fi, sizeof(fi));
 }

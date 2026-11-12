@@ -135,48 +135,62 @@ static void spin_delay(u32 n)
         cpu_pause();
 }
 
-Nstatus acpi_power_off(const void *rsdp_virt)
+/* 부팅 때 읽어 둔 S5 정보 (acpi_init). 이후로는 펌웨어 메모리를 다시 읽지 않는다 */
+static struct {
+    bool valid;
+    u32 pm1a;
+    u32 pm1b;
+    u32 typ_a;
+    u32 typ_b;
+    u32 smi_cmd;
+    u8  acpi_enable;
+} g_s5;
+
+Nstatus acpi_init(const void *rsdp_virt)
 {
     const u8 *fadt;
     const u8 *dsdt = nNULL;
-    u32 pm1a;
-    u32 pm1b;
-    u32 typ_a = 0;
-    u32 typ_b = 0;
     u32 flen;
 
-    if (rsdp_virt && (fadt = find_fadt((const u8 *)rsdp_virt)) != nNULL) {
-        flen = rd32(fadt + 4);
-        if (flen >= 148 && rd64(fadt + 140) != 0)
-            dsdt = map_table(rd64(fadt + 140), "DSDT");
-        if (!dsdt)
-            dsdt = map_table((u64)rd32(fadt + 40), "DSDT");
-        pm1a = rd32(fadt + 64);
-        pm1b = rd32(fadt + 68);
+    memset(&g_s5, 0, sizeof(g_s5));
+    if (!rsdp_virt || (fadt = find_fadt((const u8 *)rsdp_virt)) == nNULL) {
+        return NnotFound;
+    }
+    flen = rd32(fadt + 4);
+    if (flen >= 148 && rd64(fadt + 140) != 0)
+        dsdt = map_table(rd64(fadt + 140), "DSDT");
+    if (!dsdt)
+        dsdt = map_table((u64)rd32(fadt + 40), "DSDT");
+    g_s5.pm1a = rd32(fadt + 64);
+    g_s5.pm1b = rd32(fadt + 68);
+    g_s5.smi_cmd = rd32(fadt + 48);
+    g_s5.acpi_enable = fadt[52];
+    if (!dsdt || !g_s5.pm1a || !find_s5(dsdt, &g_s5.typ_a, &g_s5.typ_b)) {
+        return Nunsupported;
+    }
+    g_s5.valid = true;
+    return NSTATUS_OK;
+}
 
-        if (dsdt && pm1a && find_s5(dsdt, &typ_a, &typ_b)) {
-            u32 smi_cmd = rd32(fadt + 48);
-            u8 acpi_enable = fadt[52];
+Nstatus acpi_power_off(void)
+{
+    if (g_s5.valid) {
+        /* ACPI 모드로 (SCI_EN) */
+        if (!(inw((u16)g_s5.pm1a) & 1U) && g_s5.smi_cmd && g_s5.acpi_enable) {
+            u32 tries;
 
-            /* ACPI 모드로 (SCI_EN) */
-            if (!(inw((u16)pm1a) & 1U) && smi_cmd && acpi_enable) {
-                u32 tries;
-
-                outb((u16)smi_cmd, acpi_enable);
-                for (tries = 0; tries < 300 && !(inw((u16)pm1a) & 1U); tries++)
-                    spin_delay(100000);
-            }
-
-            printk("acpi: entering S5 (SLP_TYPa=%u SLP_TYPb=%u)\n", typ_a, typ_b);
-            outw((u16)pm1a, (u16)((typ_a << 10) | SLP_EN));
-            if (pm1b)
-                outw((u16)pm1b, (u16)((typ_b << 10) | SLP_EN));
-            spin_delay(10000000);
-        } else {
-            printk("acpi: \\_S5 or PM1 control block not found\n");
+            outb((u16)g_s5.smi_cmd, g_s5.acpi_enable);
+            for (tries = 0; tries < 300 && !(inw((u16)g_s5.pm1a) & 1U); tries++)
+                spin_delay(100000);
         }
+
+        printk("acpi: entering S5 (SLP_TYPa=%u SLP_TYPb=%u)\n", g_s5.typ_a, g_s5.typ_b);
+        outw((u16)g_s5.pm1a, (u16)((g_s5.typ_a << 10) | SLP_EN));
+        if (g_s5.pm1b)
+            outw((u16)g_s5.pm1b, (u16)((g_s5.typ_b << 10) | SLP_EN));
+        spin_delay(10000000);
     } else {
-        printk("acpi: no usable RSDP/FADT\n");
+        printk("acpi: no usable FADT/\\_S5 found at boot\n");
     }
 
     /* 마지막 수단: 에뮬레이터 고정 포트 (QEMU q35/piix, 옛 Bochs/QEMU) */

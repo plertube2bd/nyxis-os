@@ -75,6 +75,11 @@ int __nl_handle_to_fd(long h);
 long __nl_dup_ex(long h, int how, int arg, int cloexec);
 int __nl_handle_cloexec(long h, int set);          /* set: -1 = 조회만, 0/1 = 바꾸기. 반환: 지금 값 또는 -1 */
 int __nl_pipe(long out[2], int cloexec);           /* out[0] 읽기, out[1] 쓰기 */
+int __nl_openpty(long out[2], int cloexec);        /* 의사 터미널: out[0] 주 끝, out[1] 종속 끝. 없으면 ENOSYS */
+int __nl_tty_set_winsize(long h, const unsigned short ws[4]);  /* 행, 열, x/y 픽셀 (pty 의 어느 끝이든) */
+/* 장치 (nx64 의 화면): NxDeviceCommand / NxDeviceMapMMIO. 없는 플랫폼은 -1 / NULL + ENOSYS */
+long __nl_devcmd(long h, unsigned long cmd, unsigned long arg);
+void *__nl_map_mmio(long h);
 
 #define NL_T_FILE  1
 #define NL_T_DIR   2
@@ -104,6 +109,13 @@ int __nl_readdir(const char *path, unsigned long index, char *name, size_t cap, 
 int __nl_sleep_ms(unsigned long ms);
 /* 신원. name 은 모르면 빈 문자열 */
 int __nl_identity(unsigned int *uid, unsigned int *gid, char *name, size_t cap);
+
+/* 서비스 채널 (svc:/, nx64api). 없는 플랫폼은 -1 + ENOSYS. 핸들은 __nl_close 로 닫는다 */
+long __nl_channel_create(const char *path, int public_);       /* 받는 쪽 핸들 */
+long __nl_channel_open(const char *path);                      /* 보내는 쪽 핸들 */
+long __nl_channel_send(long h, const void *buf, size_t len);
+/* sender: pid, uid, gid (커널이 붙인다). timeout_ms < 0 이면 끝없이. 메시지 길이 */
+long __nl_channel_receive(long h, void *buf, size_t cap, unsigned long sender[3], long timeout_ms);
 
 /* 프로세스. 핸들 h 는 플랫폼이 정한 값 (Nyxis: 프로세스 핸들, Linux: pid) */
 /* inherit: 부모의 fd 를 같은 번호로 물려준다 (FD_CLOEXEC 제외) */
@@ -136,9 +148,23 @@ long __nl_proc_group(long h, long pgid);
 /* 콘솔의 포그라운드 그룹: pgid = -1 이면 조회, 0 이면 없음(Nyxis). 반환 = 지금 값(조회) 또는 0, 오류 -1 */
 long __nl_tty_foreground(long h, long pgid);
 void __nl_proc_release(long h);                    /* 기다린 뒤 핸들 반납 */
+/* 시스템의 프로세스 목록 (nx64 의 ntop). 살아 있는 프로세스 수 (max 보다 클 수 있다), 없는 플랫폼은 -1 + ENOSYS */
+struct __nl_procent {
+    unsigned long pid, ppid, pgid, uid;
+    int state;                  /* 0 READY 1 RUNNING 2 BLOCKED */
+    unsigned int flags;         /* 1 사용자 프로세스, 2 콘솔 세션, 4 pty 터미널, 8 보호 프로세스 */
+    unsigned long cpu_ticks, start_tick, mem_kib;
+    char name[32];
+    char user[32];
+};
+int __nl_proc_list(struct __nl_procent *out, int max);
+int __nl_signal_pid(unsigned long pid, int sig);   /* 핸들 없이 pid 로 (같은 uid 또는 root) */
+unsigned long __nl_timer_hz(void);                 /* cpu_ticks 의 단위 (모르면 100) */
+int __nl_check_password(const char *name, const char *password);   /* 맞으면 0, 틀리면 -1 + EACCES */
 
 /* 경로 규칙 */
 int __nl_path_is_absolute(const char *path);
+int __nl_can_list(const char *abs);             /* 자식 목록을 읽을 수 있는 노드인지 (opendir/chdir) */
 size_t __nl_path_root_len(const char *abs);        /* "tmp:/" -> 5, "/" -> 1 */
 int __nl_initial_cwd(char *buf, size_t cap);       /* 0 성공 */
 void __nl_cwd_changed(const char *abs);            /* 플랫폼에 알린다 (Linux: chdir) */

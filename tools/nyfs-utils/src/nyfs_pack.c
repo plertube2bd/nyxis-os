@@ -4,8 +4,10 @@
  *   nyfs-pack -s <크기> -o <이미지> <매니페스트>
  *
  * 매니페스트: 한 줄에 한 항목 ('#' 주석, 빈 줄 무시). 부모 디렉터리가 먼저 나와야 한다.
- *   d <이미지 경로> <모드(8진수)> <uid> <gid>
+ *   d <이미지 경로> <모드(8진수)> <uid> <gid> [<호스트 원본 파일>]
  *   f <이미지 경로> <모드(8진수)> <uid> <gid> <호스트 원본 파일>
+ * nyfs 의 노드는 파일이든 디렉터리든 하나의 오브젝트라 디렉터리도 내용(데이터 스트림)을 가질 수 있다:
+ * d 에 원본 파일을 주면 그 내용을 디렉터리의 데이터로 넣는다 (예: 앱 = ELF 를 내용으로, 기본 설정을 자식으로).
  * "d / ..." 는 루트 디렉터리의 모드/소유자를 정한다.
  *
  * 커널 nyfs 와 같은 코어 라이브러리(nyfs_core.c)를 쓰므로 만들어진 이미지는 커널이 그대로 마운트한다
@@ -100,7 +102,7 @@ static int apply_line(nyfs_volume_t *vol, char *line, unsigned lineno)
             fprintf(stderr, "nyfs-pack: line %u: cannot create %s (status %d)\n", lineno, path, (int)st);
             return -1;
         }
-        if (kind[0] == 'f' && copy_file(vol, ino, src) != 0)
+        if (src[0] != '\0' && copy_file(vol, ino, src) != 0)
             return -1;
     }
 

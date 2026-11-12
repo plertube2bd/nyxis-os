@@ -23,6 +23,7 @@
 #include "kernel/process/umem.h"
 #include "kernel/mm/kheap.h"
 #include "console/inputs/tty.h"
+#include "console/inputs/inputs_base.h"
 #include "kernel/syscall/nspath.h"
 #include "kernel/security/auth.h"
 #include "kernel/ipc/channel.h"
@@ -161,6 +162,12 @@ Nstatus user_vfs_path(u64 uptr, char *kpath, usize kmax, u32 op)
     return nsp_check_protected(kpath, op);
 }
 
+/* 콘솔 핸들의 터미널 (NULL = 물리 콘솔) */
+static tty_t *slot_tty(const nx_handle_t *slot)
+{
+    return slot->tty ? slot->tty : tty_console();
+}
+
 /*
  * 표준 스트림 장치 (누구나 연다):
  *   dev:/tty                    콘솔 터미널 자체. 새 콘솔 핸들 (리디렉션과 무관하게 화면/키보드)
@@ -188,6 +195,8 @@ static i64 open_stream(const char *name, u64 flags, nx_handle_table_t *table)
         if (NSTATUS_IS_ERR(status))
             return (i64)status;
         slot->console_fd = (flags & NX_O_READ) ? 0U : 1U;     /* 0 = 입력을 받는 콘솔 핸들 (poll, 에코 설정) */
+        slot->tty = current_process->ctty;                    /* 제어 터미널 (NULL = 물리 콘솔) */
+        tty_retain(slot->tty);
         return (i64)handle;
     }
 
@@ -306,6 +315,7 @@ static i64 sys_open(const u64 *a)
     nx_handle_t *slot;
     u64 handle;
     u64 flags = a[1];
+    u64 flags_nodes;
     u32 rights;
     u32 kind = 0;
     Nstatus status;
@@ -314,10 +324,14 @@ static i64 sys_open(const u64 *a)
         return (i64)NnotInitialized;
     if ((flags & ~NX_O_MASK) != 0 || flags == 0)
         return (i64)NinvalidArg;
+    if ((flags & NX_O_TRUNC) && !(flags & NX_O_WRITE))
+        return (i64)NinvalidArg;               /* 자르기는 쓰기와 함께만 */
 
     status = user_path(a[0], kpath, sizeof(kpath), &kind);
     if (NSTATUS_IS_ERR(status))
         return (i64)status;
+    flags_nodes = flags;
+    flags &= ~(u64)NX_O_TRUNC;                  /* 장치/서비스/info 에는 의미가 없다 */
     if (kind == NSP_KIND_DEV)
         return open_device(kpath, flags, table);
     if (kind == NSP_KIND_SVC)
@@ -342,6 +356,8 @@ static i64 sys_open(const u64 *a)
         char dummy = 0;
 
         status = vfs_write(&file, &dummy, 0, &written);
+        if (!NSTATUS_IS_ERR(status) && (flags_nodes & NX_O_TRUNC))
+            status = vfs_truncate(&file);       /* 내용만 0 바이트로 (자식은 그대로) */
         if (NSTATUS_IS_ERR(status)) {
             (void)vfs_close(&file);
             return (i64)status;
@@ -407,7 +423,7 @@ static i64 sys_read(const u64 *a)
         /* 콘솔 입력: 완성된 줄이 생길 때까지 잠든다 (tty.h). 한 번에 최대 한 줄. 0 = EOF(Ctrl-D) */
         usize got = 0;
 
-        status = tty_read((char *)chunk, (usize)(len < IO_CHUNK ? len : IO_CHUNK), &got);
+        status = tty_read(slot_tty(slot), (char *)chunk, (usize)(len < IO_CHUNK ? len : IO_CHUNK), &got);
         if (NSTATUS_IS_ERR(status))
             return (i64)status;
         status = copy_to_user(buf, chunk, got);   /* 실패하면 이 줄은 버려진다 (사용자 버퍼가 잘못됨) */
@@ -415,6 +431,12 @@ static i64 sys_read(const u64 *a)
             return (i64)status;
         return (i64)got;
     }
+
+    if (slot->type == NX_HANDLE_PTY)
+        return pty_master_read_user(slot->pty, buf, len);
+
+    if (slot->type == NX_HANDLE_DEVICE && slot->dev->kind == NX_DEV_CONSOLE)
+        return device_console_read_user(slot->dev, current_process, buf, len);
 
     if (slot->type == NX_HANDLE_DEVICE) {
         if (slot->dev->kind == NX_DEV_BLOCK && (len % NX_BLOCK_SECTOR) != 0)
@@ -517,6 +539,8 @@ static i64 sys_write(const u64 *a)
             return (i64)Npermission;
         return pipe_write_user(slot->pipe, buf, len);
     }
+    if (slot->type == NX_HANDLE_PTY)
+        return pty_master_write_user(slot->pty, buf, len);
     if (slot->type == NX_HANDLE_FILE && slot->of->append) {
         /* 끝으로 옮기고 바로 쓴다: 커널 안에서는 선점되지 않으므로 다른 쓰기가 끼어들지 않는다 */
         vfs_stat_t st;
@@ -535,7 +559,16 @@ static i64 sys_write(const u64 *a)
             return total ? (i64)total : (i64)status;
 
         if (slot->type == NX_HANDLE_CONSOLE) {
-            tty_write((const char *)chunk, n);   /* 터미널 장치로 바로 (printk 를 거치지 않는다) */
+            /* 터미널 장치로 바로 (printk 를 거치지 않는다). pty 는 주 끝이 읽을 때까지 잠들 수 있다 */
+            usize done = 0;
+
+            status = tty_write(slot_tty(slot), (const char *)chunk, n, &done);
+            if (NSTATUS_IS_ERR(status))
+                return total ? (i64)total : (i64)status;
+            if (done < n) {
+                total += done;
+                break;
+            }
         } else if (slot->type == NX_HANDLE_DEVICE) {
             usize done = 0;
 
@@ -664,6 +697,8 @@ static i64 sys_stat(const u64 *a)
         st.type = slot->info_dir ? NX_TYPE_DIR : NX_TYPE_FILE;
         st.size = slot->info_len;
         st.mode = slot->info_dir ? 0555U : 0444U;   /* 누구나 읽기만 */
+    } else if (slot->type == NX_HANDLE_PTY) {
+        st.type = NX_TYPE_PTY;
     } else if (slot->type == NX_HANDLE_PIPE) {
         st.type = NX_TYPE_PIPE;
         st.size = slot->pipe->count;
@@ -778,8 +813,12 @@ static i64 sys_process_create(const u64 *a)
 
     if (!table)
         return (i64)NnotInitialized;
-    if (a[4] & ~NX_SPAWN_INHERIT)
+    if (a[4] & ~(NX_SPAWN_INHERIT | NX_SPAWN_CONSOLE_SESSION | NX_SPAWN_CRITICAL))
         return (i64)NinvalidArg;
+    if ((a[4] & NX_SPAWN_CRITICAL) && (current_process->uid != 0 || !current_process->critical))
+        return (i64)Npermission;            /* 보호 프로세스는 보호 프로세스(init)만 만든다 */
+    if ((a[4] & NX_SPAWN_CONSOLE_SESSION) && current_process->uid != 0)
+        return (i64)Npermission;            /* 콘솔 세션은 로그인(root)만 만든다 */
 
     status = user_vfs_path(a[0], path, sizeof(path), NSP_OP_OPEN);
     if (NSTATUS_IS_ERR(status))
@@ -849,6 +888,9 @@ static i64 sys_process_create(const u64 *a)
             return (i64)status;
         }
     }
+    proc->console_session = (a[4] & NX_SPAWN_CONSOLE_SESSION) ? true : false;
+    proc->critical = (a[4] & NX_SPAWN_CRITICAL) ? true : false;
+    process_adopt_ctty(proc, current_process->ctty, (a[4] & NX_SPAWN_INHERIT) ? false : true);
     return (i64)handle;
 }
 
@@ -883,6 +925,8 @@ static i64 sys_process_kill(const u64 *a)
 
     if (NSTATUS_IS_ERR(status))
         return (i64)status;
+    if (signal_protected(proc, NX_SIGKILL, current_process->pid))
+        return (i64)Npermission;            /* 보호 프로세스: 부모 말고는 못 끝낸다 */
 
     return (i64)process_kill(proc, (i32)NX_EXIT_KILLED);   /* 자기 자신의 핸들은 얻을 수 없다 */
 }
@@ -1000,6 +1044,28 @@ static i64 sys_process_info(const u64 *a)
     return (i64)copy_to_user(a[1], &pi, sizeof(pi));
 }
 
+/* NxProcessList(struct nx_procent *out, max) -> 살아 있는 프로세스 수 */
+static i64 sys_process_list(const u64 *a)
+{
+    struct nx_procent *buf;
+    u32 max = a[1] > PROCESS_MAX ? PROCESS_MAX : (u32)a[1];
+    u32 n;
+    Nstatus status = NSTATUS_OK;
+
+    if (PROCESS_MAX * sizeof(struct nx_procent) > PAGE_SIZE)
+        return (i64)Noverflow;
+    buf = (struct nx_procent *)kpage_alloc();
+    if (!buf)
+        return (i64)NoutOfMemory;
+    n = process_list_snapshot(buf, max);
+    if (max > 0)
+        status = copy_to_user(a[0], buf, (usize)(n < max ? n : max) * sizeof(struct nx_procent));
+    kpage_free(buf);
+    if (NSTATUS_IS_ERR(status))
+        return (i64)status;
+    return (i64)n;
+}
+
 /* ------------------------------------------------------------------ */
 /* 신원 / 인증 / 전원                                                   */
 /* ------------------------------------------------------------------ */
@@ -1046,8 +1112,6 @@ static i64 sys_get_identity(const u64 *a)
 /* NxPowerOff() - uid 0 만. 정책(누가 끄게 할지)은 init 이 정한다 */
 static i64 sys_power_off(const u64 *a)
 {
-    const NTBLI *info = get_kernel_info();
-
     (void)a;
     if (!current_process || current_process->uid != 0)
         return (i64)Npermission;
@@ -1055,7 +1119,7 @@ static i64 sys_power_off(const u64 *a)
     if (NSTATUS_IS_ERR(ahci_flush_all()))
         printk_warn("power off: disk cache flush failed\n");
     printk("\nSystem power off.\n");
-    return (i64)acpi_power_off(info ? info->Rsdp : nNULL);
+    return (i64)acpi_power_off();
 }
 
 /* NxAuthenticate(const char *name, const char *password) -> 토큰 핸들 */
@@ -1201,9 +1265,20 @@ static i64 sys_poll(const u64 *a)
                 bits = pipe_poll_bits(slot->pipe, slot->pipe_write);
                 qs[nq++] = pipe_waitq(slot->pipe, slot->pipe_write);
             } else if (slot->type == NX_HANDLE_CONSOLE && slot->console_fd == 0) {
-                if (tty_input_ready())
+                tty_t *t = slot_tty(slot);
+
+                if (tty_input_ready(t))
                     bits = NX_POLL_IN;
-                qs[nq++] = tty_waitq();
+                if (tty_hung_up(t))
+                    bits |= NX_POLL_HUP;
+                qs[nq++] = tty_waitq(t);
+            } else if (slot->type == NX_HANDLE_PTY) {
+                bits = pty_master_poll_bits(slot->pty);
+                qs[nq++] = pty_master_waitq(slot->pty);
+            } else if (slot->type == NX_HANDLE_DEVICE && slot->dev->kind == NX_DEV_CONSOLE) {
+                if (keyboard_events_ready())
+                    bits = NX_POLL_IN;
+                qs[nq++] = keyboard_waitq();
             } else {
                 irq_restore(flags);
                 return (i64)Nunsupported;   /* 기다릴 수 없는 종류 */
@@ -1469,25 +1544,56 @@ static i64 sys_device_command(const u64 *a)
     if (NSTATUS_IS_ERR(status))
         return (i64)status;
 
+    if (slot->type == NX_HANDLE_PTY) {
+        /* pty 주 끝: 창 크기 */
+        struct nx_winsize ws;
+
+        if (a[1] == NX_DEVCMD_TTY_WINSIZE) {
+            tty_get_winsize(pty_tty(slot->pty), &ws);
+            return (i64)copy_to_user(a[2], &ws, sizeof(ws));
+        }
+        if (a[1] == NX_DEVCMD_TTY_SET_WINSIZE) {
+            status = copy_from_user(&ws, a[2], sizeof(ws));
+            if (NSTATUS_IS_ERR(status))
+                return (i64)status;
+            pty_set_winsize(slot->pty, &ws);
+            return 0;
+        }
+        return (i64)Nunsupported;
+    }
+
     if (slot->type == NX_HANDLE_CONSOLE) {
-        /* 콘솔: 에코(stdin 만), 입력 모드, 창 크기 */
+        /* 콘솔(또는 pty 종속 끝): 에코(stdin 만), 입력 모드, 창 크기 */
+        tty_t *t = slot_tty(slot);
+
         if (a[1] == NX_DEVCMD_TTY_ECHO) {
             if (slot->console_fd != 0)
                 return (i64)Nunsupported;
-            tty_set_echo(a[2] ? true : false);
+            tty_set_echo(t, a[2] ? true : false);
             return 0;
         }
         if (a[1] == NX_DEVCMD_TTY_MODE) {
             if (a[2] != NX_TTY_MODE_COOKED && a[2] != NX_TTY_MODE_RAW)
                 return (i64)NinvalidArg;
-            tty_set_raw(a[2] == NX_TTY_MODE_RAW ? true : false, current_process->pid);
+            tty_set_raw(t, a[2] == NX_TTY_MODE_RAW ? true : false, current_process->pid);
+            return 0;
+        }
+        if (a[1] == NX_DEVCMD_TTY_SET_WINSIZE) {
+            struct nx_winsize ws;
+
+            if (!t->pty)
+                return (i64)Nunsupported;   /* 물리 콘솔의 크기는 화면이 정한다 */
+            status = copy_from_user(&ws, a[2], sizeof(ws));
+            if (NSTATUS_IS_ERR(status))
+                return (i64)status;
+            pty_set_winsize(t->pty, &ws);
             return 0;
         }
         if (a[1] == NX_DEVCMD_TTY_FOREGROUND) {
             u32 pgid;
 
             if (a[2] == NX_PGID_QUERY)
-                return (i64)tty_get_foreground();
+                return (i64)tty_get_foreground(t);
             if (a[2] > 0xFFFFFFFFUL)
                 return (i64)NinvalidArg;
             pgid = (u32)a[2];
@@ -1495,13 +1601,13 @@ static i64 sys_device_command(const u64 *a)
             if (pgid != 0 && current_process->uid != 0 &&
                 !process_group_owned_by(pgid, current_process->uid))
                 return (i64)Npermission;
-            tty_set_foreground(pgid);
+            tty_set_foreground(t, pgid);
             return 0;
         }
         if (a[1] == NX_DEVCMD_TTY_WINSIZE) {
             struct nx_winsize ws;
 
-            tty_get_winsize(&ws);
+            tty_get_winsize(t, &ws);
             return (i64)copy_to_user(a[2], &ws, sizeof(ws));
         }
         return (i64)Nunsupported;
@@ -1520,6 +1626,8 @@ static i64 sys_device_command(const u64 *a)
     }
     if (a[1] == NX_DEVCMD_IOPERM)
         return (i64)device_ioperm(slot->dev, current_process, a[2] ? true : false);
+    if (a[1] == NX_DEVCMD_CONSOLE_FONT)
+        return (i64)device_console_font(slot->dev, current_process, a[2]);
     return (i64)Nunsupported;
 }
 
@@ -1597,6 +1705,7 @@ static const struct syscall_entry g_syscalls[] = {
     { NX_SYS_DUPLICATE_HANDLE_EX, sys_duplicate_handle_ex },
     { NX_SYS_HANDLE_FLAGS,     sys_handle_flags },
     { NX_SYS_PIPE_CREATE,      sys_pipe_create },
+    { NX_SYS_PTY_CREATE,       sys_pty_create },
     { NX_SYS_STAT_PATH,        sys_stat_path },
     { NX_SYS_SET_MODE,         sys_set_mode },
     { NX_SYS_SET_UMASK,        sys_set_umask },
@@ -1622,6 +1731,8 @@ static const struct syscall_entry g_syscalls[] = {
     { NX_SYS_SIGNAL_ACTION,    sys_signal_action },
     { NX_SYS_SIGNAL_MASK,      sys_signal_mask },
     { NX_SYS_SIGNAL_SEND,      sys_signal_send },
+    { NX_SYS_SIGNAL_SEND_PID,  sys_signal_send_pid },
+    { NX_SYS_PROCESS_LIST,     sys_process_list },
     { NX_SYS_SIGNAL_RETURN,    sys_signal_return },
     { NX_SYS_SIGNAL_SUSPEND,   sys_signal_suspend },
     { NX_SYS_SIGNAL_PENDING,   sys_signal_pending },
