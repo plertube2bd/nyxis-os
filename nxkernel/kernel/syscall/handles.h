@@ -35,6 +35,7 @@
 #define NX_HANDLE_INFO     7U   /* info:/ 가상 파일: 열 때 만든 스냅샷 (읽기 전용) */
 #define NX_HANDLE_PIPE     8U   /* 파이프의 한쪽 끝 (kernel/ipc/pipe.h) */
 #define NX_HANDLE_PTY      9U   /* 의사 터미널의 주 끝 (console/inputs/tty.h). 종속 끝은 NX_HANDLE_CONSOLE */
+#define NX_HANDLE_SHM      10U  /* 공유 메모리 (kernel/mm/shm.h). 매핑은 핸들에 속한다 */
 
 struct process;
 struct auth_identity;
@@ -43,6 +44,7 @@ struct nx_device;
 struct nx_pipe;
 struct tty;
 struct pty;
+struct nx_shm;
 
 /* 열린 파일 (공유 가능). refs 가 0 이 되면 VFS 핸들을 닫고 해제한다 */
 typedef struct nx_ofile {
@@ -60,6 +62,8 @@ typedef struct nx_handle {
     u32 console_fd;         /* 콘솔 핸들일 때: 0=in 1=out 2=err */
     struct tty *tty;        /* 콘솔 핸들일 때 터미널: NULL = 물리 콘솔, 아니면 pty 종속 끝 (참조 1 개) */
     struct pty *pty;        /* pty 주 끝 핸들 (주 끝 참조 1 개) */
+    struct nx_shm *shm;     /* 공유 메모리 핸들 (참조 1 개) */
+    u64  shm_va;            /* 이 핸들로 매핑한 주소 (0 = 매핑 안 함) */
     u32 hflags;             /* NX_HFLAG_* (NX_HFLAG_CLOEXEC) */
     nx_ofile_t *of;         /* 파일 핸들일 때 열린 파일 (참조 1 개) */
     struct nx_pipe *pipe;   /* 파이프 핸들일 때 (그 끝의 참조 1 개) */
@@ -100,6 +104,12 @@ Nstatus nx_handle_lookup(nx_handle_table_t *table, u64 handle, u32 required_righ
 
 /* 핸들을 닫는다 (파일이면 VFS 핸들도 닫고, 프로세스면 그 참조를 놓는다). */
 Nstatus nx_handle_close(nx_handle_table_t *table, u64 handle);
+
+/*
+ * 테이블 밖의 핸들(채널 메시지에 붙은 사본 등)이 가진 객체 참조를 놓는다. owner 는 그 핸들의 매핑(공유 메모리)이
+ * 있는 프로세스 (테이블 밖이면 NULL). 슬롯을 지우지는 않는다.
+ */
+void nx_handle_release(nx_handle_t *slot, struct process *owner);
 
 /* 방금 alloc 했지만 아직 쓰지 않은 슬롯을 되돌린다 (VFS 핸들은 닫지 않는다). 세대는 증가시켜 값을 무효화 */
 void nx_handle_discard(nx_handle_t *slot);

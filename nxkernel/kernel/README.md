@@ -97,7 +97,8 @@ constants are in `include/nyx_abi.h`, a public header shared with userland (kern
 Implemented so far (see `syscalls.txt` for the full ABI table): `NxGetVersion`, `NxGetTime`, `NxSleep`, `NxYield`,
 `NxSysInfo`, `NxOpen`/`NxClose`/`NxRead`/`NxWrite`/`NxSeek`/`NxStat`/`NxDuplicateHandle`, `NxProcessCreate`,
 `NxProcessExit`, `NxProcessInfo`, `NxVirtualAlloc` (brk-style; `NxVirtualFree`'s number is reserved for a future
-mmap-style API — for now a negative `NxVirtualAlloc` increment *is* "free"), `NxKernelPrint`, `NxDebugNop`.
+mmap-style API — for now a negative `NxVirtualAlloc` increment *is* "free"), `NxKernelPrint`, `NxDebugNop`
+(debug syscalls 768–1023: only in kernels built with `make DEBUG_SYSCALLS=1` or `SELFTEST=1`).
 Everything else returns `NsyscallFailed`. The kernel returns `Nstatus`, never POSIX `errno` — that translation is
 nlibc's job (`userland/nlibc/library/errno.h`), kept out of the kernel ABI on purpose.
 
@@ -268,6 +269,7 @@ E820 기반 맵은 이미 쓰이고 있는 그 영역들도 "사용 가능"으�
 `NxOpen`/`NxClose`/`NxRead`/`NxWrite`/`NxSeek`/`NxStat`/`NxDuplicateHandle`, `NxProcessCreate`, `NxProcessExit`,
 `NxProcessInfo`, `NxVirtualAlloc`(brk 방식 — `NxVirtualFree` 번호는 미래의 mmap 스타일 API 를 위해 예약만 해
 두었고, 지금은 `NxVirtualAlloc` 에 음수를 넘기는 것이 "해제"입니다), `NxKernelPrint`, `NxDebugNop`
+(디버그 콜 768~1023: `make DEBUG_SYSCALLS=1` 또는 `SELFTEST=1` 로 빌드한 커널에만 있음)
 (전체 ABI 표는 `syscalls.txt` 참고). 나머지 번호는 `NsyscallFailed` 를 반환합니다. 커널은 POSIX `errno` 를
 전혀 모르고 항상 `Nstatus` 를 돌려줍니다 — 그 변환은 일부러 커널 ABI 밖, nlibc 쪽
 (`userland/nlibc/library/errno.h`) 이 맡습니다.

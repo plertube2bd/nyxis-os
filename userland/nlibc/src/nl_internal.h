@@ -17,6 +17,7 @@
 #include <stdio.h>
 
 /* ---------------- 플랫폼 계층 ---------------- */
+#define NL_FD_MAX   64      /* fd 번호 상한 (Nyxis: NX_MAX_HANDLES) */
 #define NL_O_READ   0x01
 #define NL_O_WRITE  0x02
 #define NL_O_CREAT  0x04    /* 없으면 만든다 */
@@ -116,6 +117,14 @@ long __nl_channel_open(const char *path);                      /* 보내는 쪽 
 long __nl_channel_send(long h, const void *buf, size_t len);
 /* sender: pid, uid, gid (커널이 붙인다). timeout_ms < 0 이면 끝없이. 메시지 길이 */
 long __nl_channel_receive(long h, void *buf, size_t cap, unsigned long sender[3], long timeout_ms);
+/* 핸들을 붙여 보내기/받기 (컴포지터 연결). 받은 핸들은 fd 로 등록해 *out_fd 에 (없으면 -1) */
+int __nl_channel_send_handle(long h, const void *buf, size_t len, long attach);
+long __nl_channel_receive_handle(long h, void *buf, size_t cap, unsigned long sender[3], long timeout_ms, int *out_fd);
+/* 핸들을 fd 로 등록한다 (poll/read/close 에 쓰게). fd, 실패 -1 */
+int __nl_adopt_handle(long h, int flags);
+/* 공유 메모리: 핸들 (fd 로 등록됨) / 매핑 주소 */
+long __nl_shm_create(size_t size, int cloexec);
+void *__nl_shm_map(long h);
 
 /* 프로세스. 핸들 h 는 플랫폼이 정한 값 (Nyxis: 프로세스 핸들, Linux: pid) */
 /* inherit: 부모의 fd 를 같은 번호로 물려준다 (FD_CLOEXEC 제외) */

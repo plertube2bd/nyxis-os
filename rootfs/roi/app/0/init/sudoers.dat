@@ -1,4 +1,4 @@
-# sudo 를 쓸 수 있는 uid (init 이 읽는다: roi:/app/0/init/sudoers.dat)
+# elev(예전 이름 sudo) 를 쓸 수 있는 uid (init 이 읽는다: roi:/app/0/init/sudoers.dat)
 #   한 줄에 uid 하나 (10진수). '#' 부터 줄 끝은 주석. 이 파일이 없으면 uid 0 만 허용
 0
 1000

@@ -21,7 +21,7 @@
  *   1. TUI   전체 화면 텍스트 UI. 셀 버퍼에 그리고 nx64_tui_flush 가 바뀐 칸만 내보낸다 (깜빡임 없음).
  *            ntui(Nyxis OS 데스크톱)에서는 실행 상자(Super+R)로 터미널 창에서, 셸에서는 그냥 실행한다.
  *   2. 시스템 POSIX 에 없는 것: info:/ 값, 메모리, 신원, 앱 설정(app:/<앱>.run/<키>), svc:/ 서비스 채널,
- *            전원 끄기 요청.
+ *            전원 끄기 요청, 저널(journald) 쓰기/읽기.
  *   3. 화면  dev:/console: 프레임버퍼 + 키 이벤트 (콘솔 세션 프로세스와 root 만. ntui 가 쓴다).
  *            의사 터미널은 <pty.h> 의 openpty.
  * 오류: 실패하면 -1 (또는 NULL) 을 돌려주고 errno 를 정한다 (POSIX 와 같다: strerror(errno)).
@@ -75,6 +75,7 @@ enum {
 };
 #define NX64_KEY_CTRL(c) ((c) & 0x1F)    /* NX64_KEY_CTRL('q') */
 #define NX64_KEY_NONE    (-2)            /* nx64_tui_key: 시간 안에 키가 없었다 */
+#define NX64_KEY_RESIZE  0x200           /* nx64_tui_key: 터미널 크기가 바뀌었다 (셀 버퍼는 이미 새 크기다: 다시 그린다) */
 
 /* 화면을 넘겨받는다 (raw 모드, 커서 숨김, 셀 버퍼). 성공 0, 실패 -1. 끝나면 nx64_tui_end */
 int nx64_tui_begin(void);
@@ -108,8 +109,47 @@ struct nx64_app {
     int  (*tick)(void *ctx);            /* tick_ms 마다 (NULL 가능). 다시 그려야 하면 1 */
     int tick_ms;                        /* 0 이면 tick 없이 키만 기다린다 */
 };
-/* begin -> (draw, flush, 키/tick 기다리기) 반복 -> end. 성공 0, 화면을 못 얻으면 -1 */
+/* begin -> (draw, flush, 키/tick 기다리기) 반복 -> end. 성공 0, 화면을 못 얻으면 -1.
+ * 창 크기가 바뀌면(사용자가, 또는 nx64_win_resize 로) 셀 버퍼를 새 크기로 바꾸고 다시 그린다 */
 int nx64_tui_run(const struct nx64_app *app, void *ctx);
+
+/*
+ * ntui 창: 이 프로그램이 ntui(데스크톱)의 터미널 창(nterm) 안에서 돌 때 그 창을 다룬다.
+ * 터미널에 xterm 의 창 조작 시퀀스(CSI ... t)를 보내고 nterm 이 컴포지터에 부탁한다 (docs/NX64API.md).
+ * TUI 를 시작하지 않은 프로그램(printf 만 쓰는 것)도 쓸 수 있다.
+ *
+ *   nx64_ntui_present   ntui 의 터미널 창 안이면 1 (NWP_DISPLAY 가 있고 터미널이 nterm 이라고 답한다. 처음 한 번 묻는다)
+ *   nx64_ntui_require   아니면 이유를 stderr 에 쓰고 exit(1): ntui 에서만 도는 프로그램의 main 첫 줄에
+ *   nx64_win_info       지금 창 (위치/크기/상태/창 영역)
+ *   nx64_win_resize     안쪽 크기 (= 프로그램이 쓰는 칸, 0 = 그대로). 최대화/전체 화면이면 보통이 된다.
+ *                       컴포지터가 창 영역에 맞게 줄일 수 있다: 실제 크기는 nx64_win_info / nx64_tui_cols
+ *   nx64_win_move       창(테두리 포함)의 왼쪽 위를 화면 칸 x, y 로
+ *   nx64_win_center     창 영역의 가운데로
+ *   nx64_win_set_state  NX64_WIN_NORMAL / MAXIMIZED / FULLSCREEN / MINIMIZED
+ *   nx64_win_title      창 제목 (31자까지, ASCII)
+ * 크기/위치/상태는 프로그램이 끝날 때 처음 것으로 되돌린다 (셸의 터미널이 전체 화면으로 남지 않게).
+ * 남기려면 nx64_win_keep(). 바꾸기는 비동기다: 결과는 곧(다음 키 기다림에서 NX64_KEY_RESIZE) 온다.
+ * ntui 안이 아니면 -1 + ENOTSUP.
+ */
+#define NX64_WIN_NORMAL     0
+#define NX64_WIN_MAXIMIZED  1
+#define NX64_WIN_FULLSCREEN 2
+#define NX64_WIN_MINIMIZED  3
+struct nx64_win {
+    int x, y;                           /* 창(테두리 포함)의 왼쪽 위 (화면 칸). 전체 화면이면 0, 0 */
+    int cols, rows;                     /* 안쪽 크기 */
+    int state;                          /* NX64_WIN_* */
+    int area_cols, area_rows;           /* 창이 놓일 수 있는 영역 (작업 표시줄을 뺀 화면, 테두리 포함) */
+};
+int  nx64_ntui_present(void);
+void nx64_ntui_require(const char *prog);
+int  nx64_win_info(struct nx64_win *out);
+int  nx64_win_resize(int cols, int rows);
+int  nx64_win_move(int x, int y);
+int  nx64_win_center(void);
+int  nx64_win_set_state(int state);
+int  nx64_win_title(const char *title);
+void nx64_win_keep(void);
 
 /* ================================================================== */
 /* 2. 시스템 (비 POSIX)                                                 */
@@ -166,9 +206,84 @@ struct nx64_sender {
 long nx64_service_create(const char *name, int public_);
 long nx64_service_receive(long h, void *buf, size_t cap, struct nx64_sender *from, int timeout_ms);
 int  nx64_service_send(const char *name, const void *buf, size_t len);
+/*
+ * fd 를 붙여 보내기/받기 (커널의 NxChannelSendHandle/ReceiveEx: Unix 소켓의 fd 넘기기와 같다. 컴포지터 연결에 쓴다).
+ *   nx64_service_send_fd: 메시지와 함께 fd 의 사본을 보낸다 (파이프/pty/파일/공유 메모리 ...). 내 fd 는 그대로.
+ *   nx64_service_receive_fd: 받은 fd 를 *out_fd 에 (없으면 -1). 받은 fd 는 close-on-exec 가 아니다.
+ *   nx64_service_fd: 받는 핸들을 poll 할 수 있는 fd 로 (close-on-exec 로 해 둔다)
+ */
+int  nx64_service_send_fd(const char *name, const void *buf, size_t len, int fd);
+long nx64_service_receive_fd(long h, void *buf, size_t cap, struct nx64_sender *from, int timeout_ms, int *out_fd);
+int  nx64_service_fd(long h);
+/* 서비스에 보내는 끝을 fd 로 연다 (close-on-exec 아님). 이 fd 를 nx64_service_send_fd 로 다른 서비스에 붙여 보내면
+ * 받는 쪽이 이 서비스로 답장할 수 있다 (nex 가 init 에게 답장 채널을 넘긴다). write() 는 쓸 수 없다 */
+int  nx64_service_connect(const char *name);
+
+/* 공유 메모리 (NxSharedMemoryCreate/Map). fd 는 close-on-exec. 닫으면 매핑도 사라진다. 다른 프로세스에는 fd 를 보낸다 */
+int nx64_shm_create(size_t size);
+void *nx64_shm_map(int fd);
 
 /* init 에게 전원을 꺼 달라고 요청한다 (svc:/sys/init). 성공 0: 곧 꺼진다 */
 int nx64_request_poweroff(void);
+
+/*
+ * 저널 (journald, svc:/sys/journal). 로그를 남기는 가장 쉬운 길:
+ *   - 서비스(nex 유닛)라면 그냥 stdout/stderr 에 쓴다: 줄마다 저널에 들어간다 ("<3>" 로 시작하면 우선순위 3).
+ *   - 그 밖의 프로그램은 nx64_journal_printf(NX64_LOG_INFO, "loaded %d files", n);
+ * 보낸 쪽의 pid/uid 는 커널이 붙이므로 속일 수 없다. 읽기는 nx64_journal_open (journalman 이 쓴다):
+ * root 는 모든 항목, 다른 사용자는 자기 uid 의 항목만 받는다.
+ *
+ *   nx64_journal_send   메시지 하나 (tag 가 NULL 이거나 "" 이면 이 프로세스의 이름).
+ *                       개행으로 나누어 여러 항목이 되고, 한 항목은 NX64_JOURNAL_LINE_MAX 바이트까지 (넘으면 나눈다).
+ *                       journald 가 없으면 -1/ENOENT (또는 EPIPE). 큐가 차 있으면 1초까지 기다린 뒤 -1/EAGAIN
+ *   nx64_journal_printf tag 없이 printf 형식으로 (1024 바이트까지)
+ */
+#define NX64_LOG_EMERG   0
+#define NX64_LOG_ALERT   1
+#define NX64_LOG_CRIT    2
+#define NX64_LOG_ERR     3
+#define NX64_LOG_WARNING 4
+#define NX64_LOG_NOTICE  5
+#define NX64_LOG_INFO    6
+#define NX64_LOG_DEBUG   7
+#define NX64_JOURNAL_LINE_MAX 200
+#define NX64_JOURNAL_NAME_MAX 32       /* 유닛/태그 이름 (NUL 포함) */
+int nx64_journal_send(int prio, const char *tag, const char *message);
+int nx64_journal_printf(int prio, const char *fmt, ...);
+/* 우선순위 이름 <-> 번호: "err", "warning", "3" ... (모르면 -1 / "?") */
+int nx64_log_priority(const char *name);
+const char *nx64_log_priority_name(int prio);
+
+/*
+ * 저널 읽기: 조건에 맞는 항목을 한 줄에 하나씩 보내 주는 fd (파이프의 읽기 끝). 다 보내면 EOF,
+ * follow 면 새 항목을 계속 보낸다 (fd 를 닫으면 끝). 줄 형식(저널 파일과 같다, 필드는 공백 하나로 나눈다):
+ *   <UTC 마이크로초> <부팅 번호> <pid> <uid> <우선순위> <유닛|-> <태그|-> <메시지>
+ * nx64_journal_parse 가 한 줄(끝의 '\n' 은 있어도 없어도 된다)을 나눈다: message 는 line 안을 가리킨다.
+ * nx64_journal_format 은 "Nov 14 12:34:56 host tag[pid]: message" (journalctl 의 short 형식, UTC)
+ */
+struct nx64_journal_query {
+    const char *unit;                  /* NULL = 모두 */
+    const char *tag;                   /* NULL = 모두 */
+    int max_prio;                      /* 이 번호 이하(더 중요한 것)만, -1 = 모두 */
+    unsigned long pid;                 /* 0 = 모두 */
+    long lines;                        /* 마지막 N 개, -1 = 모두 */
+    int this_boot;                     /* 1 = 이번 부팅의 것만 */
+    int follow;                        /* 1 = 끝나지 않고 새 항목을 계속 */
+    long since;                        /* 이 시각(UNIX 초) 이후, 0 = 모두 */
+};
+struct nx64_journal_entry {
+    long usec;                         /* 1970-01-01 UTC 이후 마이크로초 */
+    unsigned long boot;                /* 부팅 번호 (부팅 시각의 UNIX 초) */
+    unsigned long pid;
+    unsigned long uid;
+    int prio;
+    char unit[NX64_JOURNAL_NAME_MAX];  /* 없으면 "" */
+    char tag[NX64_JOURNAL_NAME_MAX];   /* 없으면 "" */
+    const char *message;
+};
+int nx64_journal_open(const struct nx64_journal_query *q);
+int nx64_journal_parse(char *line, struct nx64_journal_entry *e);
+size_t nx64_journal_format(const struct nx64_journal_entry *e, const char *host, char *buf, size_t cap);
 
 /* ---------------- 프로세스 (ntop) ---------------- */
 
@@ -199,6 +314,8 @@ unsigned long nx64_find_process(const char *name);
 unsigned long nx64_timer_hz(void);
 /* 지금 사용자의 비밀번호가 맞는지 (화면 잠금). 맞으면 0, 틀리면 -1 + EACCES (커널이 1초 늦춘다) */
 int nx64_check_password(const char *password);
+/* pty 주 끝 fd 의 포그라운드 프로세스 그룹 (작업이 없으면 0, 실패 -1). 터미널 에뮬레이터가 신호를 보낼 때 */
+long nx64_pty_foreground(int master_fd);
 
 /* ================================================================== */
 /* 3. 화면 (dev:/console)                                              */

@@ -1,5 +1,5 @@
 /*
- * nfiles.c - 파일 탐색기 창 (Ctrl-E, 또는 실행 상자에서 "files")
+ * nfiles - 파일 탐색기 (NWP 창 프로그램: ntui 의 Super+E, 실행 상자의 "files", 또는 nfiles [디렉터리])
  *
  *   맨 위: 지금 경로.  가운데: 디렉터리 먼저, 이름순 목록 (크기).  맨 아래: 안내 / 입력 / 확인.
  *
@@ -22,7 +22,31 @@
 #include <dirent.h>
 #include <sys/stat.h>
 
-#include "ntui.h"
+#include <spawn.h>
+#include <poll.h>
+#include <sys/wait.h>
+#define NWP_SHORT_NAMES
+#include <nwp.h>
+
+/* 창 (NWP): 그리기는 이 창의 칸에 */
+static struct nwp_window *g_w;
+struct window {
+    void *data;
+    int wantClose;
+};
+#define screenPut(x, y, ch, r)          nwp_put_role(g_w, (x), (y), (ch), (r))
+#define screenText(x, y, s, r)          nwp_text(g_w, (x), (y), (s), (r))
+#define screenFill(x, y, cw, chh, c, r) nwp_fill(g_w, (x), (y), (cw), (chh), (c), (r))
+
+extern char **environ;
+
+/* 창 프로그램을 띄운다 (터미널 nterm). 끝난 것은 이벤트 루프가 거둔다 */
+static int spawnArgs(const char *const *argv)
+{
+    pid_t pid;
+
+    return posix_spawnp(&pid, argv[0], NULL, NULL, (char *const *)argv, environ) == 0 ? 0 : -1;
+}
 
 #define FILES_PATH  256
 #define FILES_NAME  248
@@ -151,9 +175,9 @@ static void loadPlaces(struct files *f)
     addEntry(f, "disk:/", true, 0);
     addEntry(f, "info:/", true, 0);
     addEntry(f, "dev:/", true, 0);
-    snprintf(roi, sizeof(roi), "roi:/%lu/", (unsigned long)uid);
+    snprintf(roi, sizeof(roi), "roi:/%lu/", (unsigned long)getuid());
     addEntry(f, roi, true, 0);
-    if (isRoot)
+    if (getuid() == 0)
         addEntry(f, "fs:/", true, 0);
 }
 
@@ -254,8 +278,12 @@ static void openSelected(struct files *f, bool edit)
         return;
     shellQuote(quoted, sizeof(quoted), path);
     snprintf(cmd, sizeof(cmd), "kilo %s", quoted);
-    if (nterminalRunEx(cmd, RUN_MAXIMIZED | RUN_AUTOCLOSE, NULL, 0, 0) == NULL)
-        snprintf(f->msg, sizeof(f->msg), "cannot open a window");
+    {
+        const char *argv[] = { "nterm", "-m", "-x", "-t", e->name, "-e", cmd, NULL };
+
+        if (spawnArgs(argv) < 0)
+            snprintf(f->msg, sizeof(f->msg), "cannot run nterm");
+    }
     f->reloadSoon = 1;                  /* 편집기 창이 닫혀 이 창이 다시 활성이 되면 크기를 다시 읽는다 */
 }
 
@@ -271,8 +299,12 @@ static void viewSelected(struct files *f)
     selectedPath(f, path, sizeof(path));
     shellQuote(quoted, sizeof(quoted), path);
     snprintf(cmd, sizeof(cmd), "cat %s", quoted);
-    if (nterminalRun(cmd) == NULL)
-        snprintf(f->msg, sizeof(f->msg), "cannot open a window");
+    {
+        const char *argv[] = { "nterm", "-t", e->name, "-e", cmd, NULL };
+
+        if (spawnArgs(argv) < 0)
+            snprintf(f->msg, sizeof(f->msg), "cannot run nterm");
+    }
 }
 
 static void startPrompt(struct files *f, enum prompt p, const char *initial)
@@ -370,7 +402,7 @@ static void sizeText(char *out, size_t cap, const struct entry *e)
 }
 
 /* 한 줄을 width 칸에 맞춰 (넘치면 자른다) */
-static void textClip(int x, int y, int width, const char *s, enum role r)
+static void textClip(int x, int y, int width, const char *s, int r)
 {
     for (int i = 0; i < width && s[i] != '\0'; i++)
         screenPut(x + i, y, (unsigned char)s[i], r);
@@ -409,7 +441,7 @@ static void filesDraw(struct window *w, int x, int y, int cols, int rows, int ac
     for (int i = 0; i < listRows && f->top + i < f->count; i++) {
         const struct entry *e = &f->ent[f->top + i];
         bool isSel = f->top + i == f->sel;
-        enum role r = isSel ? (active ? ROLE_SELECTION : ROLE_TITLE_INACTIVE) : ROLE_WINDOW;
+        int r = isSel ? (active ? ROLE_SELECTION : ROLE_TITLE_INACTIVE) : ROLE_WINDOW;
         char size[16];
         int sizeLen;
 
@@ -543,8 +575,12 @@ static int filesKey(struct window *w, int key)
         viewSelected(f);
         return 1;
     case 't':
-        if (nterminalOpenIn(f->path[0] ? f->path : NULL) == NULL)
-            snprintf(f->msg, sizeof(f->msg), "cannot open a terminal");
+        {
+            const char *argv[] = { "nterm", f->path[0] ? "-d" : NULL, f->path, NULL };
+
+            if (spawnArgs(argv) < 0)
+                snprintf(f->msg, sizeof(f->msg), "cannot run nterm");
+        }
         return 1;
     case 'r':
         if (e != NULL && f->path[0] != '\0')
@@ -581,32 +617,51 @@ static void filesClose(struct window *w)
     free(f);
 }
 
-static const struct app g_filesApp = {
-    "files", filesDraw, filesKey, NULL, NULL, NULL, filesClose
-};
-
-/* 파일 탐색기를 연다. dir 이 NULL 이면 ntui 의 현재 디렉터리 (없으면 face:/). 실패하면 NULL */
-struct window *nfilesOpen(const char *dir)
+int main(int argc, char **argv)
 {
     struct files *f = calloc(1, sizeof(*f));
-    struct window *w;
+    struct window win;
+    int quit = 0;
 
     if (f == NULL)
-        return NULL;
+        return 1;
     f->ent = malloc(FILES_MAX * sizeof(f->ent[0]));
-    if (f->ent == NULL) {
-        free(f);
-        return NULL;
-    }
-    if (dir != NULL)
-        snprintf(f->path, sizeof(f->path), "%s", dir);
+    if (f->ent == NULL)
+        return 1;
+    if (argc > 1)
+        snprintf(f->path, sizeof(f->path), "%s", argv[1]);
     else if (getcwd(f->path, sizeof(f->path)) == NULL)
         snprintf(f->path, sizeof(f->path), "face:/");
     if (reload(f, NULL) < 0)
         go(f, "face:/", NULL);
 
-    w = wmOpen("files", &g_filesApp, f, screenCols * 2 / 3, (screenRows - TASKBAR_ROWS) * 3 / 4);
-    if (w == NULL)
-        filesClose(&(struct window){ .data = f });
-    return w;
+    g_w = nwp_open("nfiles", "files", 0, 0, NWP_STATE_NORMAL);
+    if (g_w == NULL) {
+        fprintf(stderr, "nfiles: cannot open a window: %s (run it inside ntui)\n", strerror(errno));
+        return 1;
+    }
+    win.data = f;
+    win.wantClose = 0;
+    while (!quit && !win.wantClose) {
+        struct nwp_event ev;
+        int r;
+
+        nwp_clear(g_w, ROLE_WINDOW);   /* 창의 모든 칸은 이 프로그램 것: 바탕부터 칠한다 */
+        filesDraw(&win, 0, 0, nwp_cols(g_w), nwp_rows(g_w), nwp_focused(g_w));
+        (void)nwp_commit(g_w);
+        r = nwp_next_event(g_w, &ev, 1000);
+        while (waitpid(-1, NULL, WNOHANG) > 0)
+            ;                           /* 띄운 nterm 을 거둔다 */
+        if (r < 0)
+            break;                      /* 컴포지터가 없어졌다 */
+        if (r == 0)
+            continue;
+        if (ev.type == NWP_EVENT_KEY)
+            (void)filesKey(&win, ev.key);
+        else if (ev.type == NWP_EVENT_CLOSE)
+            quit = 1;
+    }
+    filesClose(&win);
+    nwp_close(g_w);
+    return 0;
 }

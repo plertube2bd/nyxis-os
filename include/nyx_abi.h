@@ -210,6 +210,17 @@
  *   두었고, v1 에서는 구현하지 않는다: 지금은 NxVirtualAlloc 에 음수를 넘기는 것이 "해제"다).
  */
 #define NX_SYS_VIRTUAL_ALLOC    96U
+/*
+ * 공유 메모리 (kernel/mm/shm.h). 컴포지터의 화면 버퍼처럼 프로세스 사이에 큰 데이터를 복사 없이 나눈다.
+ *   NxSharedMemoryCreate(size, flags) -> 핸들 (READ|WRITE|STAT|DUP). 0 으로 채운 size 바이트(페이지 단위로 올림,
+ *     NX_SHM_MAX 까지. 모든 객체 합계 NX_SHM_TOTAL_MAX). flags: NX_DUP_CLOEXEC.
+ *   NxSharedMemoryMap(h, u64 *out_addr) -> 0. 객체 전체를 매핑한다 (WRITE 권한이 있으면 읽기/쓰기, 없으면 읽기만).
+ *     같은 핸들로 다시 부르면 같은 주소. 매핑은 핸들에 속한다: 핸들을 닫거나 exec 하면 사라진다.
+ *   다른 프로세스에게는 NxChannelSendHandle 로 핸들을 보낸다 (읽기만 주려면 NxDuplicateHandle 로 WRITE 를 빼고 보낸다).
+ *   NxStat: type NX_TYPE_SHM, size = 바이트. fork 의 자식은 핸들은 물려받고 매핑은 없다.
+ */
+#define NX_SYS_SHM_CREATE       99U
+#define NX_SYS_SHM_MAP          100U
 
 /*
  * 채널 (svc:/ 이름공간의 IPC). 메시지마다 커널이 보낸 쪽 pid/uid/gid 를 붙여 준다.
@@ -246,6 +257,18 @@
  *   종속 끝이 모두 닫히면(제어 터미널로 쓰는 프로세스 포함) 주 끝 읽기는 남은 것을 다 읽은 뒤 0, NxPoll 은 HUP.
  */
 #define NX_SYS_PTY_CREATE       134U
+/*
+ * 핸들 보내기 (Unix 소켓의 SCM_RIGHTS 와 같다: 컴포지터 연결에 쓴다).
+ *   NxChannelSendHandle(h, buf, len, handle) -> 0. 메시지와 함께 handle 의 사본(같은 객체, 같은 권한)을 보낸다.
+ *     handle 은 NX_RIGHT_DUP 이 있어야 하고 파이프/pty/콘솔/파일/공유 메모리/채널 송신 끝/info 만 된다
+ *     (프로세스, 토큰, 장치, 채널 수신 끝은 Nunsupported). 보낸 쪽 핸들은 그대로 남는다.
+ *   NxChannelReceiveEx(h, buf, len, struct nx_msginfo_ex *info, timeout_ms) -> 메시지 바이트 수.
+ *     NxChannelReceive 와 같고, 핸들이 붙어 있었으면 info->handle 에 새 핸들 (없으면 NX_HANDLE_INVALID_VALUE).
+ *     핸들 자리가 없으면 NoutOfMemory (메시지는 큐에 남는다). NxChannelReceive 로 받으면 붙은 핸들은 닫힌다.
+ *   받지 않은 채 채널이 사라지면 붙은 핸들도 닫힌다.
+ */
+#define NX_SYS_CHANNEL_SEND_HANDLE 135U
+#define NX_SYS_CHANNEL_RECEIVE_EX  136U
 
 /*
  * 파일시스템 노드 (경로 규칙은 아래 "이름공간" 참고)
@@ -298,6 +321,10 @@
 #define NX_SYS_DEVICE_COMMAND   193U
 #define NX_SYS_DEVICE_MAP_MMIO  194U
 
+/* 디버그 구역 (0x0300..0x03FF): 커널을 make DEBUG_SYSCALLS=1 (또는 SELFTEST=1) 로 빌드했을 때만 있다.
+ * 일반 커널에서는 이 구역의 모든 번호가 NsyscallFailed 다. 일반 프로그램은 쓰지 말 것 */
+#define NX_SYS_DEBUG_FIRST      768U
+#define NX_SYS_DEBUG_LAST       1023U
 #define NX_SYS_KERNEL_PRINT     771U
 #define NX_SYS_DEBUG_NOP        777U
 
@@ -318,9 +345,10 @@
  *      의 type 은 "지금 자식이 있으면 NX_TYPE_DIR"), NX_O_TRUNC.
  * 2.6: 의사 터미널(NxPtyCreate, NX_TYPE_PTY, NX_DEVCMD_TTY_SET_WINSIZE, 프로세스별 제어 터미널), 콘솔 화면 장치
  *      dev:/console (NX_SPAWN_CONSOLE_SESSION, struct nx_keyevent, NX_DEVCMD_CONSOLE_FONT), nx_devinfo.format,
- *      NxProcessList(struct nx_procent), NxSignalSendPid, 보호 프로세스(NX_SPAWN_CRITICAL, NX_PROCENT_CRITICAL). */
+ *      NxProcessList(struct nx_procent), NxSignalSendPid, 보호 프로세스(NX_SPAWN_CRITICAL, NX_PROCENT_CRITICAL).
+ * 2.7: 공유 메모리(NxSharedMemoryCreate/Map, NX_TYPE_SHM), 핸들 보내기(NxChannelSendHandle/ReceiveEx). */
 #define NX_ABI_MAJOR   2UL
-#define NX_ABI_MINOR   6UL
+#define NX_ABI_MINOR   7UL
 #define NX_ABI_PATCH   0UL
 #define NX_ABI_VERSION ((NX_ABI_MAJOR << 32) | (NX_ABI_MINOR << 16) | NX_ABI_PATCH)
 
@@ -387,7 +415,7 @@
 /* ---------------- 제한 ---------------- */
 #define NX_PATH_MAX        256UL      /* NxOpen 경로 (NUL 포함) */
 #define NX_IO_MAX          0x100000UL /* 한 번의 읽기/쓰기 최대 바이트 (넘으면 잘라서 처리) */
-#define NX_MAX_HANDLES     32UL       /* 프로세스당 핸들 수 */
+#define NX_MAX_HANDLES     64UL       /* 프로세스당 핸들 수 (2.7: 32 -> 64, 컴포지터가 클라이언트마다 파이프 2 개 + 버퍼 1 개) */
 #define NX_SLEEP_MAX_MS    3600000UL  /* NxSleep 최대 1시간 */
 #define NX_PID_SELF        0xFFFFFFFFUL
 #define NX_PROC_NAME_MAX   32U        /* nx_procent.name (NUL 포함) */
@@ -409,10 +437,13 @@
 /* roi:/default/ 틀에서 "새 사용자 소유" 를 뜻하는 소유자. 복사할 때 그 사용자의 uid/gid 로 바뀐다 */
 #define NX_UID_TEMPLATE     0xFFFFFFFEU
 #define NX_AUTH_FAIL_DELAY_MS 1000UL  /* 인증 실패 시 지연 (무차별 대입을 느리게) */
-#define NX_POLL_MAX        16UL
+#define NX_POLL_MAX        32UL       /* 2.7: 16 -> 32 */
 #define NX_CHAN_MSG_MAX    256UL      /* 채널 메시지 최대 바이트 */
 #define NX_CHAN_QUEUE_MAX  16UL       /* 채널 큐 최대 메시지 수 */
 #define NX_CHAN_PUBLIC     0x1UL      /* NxChannelCreate: 누구나 보낼 수 있음 */
+#define NX_SHM_MAX         (16UL * 1024UL * 1024UL)    /* 공유 메모리 객체 하나 */
+#define NX_SHM_TOTAL_MAX   (128UL * 1024UL * 1024UL)   /* 모든 공유 메모리 합계 */
+#define NX_HANDLE_INVALID_VALUE 0xFFFFFFFFFFFFFFFFUL   /* "핸들 없음" (nx_msginfo_ex.handle) */
 #define NX_BLOCK_SECTOR    512UL      /* 블록 장치 읽기/쓰기 단위 (오프셋/길이 모두 배수여야 함) */
 #define NX_PIPE_CAPACITY   4096U      /* 파이프 버퍼 */
 #define NX_PIPE_ATOMIC     512U       /* 이 이하의 파이프 쓰기는 섞이지 않는다 (POSIX PIPE_BUF) */
@@ -451,6 +482,7 @@
  * 그룹을 정할 수 있는 조건: root 이거나, 그 그룹의 살아 있는 프로세스가 모두 호출자와 같은 uid
  * (다른 사용자의 프로세스(init, login 등)를 Ctrl-C 로 끝내게 만들 수 없다). 아니면 Npermission.
  */
+/* pty 주 끝에는 조회(NX_PGID_QUERY)만 된다 (종속 끝의 포그라운드 그룹) */
 #define NX_DEVCMD_TTY_FOREGROUND 6UL
 /* dev:/console 에: arg = struct nx_fontinfo * (buf 가 0 이면 크기만 채운다) */
 #define NX_DEVCMD_CONSOLE_FONT   7UL
@@ -511,6 +543,7 @@
 #define NX_TYPE_DEVICE   7U
 #define NX_TYPE_PIPE     8U
 #define NX_TYPE_PTY      9U     /* 의사 터미널 주 끝 */
+#define NX_TYPE_SHM      10U    /* 공유 메모리 */
 
 /* NxStat: 32바이트 */
 struct nx_stat {
@@ -603,6 +636,15 @@ struct nx_msginfo {
     uint32_t sender_uid;
     uint32_t sender_gid;
     uint32_t length;          /* 메시지 길이 (버퍼가 작아 실패했을 때도 채워진다) */
+};
+
+/* NxChannelReceiveEx 메시지 정보: 24바이트 */
+struct nx_msginfo_ex {
+    uint32_t sender_pid;
+    uint32_t sender_uid;
+    uint32_t sender_gid;
+    uint32_t length;
+    uint64_t handle;          /* 메시지에 붙어 온 핸들, 없으면 NX_HANDLE_INVALID_VALUE */
 };
 
 /* NxReadDir: 256바이트 */

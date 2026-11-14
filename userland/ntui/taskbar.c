@@ -226,9 +226,11 @@ int taskbarKey(int key)
         g_focus = 0;
         if (g_cursor == CURSOR_MENU)
             menuOpen();
-        else if (g_cursor == g_count && clockOpen() != NULL)
-            wmSyncTaskbar();            /* 새 창(활성)을 알아야 호출자의 wmSetActive(taskbarActive()) 가 그 창을 고른다 */
-        else if (g_cursor == g_active && !g_min[g_cursor]) {
+        else if (g_cursor == g_count) {
+            if (!serverActivateApp("nclock"))
+                (void)launchApp("nclock");          /* 창은 연결되는 대로 뜬다 */
+            wmSyncTaskbar();
+        } else if (g_cursor == g_active && !g_min[g_cursor]) {
             wmMinimize(g_cursor);       /* 활성 창을 다시 고르면 최소화 (Windows 작업 표시줄처럼) */
             wmSyncTaskbar();
         } else if (g_count > 0)

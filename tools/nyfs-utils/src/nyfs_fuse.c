@@ -306,6 +306,39 @@ static int op_read(const char *path, char *buf, size_t size, off_t offset, struc
     return (int)got;
 }
 
+/* 심볼릭 링크(nyfs-pack 의 l 항목)의 대상 경로 = 노드의 내용. NyxisOS 경로("app:/x.run" 등)라 호스트에서는
+ * 보통 따라갈 수 없지만, ls -l 이 대상을 보여 준다 */
+static int op_readlink(const char *path, char *buf, size_t size)
+{
+    nyfs_cred_t cred;
+    nyfs_ino_t ino;
+    nyfs_inode_t inode;
+    usize got = 0;
+    nyfs_status_t status;
+
+    if (size == 0) {
+        return -EINVAL;
+    }
+    nyfs_cred_from_context(&cred);
+    status = nyfs_resolve(path, &cred, &ino);
+    if (NSTATUS_IS_ERR(status)) {
+        return nyfs_status_to_errno(status);
+    }
+    status = nyfs_read_inode(&g_vol, ino, &inode);
+    if (NSTATUS_IS_ERR(status)) {
+        return nyfs_status_to_errno(status);
+    }
+    if (inode.type != NYFS_INO_TYPE_SYMLINK) {
+        return -EINVAL;
+    }
+    status = nyfs_op_read(&g_vol, ino, &cred, 0, buf, size - 1, &got);
+    if (NSTATUS_IS_ERR(status)) {
+        return nyfs_status_to_errno(status);
+    }
+    buf[got] = '\0';
+    return 0;
+}
+
 static int op_write(const char *path, const char *buf, size_t size, off_t offset, struct fuse_file_info *fi)
 {
     nyfs_cred_t cred;
@@ -507,6 +540,7 @@ static const struct fuse_operations nyfs_fuse_ops = {
     .create   = op_create,
     .open     = op_open,
     .read     = op_read,
+    .readlink = op_readlink,
     .write    = op_write,
     .unlink   = op_unlink,
     .rmdir    = op_rmdir,

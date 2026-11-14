@@ -206,6 +206,79 @@ int nx64_service_send(const char *name, const void *buf, size_t len)
     return r < 0 ? -1 : 0;
 }
 
+int nx64_service_send_fd(const char *name, const void *buf, size_t len, int fd)
+{
+    char path[160];
+    long h;
+    long a = __nl_fd_to_handle(fd);
+    int r;
+    int saved;
+
+    if (a < 0 || service_path(name, path, sizeof(path)) < 0)
+        return -1;
+    h = __nl_channel_open(path);
+    if (h < 0)
+        return -1;
+    r = __nl_channel_send_handle(h, buf, len, a);
+    saved = errno;
+    (void)__nl_close(h);
+    errno = saved;
+    return r < 0 ? -1 : 0;
+}
+
+long nx64_service_receive_fd(long h, void *buf, size_t cap, struct nx64_sender *from, int timeout_ms, int *out_fd)
+{
+    unsigned long sender[3];
+    long r = __nl_channel_receive_handle(h, buf, cap, sender, timeout_ms, out_fd);
+
+    if (r >= 0 && from != NULL) {
+        from->pid = sender[0];
+        from->uid = sender[1];
+        from->gid = sender[2];
+    }
+    return r;
+}
+
+int nx64_service_fd(long h)
+{
+    int fd = __nl_adopt_handle(h, NL_O_READ);
+
+    if (fd >= 0)
+        (void)__nl_handle_cloexec(h, 1);
+    return fd;
+}
+
+int nx64_service_connect(const char *name)
+{
+    char path[160];
+    long h;
+    int fd;
+
+    if (service_path(name, path, sizeof(path)) < 0)
+        return -1;
+    h = __nl_channel_open(path);
+    if (h < 0)
+        return -1;
+    fd = __nl_adopt_handle(h, NL_O_WRITE);
+    if (fd < 0)
+        (void)__nl_close(h);
+    return fd;
+}
+
+int nx64_shm_create(size_t size)
+{
+    long h = __nl_shm_create(size, 1);
+
+    return h < 0 ? -1 : __nl_handle_to_fd(h);
+}
+
+void *nx64_shm_map(int fd)
+{
+    long h = __nl_fd_to_handle(fd);
+
+    return h < 0 ? NULL : __nl_shm_map(h);
+}
+
 int nx64_request_poweroff(void)
 {
     return nx64_service_send("svc:/sys/init", "poweroff", 8);
@@ -273,6 +346,15 @@ int nx64_check_password(const char *password)
         return -1;
     }
     return __nl_check_password(me.name, password);
+}
+
+long nx64_pty_foreground(int master_fd)
+{
+    long h = __nl_fd_to_handle(master_fd);
+
+    if (h < 0)
+        return -1;
+    return __nl_devcmd(h, NX_DEVCMD_TTY_FOREGROUND, NX_PGID_QUERY);
 }
 
 unsigned long nx64_timer_hz(void)

@@ -6,6 +6,9 @@
  * 매니페스트: 한 줄에 한 항목 ('#' 주석, 빈 줄 무시). 부모 디렉터리가 먼저 나와야 한다.
  *   d <이미지 경로> <모드(8진수)> <uid> <gid> [<호스트 원본 파일>]
  *   f <이미지 경로> <모드(8진수)> <uid> <gid> <호스트 원본 파일>
+ *   l <이미지 경로> <모드(8진수)> <uid> <gid> <대상 경로>
+ * l 은 심볼릭 링크: 노드 종류가 NYFS_INO_TYPE_SYMLINK 이고 내용이 대상 경로다. 대상은 "ns:/경로"(절대),
+ * "/경로"(같은 네임스페이스), "경로"(링크가 있는 디렉터리 기준) 중 하나 — 커널 VFS 가 열 때 따라간다.
  * nyfs 의 노드는 파일이든 디렉터리든 하나의 오브젝트라 디렉터리도 내용(데이터 스트림)을 가질 수 있다:
  * d 에 원본 파일을 주면 그 내용을 디렉터리의 데이터로 넣는다 (예: 앱 = ELF 를 내용으로, 기본 설정을 자식으로).
  * "d / ..." 는 루트 디렉터리의 모드/소유자를 정한다.
@@ -65,6 +68,21 @@ static int copy_file(nyfs_volume_t *vol, nyfs_ino_t ino, const char *src)
     return 0;
 }
 
+/* 새로 만든 파일 노드를 심볼릭 링크로: 내용 = 대상 경로, 노드 종류 = SYMLINK */
+static int make_symlink(nyfs_volume_t *vol, nyfs_ino_t ino, const char *target)
+{
+    usize len = (usize)strlen(target);
+    usize done = 0;
+    nyfs_inode_t inode;
+
+    if (NSTATUS_IS_ERR(nyfs_op_write(vol, ino, &g_root, 0, target, len, &done)) || done != len)
+        return -1;
+    if (NSTATUS_IS_ERR(nyfs_read_inode(vol, ino, &inode)))
+        return -1;
+    inode.type = NYFS_INO_TYPE_SYMLINK;
+    return NSTATUS_IS_ERR(nyfs_write_inode(vol, ino, &inode)) ? -1 : 0;
+}
+
 static int apply_line(nyfs_volume_t *vol, char *line, unsigned lineno)
 {
     char kind[4];
@@ -79,8 +97,9 @@ static int apply_line(nyfs_volume_t *vol, char *line, unsigned lineno)
 
     src[0] = '\0';
     fields = sscanf(line, "%3s %1023s %o %lu %lu %1023s", kind, path, &mode, &uid, &gid, src);
-    if (fields < 5 || (kind[0] != 'd' && kind[0] != 'f') || kind[1] != '\0' ||
-        (kind[0] == 'f' && fields != 6) || mode > 07777U || path[0] != '/') {
+    if (fields < 5 || (kind[0] != 'd' && kind[0] != 'f' && kind[0] != 'l') || kind[1] != '\0' ||
+        (kind[0] != 'd' && fields != 6) || mode > 07777U || path[0] != '/' ||
+        (kind[0] == 'l' && strcmp(path, "/") == 0)) {
         fprintf(stderr, "nyfs-pack: line %u: malformed entry\n", lineno);
         return -1;
     }
@@ -102,7 +121,12 @@ static int apply_line(nyfs_volume_t *vol, char *line, unsigned lineno)
             fprintf(stderr, "nyfs-pack: line %u: cannot create %s (status %d)\n", lineno, path, (int)st);
             return -1;
         }
-        if (src[0] != '\0' && copy_file(vol, ino, src) != 0)
+        if (kind[0] == 'l') {
+            if (make_symlink(vol, ino, src) != 0) {
+                fprintf(stderr, "nyfs-pack: line %u: cannot make link %s -> %s\n", lineno, path, src);
+                return -1;
+            }
+        } else if (src[0] != '\0' && copy_file(vol, ino, src) != 0)
             return -1;
     }
 

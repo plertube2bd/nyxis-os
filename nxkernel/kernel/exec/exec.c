@@ -75,6 +75,8 @@ Nstatus exec_replace(struct trap_frame *frame, const char *path, const spawn_arg
 
             if (slot->type == NX_HANDLE_DEVICE && slot->dev)
                 slot->dev->mapped_va = 0;
+            if (slot->type == NX_HANDLE_SHM)
+                slot->shm_va = 0;            /* 공유 메모리 매핑도 옛 주소 공간과 함께 사라진다 (프레임은 객체의 것) */
         }
     }
     old = self->addrspace;

@@ -40,7 +40,7 @@ out/nlibc/bin/nlcc -O2 -o demo.run demo.c
 nlcc -o tmp:/demo.run app:/src/examples/nx64demo.c && tmp:/demo.run
 ```
 
-데스크톱(ntui)에서는 Super+R로 명령을 입력하면 터미널 창(ntui의 터미널 에뮬레이터 + pty)에서 실행된다. Tab으로 최대화된 창을 고를 수 있다. TUI 앱은 그 창을 터미널로 쓴다 (창 크기가 바뀌면 SIGWINCH).
+데스크톱(ntui)에서는 Super+R로 명령을 입력하면 터미널 창(nterm: 터미널 에뮬레이터 + pty, NWP 클라이언트)에서 실행된다. Tab으로 최대화된 창을 고를 수 있다. TUI 앱은 그 창을 터미널로 쓴다 (창 크기가 바뀌면 SIGWINCH).
 
 ## TUI
 
@@ -57,6 +57,40 @@ nlcc -o tmp:/demo.run app:/src/examples/nx64demo.c && tmp:/demo.run
 
 - **스타일:** `nx64_style`은 256색 `fg`/`bg`와 `NX64_BOLD`·`NX64_UNDERLINE`·`NX64_REVERSE`로 이루어진다. `nx64_style_make(fg, bg, attr)`로 만든다.
 - **기본 스타일:** `NX64_DEFAULT`, `NX64_FRAME`, `NX64_ACCENT`, `NX64_SELECTED`, `NX64_DIM`은 데스크톱의 nyx 테마와 같은 색이다.
+
+## ntui 창 (터미널 창 다루기)
+
+TUI 프로그램은 ntui(데스크톱)의 터미널 창(nterm) 안에서 돈다. 그 창을 프로그램이 직접 다룰 수 있다.
+
+```c
+int main(void)
+{
+    struct nx64_app app = { draw, key, NULL, 0 };
+
+    nx64_ntui_require("mygame");            /* ntui 의 터미널 창이 아니면 이유를 쓰고 끝낸다 */
+    nx64_win_resize(80, 25);                /* 안쪽 80 x 25 칸 */
+    nx64_win_center();
+    return nx64_tui_run(&app, NULL);        /* 크기가 바뀌면 셀 버퍼를 맞추고 다시 그린다 */
+}                                           /* 끝나면 창은 처음 모양으로 돌아간다 */
+```
+
+| 함수 | 하는 일 |
+|---|---|
+| `nx64_ntui_present()` | ntui 의 터미널 창 안이면 1. `NWP_DISPLAY` 가 있을 때만 터미널에 묻는다 (XTVERSION `CSI > 0 q` 에 nterm 이 답한다) |
+| `nx64_ntui_require(prog)` | 아니면 `prog: this program runs only in an ntui terminal window ...` 를 쓰고 `exit(1)` |
+| `nx64_win_info(&w)` | `x`, `y` (창 왼쪽 위, 화면 칸), `cols`, `rows` (안쪽 크기), `state`, `area_cols`, `area_rows` (창 영역) |
+| `nx64_win_resize(cols, rows)` | 안쪽 크기 (0 = 그대로). 컴포지터가 창 영역에 맞게 줄일 수 있다 |
+| `nx64_win_move(x, y)` / `nx64_win_center()` | 옮기기 |
+| `nx64_win_set_state(s)` | `NX64_WIN_NORMAL` / `MAXIMIZED` / `FULLSCREEN` / `MINIMIZED` |
+| `nx64_win_title(t)` | 창 제목 (OSC 2) |
+| `nx64_win_keep()` | 끝날 때 되돌리지 않는다 (기본은 크기/위치/상태를 처음 것으로 되돌린다) |
+
+- ntui 밖이면 `-1` + `ENOTSUP`. 최대화/전체 화면인 창을 옮기거나 크기를 바꾸면 보통 배치가 된다.
+- 바꾸기는 비동기다. 결과는 곧 온다: `nx64_tui_run` 이 다시 그리고, 직접 `nx64_tui_key` 를 쓰면 `NX64_KEY_RESIZE`.
+  바꾼 바로 뒤의 `nx64_win_info` 는 nterm 이 컴포지터와 맞춘 뒤에 답한다 (NWP `SYNC`).
+- 터미널 시퀀스는 xterm 과 같다 (`CSI 8;행;열 t`, `CSI 3;x;y t`, `CSI 9;1 t`, `CSI 10;1 t`, `CSI 2 t`, 질의 `CSI 11/13/18/19 t`,
+  `OSC 2;제목`): 다른 언어나 셸 스크립트에서도 그대로 쓸 수 있다. 위치는 픽셀이 아니라 칸이다.
+- 셸에서는 [`nwin`](../userland/nwin/main.c): `nwin`, `nwin size 100x30`, `nwin move 4 2`, `nwin center`, `nwin full`, `nwin demo`.
 
 ## 시스템 (비 POSIX)
 
@@ -89,9 +123,12 @@ nlcc -o tmp:/demo.run app:/src/examples/nx64demo.c && tmp:/demo.run
 | [nyfetch](../userland/coreutils/nyfetch.c) | `nx64_whoami`, `nx64_info`, `nx64_info_ulong`, `nx64_memory`, 설정 `fields` |
 | [poweroff](../userland/poweroff/main.c) | `nx64_request_poweroff` (nlibc 앱이 되어 오류를 `strerror`로 알린다) |
 | [nysh](../userland/nysh/main.c) | 설정 `mark`, `nx64_setting_path`로 `rc`, 내장 `whoami`는 `nx64_whoami` (커널 신원) |
+| [journald](../userland/journald/main.c) | `nx64_service_create`/`_receive_fd`/`_fd` (로그, 서비스 출력 파이프, 읽기 요청), `nx64_processes`, 설정 `storage` `max_kib` |
+| [journalman](../userland/journalman/main.c) | `nx64_journal_open`/`_parse`/`_format`/`_send`, `nx64_info` |
+| [nex](../userland/nex/main.c) | `nx64_service_create`/`_connect`/`_send_fd` (init 에게 답장 채널을 넘긴다), 저널 읽기 |
 | [ntui](../userland/ntui/sys.c) | 사용자/호스트/시간대(`nx64_whoami`, `nx64_info`), 테마·startup 설정, 시계 창의 업타임 |
 
-ntui의 화면 그리기는 창 관리자용 자체 계층(`screen.c`, 역할 색)을 쓰고, 화면 모드에서는 아래 `nx64_display_*`로 프레임버퍼에 직접 그린다. init·login·sudo는 nlibc 없이 도는 작은 시스템 런타임(`userland/lib/nyx.h`)에 남겨 두었다.
+ntui의 화면 그리기는 창 관리자용 자체 계층(`screen.c`, 역할 색)을 쓰고, 화면 모드에서는 아래 `nx64_display_*`로 프레임버퍼에 직접 그린다. init·login·elev는 nlibc 없이 도는 작은 시스템 런타임(`userland/lib/nyx.h`)에 남겨 두었다.
 
 ## 프로세스
 
@@ -101,6 +138,7 @@ ntui의 화면 그리기는 창 관리자용 자체 계층(`screen.c`, 역할 �
 | `nx64_signal_pid(pid, sig)` | pid 로 신호. 자기 uid 의 프로세스만 (root 는 모두): 아니면 `EPERM`, 없으면 `ESRCH` |
 | `nx64_find_process(name)` | 그 이름의 다른 프로세스 pid (없으면 0). ntui 가 두 번 뜨지 않게 쓴다 |
 | `nx64_timer_hz()` | CPU 틱의 단위 (초당 틱 수) |
+| `nx64_pty_foreground(master_fd)` | pty 주 끝에서 본 포그라운드 프로세스 그룹 (작업이 없으면 0). 터미널 에뮬레이터가 단축키로 신호를 보낼 때 |
 | `nx64_check_password(pw)` | 지금 사용자의 비밀번호가 맞으면 0 (화면 잠금). 틀리면 -1 + `EACCES` (커널이 1초 늦춘다) |
 
 이름은 커널이 실행 파일 경로에서 정한다 (argv[0] 이 아니다: 다른 프로그램인 척할 수 없다).
@@ -116,9 +154,40 @@ ntui의 화면 그리기는 창 관리자용 자체 계층(`screen.c`, 역할 �
 | `nx64_display_keys(&d, ev, max, timeout_ms)` | 키 이벤트를 읽는다: `code`(PS/2 세트 1, E0 확장은 +0x100, `NX64_KC_*`: PrintScreen 과 메뉴 키 포함), `mods`(`NX64_KMOD_SHIFT/CTRL/ALT/SUPER/ALTGR/CAPS`), `pressed`(누름/뗌), `ch`(Shift 반영 ASCII). `d.fd` 를 poll 해도 된다 |
 | `nx64_display_close(&d)` | 돌려준다 |
 
+## 공유 메모리와 fd 보내기
+
+| 함수 | 하는 일 |
+|---|---|
+| `nx64_shm_create(size)` | 0 으로 채운 공유 메모리 fd (close-on-exec) |
+| `nx64_shm_map(fd)` | 매핑 주소 (fd 를 닫으면 매핑도 사라진다) |
+| `nx64_service_send_fd(name, buf, len, fd)` | 서비스 채널에 메시지와 fd 사본을 보낸다 (Unix 소켓의 fd 넘기기) |
+| `nx64_service_receive_fd(h, buf, cap, &from, timeout, &fd)` | 받은 fd 는 `fd` 에 (없으면 -1) |
+| `nx64_service_fd(h)` | 서비스 받는 핸들을 poll 할 수 있는 fd 로 |
+| `nx64_service_connect(name)` | 서비스에 보내는 끝을 fd 로. 이 fd 를 다른 서비스에 붙여 보내면 그쪽이 답장할 수 있다 (nex 가 init 에게) |
+
+창 프로그램은 이것들 위에 만든 [`<nwp.h>`](NWP.md) 를 쓴다.
+
+## 저널 (journald)
+
+로그는 journald(`svc:/sys/journal`)가 모은다. 보낸 쪽의 pid/uid 는 커널이 붙이므로 속일 수 없다.
+
+- **서비스(nex 유닛)**: 아무것도 하지 않아도 된다. stdout/stderr 의 줄마다 그 유닛의 항목이 된다. 줄이 `<3>` 으로 시작하면 우선순위 3(err).
+- **그 밖의 프로그램**: `nx64_journal_printf(NX64_LOG_WARNING, "disk %d%% full", pct);`
+
+| 함수 | 하는 일 |
+|---|---|
+| `nx64_journal_send(prio, tag, msg)` | 항목 쓰기. `tag` 가 NULL 이면 이 프로세스의 이름. 개행마다, `NX64_JOURNAL_LINE_MAX`(200) 바이트마다 나뉜다. journald 가 없으면 -1 |
+| `nx64_journal_printf(prio, fmt, ...)` | printf 형식으로 |
+| `nx64_log_priority("err")` / `nx64_log_priority_name(3)` | 우선순위 이름 ↔ 번호 (`emerg alert crit err warning notice info debug`, `0`..`7`) |
+| `nx64_journal_open(&q)` | 읽기: 조건(`unit`, `tag`, `max_prio`, `pid`, `lines`, `this_boot`, `follow`, `since`)에 맞는 항목을 한 줄에 하나씩 보내 주는 fd. root 는 모두, 다른 사용자는 자기 uid 의 항목만 |
+| `nx64_journal_parse(line, &e)` | 한 줄을 `struct nx64_journal_entry` 로 (`usec`, `boot`, `pid`, `uid`, `prio`, `unit`, `tag`, `message`) |
+| `nx64_journal_format(&e, host, buf, cap)` | `Nov 14 12:34:56 host tag[pid]: message` (UTC) |
+
+저장 형식(한 줄에 항목 하나)은 `<UTC 마이크로초> <부팅 번호> <pid> <uid> <우선순위> <유닛|-> <태그|-> <메시지>` 이다. 명령으로는 [journalman](../userland/journalman/main.c) (`journalman -u journald -f`, `journalman log -p err 메시지`), 서비스 관리는 [nex](../userland/nex/main.c).
+
 ## 의사 터미널 (`<pty.h>`)
 
-`openpty(&master, &slave, NULL, NULL, &ws)`: 주 끝에 쓴 바이트는 키 입력이 되고(종속 끝의 줄 편집기/raw 규칙), 주 끝을 읽으면 프로그램 출력이 그대로 나온다. 종속 끝을 자식의 0/1/2로 넘기면 그 pty가 자식의 제어 터미널(`dev:/tty`)이 된다 (`isatty`, `tcsetattr`, `TIOCGWINSZ`, Ctrl-C = SIGINT). 크기는 `ioctl(master, TIOCSWINSZ, &ws)` (포그라운드 그룹에 SIGWINCH). 주 끝을 닫으면 그쪽 프로세스는 SIGHUP, 종속 끝 쪽이 모두 끝나면 주 끝 읽기가 0 (EOF). ntui의 터미널 창(`userland/ntui/nterminal.c`)이 예다.
+`openpty(&master, &slave, NULL, NULL, &ws)`: 주 끝에 쓴 바이트는 키 입력이 되고(종속 끝의 줄 편집기/raw 규칙), 주 끝을 읽으면 프로그램 출력이 그대로 나온다. 종속 끝을 자식의 0/1/2로 넘기면 그 pty가 자식의 제어 터미널(`dev:/tty`)이 된다 (`isatty`, `tcsetattr`, `TIOCGWINSZ`, Ctrl-C = SIGINT). 크기는 `ioctl(master, TIOCSWINSZ, &ws)` (포그라운드 그룹에 SIGWINCH). 주 끝을 닫으면 그쪽 프로세스는 SIGHUP, 종속 끝 쪽이 모두 끝나면 주 끝 읽기가 0 (EOF). 터미널 창 nterm(`userland/nterm/main.c`)이 예다.
 
 ## 예제
 

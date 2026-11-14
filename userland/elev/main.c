@@ -1,12 +1,15 @@
 /*
- * sudo - 명령을 root 로 실행해 달라고 init 에게 "요청" 한다 (poweroff 와 같은 구조)
+ * elev - 명령을 root 로 실행해 달라고 init 에게 "요청" 한다 (poweroff 와 같은 구조)
  *
- *   sudo <명령> [인자...]      명령: 이름만이면 app:/<이름>.run, ':' 이 있으면 그 경로
+ *   elev <명령> [인자...]      명령: 이름만이면 app:/<이름>.run, ':' 이 있으면 그 경로
  *
- * 직접 root 가 되지 않는다. 비밀번호를 묻고, 답장 채널 svc:/<사용자>/sudo-<pid> 를 만든 뒤 svc:/sys/init 로
+ * 직접 root 가 되지 않는다. 비밀번호를 묻고, 답장 채널 svc:/<사용자>/elev-<pid> 를 만든 뒤 svc:/sys/init 로
  * 요청을 보낸다. init(uid 0)이 보낸 uid 가 roi:/app/0/init/sudoers.dat 에 있는지, 비밀번호가 맞는지 확인하고
- * 명령을 root 로 띄운다. 명령이 끝나면 init 이 답장 채널로 종료 코드를 보내 주고, sudo 는 그 코드로 끝난다.
- * 명령은 sudo 와 같은 프로세스 그룹에서 돌므로 Ctrl-C 가 둘 다 끝낸다. 요청 형식은 init/main.c 머리말.
+ * 명령을 root 로 띄운다. 명령이 끝나면 init 이 답장 채널로 종료 코드를 보내 주고, elev 는 그 코드로 끝난다.
+ * 명령은 elev 와 같은 프로세스 그룹에서 돌므로 Ctrl-C 가 둘 다 끝낸다. 요청 형식은 init/main.c 머리말.
+ *
+ * 예전 이름 sudo 로도 부를 수 있다: app:/sudo.run 은 app:/elev.run 을 가리키는 심볼릭 링크다 (nxkernel/Makefile 의
+ * ROOTFS_LINKS). 권한 목록 파일 이름(sudoers.dat)은 그대로 둔다.
  *
  * 제한: 요청 전체(비밀번호, 경로, 인자)가 채널 메시지 하나(NX_CHAN_MSG_MAX = 256 바이트)에 들어가야 한다.
  */
@@ -69,7 +72,7 @@ static const char *env_get(char **envp, const char *name)
 
 static int fail(const char *what, long status)
 {
-    nx_puts("sudo: ");
+    nx_puts("elev: ");
     nx_puts(what);
     if (status) {
         nx_puts(" (status ");
@@ -97,7 +100,7 @@ int main(int argc, char **argv, char **envp)
     int i;
 
     if (argc < 2) {
-        nx_puts("usage: sudo <command> [args...]\n");
+        nx_puts("usage: elev <command> [args...]\n");
         return 2;
     }
     if (argc - 1 > MAX_ARGS)
@@ -120,12 +123,12 @@ int main(int argc, char **argv, char **envp)
         nx_memcpy(path + 5 + n, ".run", 5);
     }
 
-    /* 답장 채널: svc:/<이름>/sudo-<pid> (같은 uid 와 root 만 보낼 수 있다) */
+    /* 답장 채널: svc:/<이름>/elev-<pid> (같은 uid 와 root 만 보낼 수 있다) */
     if (nx_strlen(id.name) + 32 >= sizeof(reply_path))
         return fail("user name too long", 0);
     nx_memcpy(reply_path, "svc:/", 5);
     nx_memcpy(reply_path + 5, id.name, nx_strlen(id.name));
-    nx_memcpy(reply_path + 5 + nx_strlen(id.name), "/sudo-", 7);
+    nx_memcpy(reply_path + 5 + nx_strlen(id.name), "/elev-", 7);
     utoa(pi.pid, num);
     nx_memcpy(reply_path + nx_strlen(reply_path), num, nx_strlen(num) + 1);
 
@@ -139,7 +142,7 @@ int main(int argc, char **argv, char **envp)
     /* 비밀번호 (root 는 묻지 않는다) */
     password[0] = '\0';
     if (id.uid != 0) {
-        nx_puts("[sudo] password for ");
+        nx_puts("[elev] password for ");
         nx_puts(id.name);
         nx_puts(": ");
         (void)nx_set_echo(0);
@@ -155,7 +158,7 @@ int main(int argc, char **argv, char **envp)
     utoa(pgid > 0 ? (unsigned long)pgid : 0UL, num);
 
     g_len = 0;
-    r = put_field("sudo") | put_field(num) | put_field(id.name) | put_field(reply_path) |
+    r = put_field("elev") | put_field(num) | put_field(id.name) | put_field(reply_path) |
         put_field(password) | put_field(env_get(envp, "PWD")) | put_field(path);
     for (i = 1; i < argc && r == 0; i++)
         r = put_field(argv[i]);

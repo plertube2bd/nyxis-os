@@ -96,6 +96,7 @@
 ;
 ;   771 NxKernelPrint(const char *str)    디버그 로그. 서식 문자열 아님, 제어 문자는 '?' 로 치환
 ;   777 NxDebugNop
+;       ↑ 디버그 콜: make DEBUG_SYSCALLS=1 (SELFTEST=1 이면 자동) 커널에만 있다. 일반 커널은 NsyscallFailed
 ;
 ; 그 외 번호는 NsyscallFailed. 사용자 포인터는 모두 검증된다 (uaccess.h: 페이지 테이블 USER/RW 비트 확인 +
 ; 접근 도중 매핑이 바뀌는 경쟁에도 안전한 폴트 복구 복사). 핸들은 프로세스별 테이블에서 권한(NX_RIGHT_*)까지
@@ -181,8 +182,8 @@
 96  | NxVirtualAlloc  ; [구현됨: brk 방식, mmap 스타일은 아직]
 97  | NxVirtualFree  ; 예약됨 (v1 은 NxVirtualAlloc 에 음수를 넘기는 것이 "해제")
 98  | NxProtect
-99  | NxSharedMemoryCreate
-100 | NxSharedMemoryMap
+99  | NxSharedMemoryCreate  ; [구현됨]
+100 | NxSharedMemoryMap  ; [구현됨]
 
 ; =========================================================
 ; 0x0080 ~ 0x009F : IPC
@@ -195,6 +196,8 @@
 132 | NxSignal
 133 | NxEventCreate
 134 | NxPtyCreate  ; [구현됨]
+135 | NxChannelSendHandle  ; [구현됨]
+136 | NxChannelReceiveEx  ; [구현됨]
 
 ; =========================================================
 ; 0x00A0 ~ 0x00BF : Filesystem
@@ -233,6 +236,7 @@
 
 ; =========================================================
 ; 0x0300 ~ Debug / Experimental
+;   make DEBUG_SYSCALLS=1 (또는 SELFTEST=1) 로 빌드한 커널에만 있다. 일반 커널은 768~1023 을 모두 NsyscallFailed
 ; =========================================================
 
 768 | NxTrace

@@ -1,0 +1,9 @@
+# 시스템 저널 (nex status journald). 유닛 파일 형식은 userland/init/service.c 머리말
+description = Nyxis system journal
+exec        = app:/journald.run
+restart     = always
+restart_ms  = 500
+boot        = yes
+order       = 10
+# journald 는 자기 출력을 자기가 읽을 수 없으니 콘솔로
+output      = console

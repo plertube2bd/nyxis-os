@@ -24,7 +24,9 @@
 #   옵션:  DEBUG=1     부트로더 프레임버퍼 테스트 패턴 활성화 (-DNYTB_DEBUG)
 #          RES=WxH     화면 해상도 (기본 1600x900). 부트로더가 정확히 그 모드를, 없으면 그 안에 드는 가장 큰
 #                      모드를 고른다. 바꾸면 부트로더/ISO 만 다시 만든다 (예: make RES=1280x800 run)
-#          SELFTEST=1  커널 부팅 후 자체 점검(kernel/selftest.c) 실행 (-DNYX_SELFTEST)
+#          SELFTEST=1  커널 부팅 후 자체 점검(kernel/selftest.c) 실행 (-DNYX_SELFTEST). DEBUG_SYSCALLS 도 켠다
+#          DEBUG_SYSCALLS=1  디버그 시스템 콜(0x0300 구역, 768~1023: NxKernelPrint, NxDebugNop)을 커널에 넣는다
+#                      (-DNYX_DEBUG_SYSCALLS). 기본은 빠진다: 그 번호는 NsyscallFailed
 #
 # [수정 이력 요약]
 #  - 커널 컴파일 옵션 정비 (예전에는 -std=gnu11 + 경고 옵션 없음):
@@ -132,6 +134,29 @@ ifneq ($(SELFTEST),)
 KERNEL_CFLAGS += -DNYX_SELFTEST=$(SELFTEST)
 endif
 
+# 디버그 시스템 콜 (0x0300 구역). 아무나 커널 로그에 글을 쓸 수 있는 NxKernelPrint 같은 것이라 기본 빌드에서는
+#   코드째 빠진다 (kernel/syscall/syscall.c). SELFTEST 의 자체 점검이 이 콜로 사용자 포인터 검증을 시험하므로
+#   SELFTEST 이미지에서는 기본으로 켠다
+ifneq ($(SELFTEST),)
+DEBUG_SYSCALLS ?= 1
+endif
+ifneq ($(filter-out 0,$(DEBUG_SYSCALLS)),)
+KERNEL_CFLAGS += -DNYX_DEBUG_SYSCALLS=1
+DEBUG_SYSCALLS_ON = 1
+else ifneq ($(SELFTEST),)
+$(error SELFTEST 이미지에는 디버그 시스템 콜이 필요합니다 (DEBUG_SYSCALLS=0 과 함께 쓸 수 없음))
+else
+DEBUG_SYSCALLS_ON = 0
+endif
+# 켜고 끄면 syscall.o 를 다시 컴파일하도록 (Makefile 은 CFLAGS 변경을 추적하지 않는다: 그러지 않으면 한 번
+#   DEBUG_SYSCALLS=1 로 빌드한 뒤 일반 빌드를 해도 디버그 콜이 남는다)
+DEBUG_SYSCALLS_STAMP = $(BUILD)/.debug-syscalls-$(DEBUG_SYSCALLS_ON)
+$(DEBUG_SYSCALLS_STAMP):
+	@mkdir -p $(BUILD)
+	@rm -f $(BUILD)/.debug-syscalls-*
+	@touch $@
+$(BUILD)/obj/kernel/syscall/syscall.o: $(DEBUG_SYSCALLS_STAMP)
+
 ASFLAGS = --64
 
 # =========================
@@ -182,6 +207,7 @@ KERNEL_C_SRCS = \
 	kernel/process/spawn.c \
 	kernel/mm/pfa.c \
 	kernel/mm/kheap.c \
+	kernel/mm/shm.c \
 	kernel/crypto/sha256.c \
 	kernel/security/auth.c \
 	kernel/syscall/nspath.c \
@@ -337,7 +363,7 @@ USER_CFLAGS = \
 #   버리게 한다 (정적 링크가 .o 단위가 아니라 함수 단위가 된다: 예) printf 만 쓰는 앱에 scanf/strtod 가 딸려 오지 않음).
 #   NLIBC_CFLAGS 도 이것을 물려받는다. 앱 쪽은 nlcc 드라이버가 같은 옵션을 넣는다.
 
-# 사용자 프로그램 (라이브러리가 아닌 것: init/login/sudo/..., elftest, coreutils, nysh, ntui 등 userland/ 의 앱)은
+# 사용자 프로그램 (라이브러리가 아닌 것: init/login/elev/..., elftest, coreutils, nysh, ntui 등 userland/ 의 앱)은
 #   C99 까지의 문법을 쓴다 (선언과 문장 섞기, // 주석, for 안의 선언, 지정 초기화 등). -pedantic 이 C11 이후의
 #   문법과 GNU 확장을 막는다. VLA 는 프로젝트 규칙대로 계속 금지(-Wvla: 작은 사용자 스택에서 위험).
 #   라이브러리(userland/lib, nlibc)와 nlibc 의 검사/예제 프로그램은 C89 그대로 (USER_CFLAGS, NLIBC_CFLAGS,
@@ -371,14 +397,20 @@ $(BUILD)/obj/ulib/crt0.o: $(ULIB_DIR)/crt0.s
 USERLAND_SPECIAL = lib nlibc initrd elftest coreutils kilo nlcc
 USERLAND_DIRS    = $(filter-out $(USERLAND_SPECIAL),$(sort $(notdir $(patsubst %/,%,$(dir $(wildcard $(ROOT)/userland/*/*.c))))))
 
-# 시스템 프로그램: userland/<이름>/main.c -> fs:/usr/<이름>.run (= app:/<이름>.run)
+# 시스템 프로그램: userland/<이름>/*.c -> fs:/usr/<이름>.run (= app:/<이름>.run). 디렉터리의 *.c 를 모두 묶는다
 USER_PROGS     = $(filter $(USERLAND_DIRS),$(notdir $(patsubst %/main.c,%,$(shell grep -l '^\#include "nyx.h"' $(ROOT)/userland/*/main.c 2>/dev/null))))
 USER_PROG_ELFS = $(addprefix $(USR_DIR)/,$(addsuffix .run,$(USER_PROGS)))
 
+# main.c 말고 다른 소스/헤더가 바뀌어도 다시 만든다
+$(foreach p,$(USER_PROGS),$(eval $(USR_DIR)/$(p).run: $(wildcard $(ROOT)/userland/$(p)/*.c $(ROOT)/userland/$(p)/*.h)))
+
 $(USER_PROG_ELFS): $(USR_DIR)/%.run: $(ROOT)/userland/%/main.c $(ULIB_OBJS) $(ULIB_DIR)/nyx.h $(USER_LDS)
-	@mkdir -p $(BUILD)/obj/user $(USR_DIR)
-	$(CC) $(USER_PROG_CFLAGS) -I$(ULIB_DIR) -c $< -o $(BUILD)/obj/user/$*.o
-	$(USER_LD) -o $@ $(ULIB_OBJS) $(BUILD)/obj/user/$*.o
+	@mkdir -p $(BUILD)/obj/user/$* $(USR_DIR)
+	@for s in $(wildcard $(ROOT)/userland/$*/*.c); do \
+		echo "  CC(user) $$s"; \
+		$(CC) $(USER_PROG_CFLAGS) -I$(ULIB_DIR) -c $$s -o $(BUILD)/obj/user/$*/$$(basename $$s .c).o || exit 1; \
+	done
+	$(USER_LD) -o $@ $(ULIB_OBJS) $(patsubst $(ROOT)/userland/$*/%.c,$(BUILD)/obj/user/$*/%.o,$(wildcard $(ROOT)/userland/$*/*.c))
 
 # elftest: 자체 점검용 (자기 start.s 로 진입 레지스터를 검사하고, 공용 런타임도 쓴다)
 $(ELFTEST_ELF): $(ELFTEST_DIR)/elftest.c $(ELFTEST_DIR)/systest.c $(ELFTEST_DIR)/start.s $(USER_LDS) $(BUILD)/obj/ulib/nyx.o $(ULIB_DIR)/nyx.h
@@ -400,7 +432,7 @@ NLIBC_ASM_MODS = setjmp sigtramp
 NLIBC_HDRS   = $(wildcard $(NLIBC_DIR)/library/*.h $(NLIBC_DIR)/library/sys/*.h) $(NLIBC_DIR)/src/nl_internal.h $(INCLUDE_DIR)/nyx_abi.h
 # nx64api (<nx64.h>: TUI + 비 POSIX). 시스템 콜은 플랫폼 계층(nxsys / sys_linux)으로 부르므로 호스트 검사용
 #   nlibc 에도 들어간다 (svc:/, info:/ 는 -1). libnlibc.a 에 있으니 nlcc(호스트/Nyxis 안 모두)로 링크 옵션 없이 쓴다
-NX64_MODS    = nx64_tui nx64_sys
+NX64_MODS    = nx64_tui nx64_sys nx64_journal nwp
 NLIBC_OBJS   = $(patsubst %,$(BUILD)/obj/nlibc/%.o,$(NLIBC_MODS) $(NLIBC_ASM_MODS) $(NX64_MODS) nxsys)
 NLIBC_A      = $(BUILD)/obj/nlibc/libnlibc.a
 NLIBC_CRT0   = $(BUILD)/obj/nlibc/nlcrt0.o
@@ -478,10 +510,14 @@ COREUTILS_ELFS = $(addprefix $(USR_DIR)/,$(addsuffix .run,$(COREUTILS)))
 NLIBC_APPS      = $(filter-out $(USER_PROGS),$(USERLAND_DIRS))
 NLIBC_APP_ELFS  = $(addprefix $(USR_DIR)/,$(addsuffix .run,$(NLIBC_APPS)))
 
+# 앱이 다른 디렉터리의 소스를 함께 쓸 때: NLIBC_APP_EXTRA_<앱> (소스), NLIBC_APP_INC_<앱> (-I)
+NLIBC_APP_EXTRA_nkeys = $(ROOT)/userland/ntui/keymap.c
+NLIBC_APP_INC_nkeys   = -I$(ROOT)/userland/ntui
+
 define NLIBC_APP_RULE
-$(USR_DIR)/$(1).run: $(wildcard $(ROOT)/userland/$(1)/*.c $(ROOT)/userland/$(1)/*.h) $(NLIBC_STAMP)
+$(USR_DIR)/$(1).run: $(wildcard $(ROOT)/userland/$(1)/*.c $(ROOT)/userland/$(1)/*.h) $(NLIBC_APP_EXTRA_$(1)) $(NLIBC_STAMP)
 	@mkdir -p $(USR_DIR)
-	$(NLCC) $(NLIBC_APP_CFLAGS) -D_POSIX_C_SOURCE=200809L -o $$@ $(wildcard $(ROOT)/userland/$(1)/*.c)
+	$(NLCC) $(NLIBC_APP_CFLAGS) $(NLIBC_APP_INC_$(1)) -D_POSIX_C_SOURCE=200809L -o $$@ $(wildcard $(ROOT)/userland/$(1)/*.c) $(NLIBC_APP_EXTRA_$(1))
 endef
 $(foreach a,$(NLIBC_APPS),$(eval $(call NLIBC_APP_RULE,$(a))))
 
@@ -640,8 +676,10 @@ test-disk: $(NYFS_PACK)
 
 # nyfs-utils 의 소스가 바뀌면 다시 만든다 (이 규칙에 의존성이 없으면 옛 nyfs-pack 으로 이미지를 만들게 된다)
 NYFS_PACK_SRCS = $(wildcard $(ROOT)/tools/nyfs-utils/src/*.c $(ROOT)/tools/nyfs-utils/include/*.h)
+#   BUILD 를 직접 넘긴다: make BUILD=<dir> 로 부르면 명령줄 변수가 하위 make 에도 전해져 nyfs-pack 이 <dir> 에
+#   만들어지고 $(NYFS_PACK) 은 옛 바이너리로 남는다
 $(NYFS_PACK): $(NYFS_PACK_SRCS)
-	$(MAKE) -C $(ROOT)/tools/nyfs-utils pack
+	$(MAKE) -C $(ROOT)/tools/nyfs-utils BUILD=$(abspath $(dir $(NYFS_PACK))) pack
 
 # 루트 파일시스템 = nyfs 이미지 (커널이 fs:/ 로 마운트)
 ROI_SRC   = $(ROOT)/rootfs/roi
@@ -650,10 +688,14 @@ ROI_FILES = $(shell find $(ROI_SRC) -type f 2>/dev/null)
 APP_SRC   = $(ROOT)/rootfs/app
 APP_FILES = $(shell find $(APP_SRC) 2>/dev/null)
 
+# 심볼릭 링크 (nyfs-pack 의 l 항목: 커널 VFS 가 열 때 따라간다). 대상이 이름만이면 링크가 있는 디렉터리 기준.
+#   app:/sudo.run -> app:/elev.run (권한 상승 명령의 예전 이름)
+ROOTFS_LINKS = --link /usr/sudo.run=elev.run
+
 $(INITRD_IMG): $(ROOTFS_EXTRA_DEPS) $(USER_PROG_ELFS) $(ELFTEST_ELF) $(NLIBC_TEST_ELF) $(FPUTEST_ELF) $(HELLO_ELF) $(COREUTILS_ELFS) $(NLIBC_APP_ELFS) $(KILO_ELF) $(NLCC_ELF) $(NLCC_STAMP) $(INITRD_RUN) $(ROOT_USERS_DB) $(NYFS_PACK) $(ROOT)/tools/mkrootfs.py $(ROI_FILES) $(APP_FILES)
 	python3 $(ROOT)/tools/mkrootfs.py --users $(ROOT_USERS_DB) --bin $(USR_DIR) --roi $(ROI_SRC) --app $(APP_SRC) \
 		--file /usr/hellowld.run=$(INITRD_RUN):0644 --tree /usr/lib=$(NLCC_ROOT)/lib --tree /usr/src=$(NLCC_ROOT)/src \
-		$(ROOTFS_EXTRA) > $(ROOTFS_MANIFEST)
+		$(ROOTFS_LINKS) $(ROOTFS_EXTRA) > $(ROOTFS_MANIFEST)
 	$(NYFS_PACK) -s $(ROOTFS_SIZE) -o $@ $(ROOTFS_MANIFEST)
 
 # FAT16 은 운영체제에서 쓰지 않는다: 호스트 테스트(make test-host)용 이미지만 만든다
@@ -890,12 +932,15 @@ test-coreutils: nlibc-host-lib
 	$(LD) -static -nostdlib -o $(CU_HOST_OUT)/bin/nysh $(NLIBC_HOST_OUT)/crt0.o $(CU_HOST_OUT)/nysh.o $(NLIBC_HOST_LIB)
 	sh $(HOST_DIR)/nysh/run.sh $(CU_HOST_OUT)/bin $(CU_HOST_OUT)/work-nysh
 
-# ntui 의 터미널 에뮬레이터(vt.c)를 호스트에서 검사한다 (libc 만 쓰므로 호스트 컴파일러 + 새니타이저)
+# nterm 의 터미널 에뮬레이터(vt.c)와 ntui 의 단축키 설정(keymap.c)을 호스트에서 검사한다 (libc 만 쓰므로 호스트 컴파일러 + 새니타이저)
 test-ntui:
 	@mkdir -p $(HOST_OUT)/ntui
-	$(CC) -std=c99 -Wall -Wextra -Werror -Wshadow $(HOST_SAN) -I$(ROOT)/userland/ntui \
-		$(HOST_DIR)/ntui/vt_test.c $(ROOT)/userland/ntui/vt.c -o $(HOST_OUT)/ntui/vt_test
+	$(CC) -std=c99 -Wall -Wextra -Werror -Wshadow $(HOST_SAN) -I$(ROOT)/userland/nterm -idirafter $(NLIBC_DIR)/library \
+		$(HOST_DIR)/ntui/vt_test.c $(ROOT)/userland/nterm/vt.c -o $(HOST_OUT)/ntui/vt_test
 	$(HOST_OUT)/ntui/vt_test
+	$(CC) -std=c99 -Wall -Wextra -Werror -Wshadow $(HOST_SAN) -I$(ROOT)/userland/ntui -idirafter $(NLIBC_DIR)/library \
+		$(HOST_DIR)/ntui/keymap_test.c $(ROOT)/userland/ntui/keymap.c -o $(HOST_OUT)/ntui/keymap_test
+	$(HOST_OUT)/ntui/keymap_test $(ROOT)/rootfs/app/ntui/keys
 
 # =========================
 # Check: C89 준수/경고 검사

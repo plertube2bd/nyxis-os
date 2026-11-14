@@ -33,6 +33,12 @@ typedef struct vfs_stat {
  * NX_O_READ(1)/NX_O_WRITE(2) 와 겹치지 않는다. 사용자는 NxOpen 으로 이 비트를 줄 수 없다 */
 #define VFS_O_EXEC 0x100U
 
+/* vnode 종류 (vfs_init_vnode 의 type). 1 = 파일, 2 = 디렉터리, 3 = 심볼릭 링크.
+ * 링크는 VFS 가 경로를 해석할 때 readlink 로 대상 경로를 읽어 따라간다 (vfs.c 의 follow_link) */
+#define VFS_NODE_FILE    1U
+#define VFS_NODE_DIR     2U
+#define VFS_NODE_SYMLINK 3U
+
 typedef struct vfs_ops {
     Nstatus (*lookup)(vnode_t *dir, const char *name, vnode_t **out_vnode);
     Nstatus (*open)(vnode_t *vnode, u32 flags, handle_t *out_handle);
@@ -65,6 +71,10 @@ typedef struct vfs_ops {
     /* vnode 를 해제하기 직전에 파일시스템의 vnode 데이터(fs_private)를 돌려준다 (선택 사항).
      * VFS 가 캐시에서 거두거나 지운 파일의 마지막 핸들이 닫힐 때 부른다 */
     void (*release)(vnode_t *vnode);
+
+    /* 심볼릭 링크(VFS_NODE_SYMLINK)의 대상 경로를 buf 에 채우고 길이를 *out_len 에 (NUL 은 붙이지 않는다).
+     * 대상이 max 바이트 이상이면 NpathTooLong. 선택 사항 (NULL 이면 링크를 따라갈 수 없다: Nunsupported) */
+    Nstatus (*readlink)(vnode_t *vnode, char *buf, usize max, usize *out_len);
 } vfs_ops_t;
 
 struct vfs_filesystem {

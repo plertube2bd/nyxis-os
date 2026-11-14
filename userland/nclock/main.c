@@ -1,5 +1,5 @@
 /*
- * clock.c - 시계 / 달력 창 (작업 표시줄의 시계 위젯: 작업 표시줄(Super+B)에서 시계를 고르고 Enter, 또는 메뉴의 Clock & calendar)
+ * nclock - 시계 / 달력 (NWP 창 프로그램). q / Esc 끝. 원래 설명: 시계 / 달력 창 (작업 표시줄의 시계 위젯: 작업 표시줄(Super+B)에서 시계를 고르고 Enter, 또는 메뉴의 Clock & calendar)
  *
  *    14:32:07
  *    Wednesday, 11 November 2026
@@ -20,7 +20,33 @@
 
 #include <nx64.h>
 
-#include "ntui.h"
+#define NWP_SHORT_NAMES
+#include <nwp.h>
+
+/* 창 (NWP) */
+static struct nwp_window *g_w;
+struct window {
+    void *data;
+};
+#define screenText(x, y, s, r)          nwp_text(g_w, (x), (y), (s), (r))
+#define screenFill(x, y, cw, chh, c, r) nwp_fill(g_w, (x), (y), (cw), (chh), (c), (r))
+
+static int utcOffset;                   /* 분 (info:/utc_offset "+HH:MM") */
+static char timezoneName[64];           /* info:/timezone */
+
+static void loadZone(void)
+{
+    char buf[16];
+
+    if (nx64_info("timezone", timezoneName, sizeof(timezoneName)) <= 0)
+        strcpy(timezoneName, "UTC");
+    utcOffset = 0;
+    if (nx64_info("utc_offset", buf, sizeof(buf)) == 6 && (buf[0] == '+' || buf[0] == '-') && buf[3] == ':') {
+        int m = ((buf[1] - '0') * 10 + (buf[2] - '0')) * 60 + (buf[4] - '0') * 10 + (buf[5] - '0');
+
+        utcOffset = buf[0] == '-' ? -m : m;
+    }
+}
 
 struct clock {
     long shown;                         /* 마지막으로 그린 시각 (초) */
@@ -115,7 +141,7 @@ static void clockDraw(struct window *w, int x, int y, int cols, int rows, int ac
     int n;
     int i;
     int row;
-    enum role r = ROLE_WINDOW;
+    int r = ROLE_WINDOW;
 
     (void)active;
     screenFill(x, y, cols, rows, ' ', r);
@@ -189,33 +215,35 @@ static int clockKey(struct window *w, int key)
     return 0;
 }
 
-/* 초가 바뀌었으면 다시 그린다 */
-static int clockTick(struct window *w)
+int main(void)
 {
-    struct clock *c = (struct clock *)w->data;
+    static struct clock c;
+    struct window win;
 
-    return local_seconds() != c->shown;
-}
+    loadZone();
+    c.shown = -1;
+    clock_today(&c);
+    win.data = &c;
+    g_w = nwp_open("nclock", "clock", 28, 16, NWP_STATE_NORMAL);
+    if (g_w == NULL) {
+        fprintf(stderr, "nclock: cannot open a window (run it inside ntui)\n");
+        return 1;
+    }
+    for (;;) {
+        struct nwp_event ev;
+        int r;
 
-static void clockClose(struct window *w)
-{
-    free(w->data);
-    w->data = NULL;
-}
-
-static const struct app g_clockApp = { "clock", clockDraw, clockKey, NULL, NULL, clockTick, clockClose };
-
-struct window *clockOpen(void)
-{
-    struct clock *c = (struct clock *)calloc(1, sizeof(*c));
-    struct window *w;
-
-    if (c == NULL)
-        return NULL;
-    c->shown = -1;
-    clock_today(c);
-    w = wmOpen("clock", &g_clockApp, c, 30, 18);
-    if (w == NULL)
-        free(c);
-    return w;
+        clockDraw(&win, 0, 0, nwp_cols(g_w), nwp_rows(g_w), nwp_focused(g_w));
+        (void)nwp_commit(g_w);
+        r = nwp_next_event(g_w, &ev, 1000);    /* 1초마다 시계를 다시 그린다 */
+        if (r < 0 || (r > 0 && ev.type == NWP_EVENT_CLOSE))
+            break;
+        if (r > 0 && ev.type == NWP_EVENT_KEY) {
+            if (ev.key == 'q' || ev.key == NWP_KEY_ESC)
+                break;
+            (void)clockKey(&win, ev.key);
+        }
+    }
+    nwp_close(g_w);
+    return 0;
 }

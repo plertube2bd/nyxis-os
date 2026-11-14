@@ -182,7 +182,7 @@ int dup2(int fd, int fd2)
 
     if (h < 0)
         return -1;
-    if (fd2 < 0 || fd2 >= 32) {             /* NX_MAX_HANDLES */
+    if (fd2 < 0 || fd2 >= NL_FD_MAX) {      /* NX_MAX_HANDLES */
         errno = EBADF;
         return -1;
     }

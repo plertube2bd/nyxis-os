@@ -3,15 +3,16 @@
  *
  * 프로그램 출력(바이트)을 해석해 글자 칸 격자(cols x rows)를 만든다. 화면에 그리는 것은 nterminal.c 가 한다.
  *
- * 해석하는 것:
+ * 해석하는 것 (창 조작/제목은 vtSetWindowOps 로 nterm 에 넘긴다):
  *   제어 문자   BEL(무시) BS HT LF VT FF CR (LF 는 줄바꿈 + 줄 처음: Nyxis 콘솔과 같다), CAN/SUB(시퀀스 취소)
  *   ESC 7 / 8   커서 저장/복원      ESC c 초기화       ESC D 아래로(IND)  ESC E 다음 줄(NEL)  ESC M 위로(RI)
  *   ESC ( 0 / ESC ( B   DEC 선 그리기 문자 집합 켜기/끄기 (G0)
  *   CSI @ A B C D E F G H J K L M P S T X a b d e f m n r s u ` 와 h/l 모드:
  *     4 끼워 넣기, ?1 방향키 응용 모드, ?6 원점 모드, ?7 자동 줄바꿈, ?25 커서, ?47 ?1047 ?1049 보조 화면
  *   SGR 0 1 4 7 22 24 27 30-37 39 40-47 49 90-97 100-107, 38/48 ;5;n (256색) 과 ;2;r;g;b (가까운 256색으로)
- *   DSR 5n / 6n (커서 위치 보고), DA (CSI c) -> 응답 함수로
- *   OSC / DCS / PM / APC 문자열은 끝(BEL 또는 ESC \)까지 버린다
+ *   DSR 5n / 6n (커서 위치 보고), DA (CSI c), XTVERSION (CSI > 0 q: "nterm(1)") -> 응답 함수로
+ *   창 조작 CSI Ps ; Ps ; Ps t (xterm XTWINOPS) -> 창 조작 함수로 (nterm 이 컴포지터에 부탁하고 질의에 답한다)
+ *   OSC 0 / OSC 2 (창 제목) -> 제목 함수로. 그 밖의 OSC 와 DCS / PM / APC 문자열은 끝(BEL 또는 ESC \)까지 버린다
  *   UTF-8: U+2500-259F(상자/블록)은 그대로, 그 밖의 ASCII 아닌 글자는 '?' (글꼴이 ASCII 뿐이다)
  * 줄 끝에서 쓴 뒤의 줄바꿈은 다음 글자까지 미룬다 (xterm 과 같다). 줄 처음의 BS 는 윗줄 끝으로 간다
  * (커널 줄 편집기가 여러 줄에 걸친 입력을 BS 로 되돌아가며 고친다).
@@ -22,12 +23,13 @@
 #include <string.h>
 #include <stdio.h>
 
-#include "ntui.h"
+#include "vt.h"
 
 #define VT_MAX_COLS   256
 #define VT_MAX_ROWS   200
 #define VT_SCROLLBACK 400
 #define VT_PARAMS     16
+#define VT_OSC_MAX    64
 
 enum { S_GROUND, S_ESC, S_CSI, S_STR, S_STR_ESC, S_CHARSET };
 
@@ -62,11 +64,18 @@ struct vt {
     int params[VT_PARAMS];
     int nparams;
     int priv;                           /* CSI 의 '?' 등 */
+    int inter;                          /* CSI 에 중간 바이트가 있었다 (CSI Ps SP t 같은 다른 시퀀스) */
     unsigned utf;                       /* UTF-8 모으는 중인 코드 포인트 */
     int utfNeed;
 
     vt_reply_fn reply;
     void *ctx;
+    vt_winop_fn winop;
+    vt_title_fn title;
+
+    int strOsc;                         /* S_STR 이 OSC 다 (모은다) */
+    char osc[VT_OSC_MAX];
+    int oscLen;
 };
 
 /* ---------------- 셀 ---------------- */
@@ -250,6 +259,12 @@ struct vt *vtNew(int cols, int rows, vt_reply_fn reply, void *ctx)
     clearGrid(v, v->mainGrid);
     clearGrid(v, v->altGrid);
     return v;
+}
+
+void vtSetWindowOps(struct vt *v, vt_winop_fn winop, vt_title_fn title)
+{
+    v->winop = winop;
+    v->title = title;
 }
 
 void vtFree(struct vt *v)
@@ -645,6 +660,14 @@ static void csiDispatch(struct vt *v, int final)
     int n = param(v, 0, 1);
     int i;
 
+    if (v->inter && (final == 't' || final == 'q'))
+        return;                         /* DECSWBV, DECSCUSR 등: 다루지 않는다 */
+
+    if (v->priv == '>' && final == 'q') {
+        if (param(v, 0, 0) == 0)
+            reply(v, "\033P>|nterm(1)\033\\");   /* XTVERSION: nx64_ntui_present 가 이것으로 ntui 의 터미널을 안다 */
+        return;
+    }
     if (v->priv != 0 && final != 'h' && final != 'l' && final != 'c' && final != 'n')
         return;                         /* 모르는 사적 시퀀스 */
 
@@ -759,6 +782,10 @@ static void csiDispatch(struct vt *v, int final)
         if (v->priv == 0 && param(v, 0, 0) == 0)
             reply(v, "\033[?1;2c");     /* VT100 + 고급 비디오 */
         break;
+    case 't':
+        if (v->winop != NULL && v->nparams > 0)
+            v->winop(v->ctx, v->params, v->nparams);
+        break;
     default:
         break;
     }
@@ -809,10 +836,13 @@ static void escDispatch(struct vt *v, int c)
         v->state = S_CSI;
         v->nparams = 0;
         v->priv = 0;
+        v->inter = 0;
         memset(v->params, 0, sizeof(v->params));
         break;
     case ']': case 'P': case 'X': case '^': case '_':
         v->state = S_STR;
+        v->strOsc = c == ']';
+        v->oscLen = 0;
         break;
     case '(':
         v->state = S_CHARSET;
@@ -835,6 +865,23 @@ static void escDispatch(struct vt *v, int c)
     default:
         break;                          /* ESC = > 등 */
     }
+}
+
+/* OSC 문자열이 끝났다: "0;제목" / "2;제목" 이면 창 제목 */
+static void oscDone(struct vt *v)
+{
+    int i;
+
+    if (!v->strOsc || v->title == NULL)
+        return;
+    v->osc[v->oscLen] = '\0';
+    if ((v->osc[0] == '0' || v->osc[0] == '2') && v->osc[1] == ';') {
+        for (i = 2; v->osc[i] != '\0'; i++)
+            if ((unsigned char)v->osc[i] < 0x20 || (unsigned char)v->osc[i] >= 0x7F)
+                v->osc[i] = '?';        /* 제목 글꼴도 ASCII 뿐이다 */
+        v->title(v->ctx, v->osc + 2);
+    }
+    v->strOsc = 0;
 }
 
 static void feedByte(struct vt *v, unsigned char c)
@@ -880,19 +927,27 @@ static void feedByte(struct vt *v, unsigned char c)
             v->priv = c;
             return;
         }
-        if (c >= 0x20 && c <= 0x2F)
-            return;                     /* 중간 바이트: 무시 */
+        if (c >= 0x20 && c <= 0x2F) {
+            v->inter = 1;               /* 중간 바이트: 이 시퀀스는 다른 뜻이다 */
+            return;
+        }
         v->state = S_GROUND;
         if (c >= 0x40 && c <= 0x7E)
             csiDispatch(v, c);
         return;
     case S_STR:
-        if (c == 0x07)
+        if (c == 0x07) {
+            oscDone(v);
             v->state = S_GROUND;
-        else if (c == 0x1B)
+        } else if (c == 0x1B) {
             v->state = S_STR_ESC;
+        } else if (v->strOsc && v->oscLen < VT_OSC_MAX - 1) {
+            v->osc[v->oscLen++] = (char)c;
+        }
         return;
     case S_STR_ESC:
+        if (c == '\\')
+            oscDone(v);
         v->state = c == '\\' ? S_GROUND : S_STR;
         return;
     case S_CHARSET:

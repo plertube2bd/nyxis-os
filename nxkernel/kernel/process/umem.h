@@ -41,6 +41,9 @@
 /* 장치 MMIO 매핑 자리 (NxDeviceMapMMIO). ELF 상한(0x7000_0000_0000) 위, 스택 아래. 힙은 누적 512MiB 상한이라
  * 여기까지 올라오지 않는다. */
 #define NX_USER_MMIO_BASE    0x0000780000000000UL
+/* 공유 메모리 매핑 (kernel/mm/shm.h): 핸들 슬롯 i 의 매핑 = NX_USER_SHM_BASE + i * NX_SHM_SLOT_SIZE */
+#define NX_USER_SHM_BASE     0x0000700000000000UL
+#define NX_SHM_SLOT_SIZE     (32UL * 1024UL * 1024UL)
 #define NX_USER_MMIO_SIZE    (256UL * 1024UL * 1024UL)
 
 /*

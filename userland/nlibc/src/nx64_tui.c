@@ -10,6 +10,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <termios.h>
+#include <errno.h>
+#include <time.h>
 #include <sys/ioctl.h>
 
 #define NX64_OUT_MAX 4096
@@ -36,6 +38,10 @@ static struct nx64_cell *g_front;
 static char g_out[NX64_OUT_MAX];
 static size_t g_out_len;
 static int g_atexit;
+
+/* 창 조작 질의의 답을 기다리다가 함께 읽은 다른 바이트 (그사이에 친 키): read_byte 가 먼저 돌려준다 */
+static unsigned char g_pend[256];
+static size_t g_pend_len;
 
 nx64_style nx64_style_make(int fg, int bg, int attr)
 {
@@ -340,11 +346,50 @@ void nx64_tui_flush(void)
 static int read_byte(void)
 {
     unsigned char c;
-    ssize_t n = read(g_tty, &c, 1);
+    ssize_t n;
+
+    if (g_pend_len > 0) {
+        c = g_pend[0];
+        memmove(g_pend, g_pend + 1, --g_pend_len);
+        return c;
+    }
+    n = read(g_tty, &c, 1);
 
     if (n == 1)
         return c;
     return n == 0 ? -1 : -2;
+}
+
+/* 터미널 크기가 바뀌었으면 셀 버퍼를 새 크기로 (내용은 지운다: 다시 그려야 한다). 바뀌었으면 1 */
+static int check_resize(void)
+{
+    struct winsize ws;
+    struct nx64_cell *b;
+    struct nx64_cell *f;
+    size_t n;
+
+    if (g_tty < 0 || ioctl(g_tty, TIOCGWINSZ, &ws) != 0 || ws.ws_col == 0 || ws.ws_row == 0)
+        return 0;
+    if (ws.ws_col == g_cols && ws.ws_row == g_rows)
+        return 0;
+    n = (size_t)ws.ws_col * (size_t)ws.ws_row;
+    b = (struct nx64_cell *)calloc(n, sizeof(struct nx64_cell));
+    f = (struct nx64_cell *)calloc(n, sizeof(struct nx64_cell));
+    if (b == NULL || f == NULL) {
+        free(b);
+        free(f);
+        return 0;
+    }
+    free(g_back);
+    free(g_front);
+    g_back = b;
+    g_front = f;
+    g_cols = ws.ws_col;
+    g_rows = ws.ws_row;
+    out_cstr("\033[0m\033[2J");
+    nx64_tui_clear(NX64_DEFAULT);
+    nx64_tui_invalidate();
+    return 1;
 }
 
 int nx64_tui_key(int timeout_ms)
@@ -357,6 +402,8 @@ int nx64_tui_key(int timeout_ms)
     if (g_tty < 0)
         return -1;
     for (;;) {
+        if (check_resize())
+            return NX64_KEY_RESIZE;
         c = read_byte();
         if (c != -1)
             break;
@@ -413,6 +460,10 @@ int nx64_tui_run(const struct nx64_app *app, void *ctx)
         k = nx64_tui_key(app->tick_ms > 0 ? app->tick_ms : -1);
         if (k == -1)
             break;                      /* 입력이 끝났다 */
+        if (k == NX64_KEY_RESIZE) {
+            dirty = 1;                  /* 셀 버퍼는 이미 새 크기다 */
+            continue;
+        }
         if (k == NX64_KEY_NONE) {
             if (app->tick && app->tick(ctx))
                 dirty = 1;
@@ -424,4 +475,338 @@ int nx64_tui_run(const struct nx64_app *app, void *ctx)
     }
     nx64_tui_end();
     return 0;
+}
+
+/* ---------------- ntui 창 (nterm 에 xterm 창 조작 시퀀스) ---------------- */
+
+static int g_wfd = -1;                  /* TUI 밖에서 쓰는 터미널 (dev:/tty, close-on-exec) */
+static int g_present = -1;              /* nx64_ntui_present 의 답 (-1 = 아직 묻지 않음) */
+static int g_keep;                      /* nx64_win_keep: 끝날 때 되돌리지 않는다 */
+static int g_saved;                     /* g_orig_win 에 처음 창을 적어 두었다 */
+static struct nx64_win g_orig_win;
+
+/* 창 조작에 쓸 터미널 fd */
+static int win_fd(void)
+{
+    if (g_tty >= 0)
+        return g_tty;
+    if (g_wfd < 0) {
+        g_wfd = open("dev:/tty", O_RDWR);
+        if (g_wfd >= 0)
+            (void)fcntl(g_wfd, F_SETFD, FD_CLOEXEC);
+    }
+    return g_wfd;
+}
+
+static int win_write(const char *seq)
+{
+    int fd = win_fd();
+    size_t n = strlen(seq);
+
+    if (fd < 0)
+        return -1;
+    if (fd == g_tty)
+        out_flush();                    /* 그리던 것 뒤에 */
+    return write(fd, seq, n) == (ssize_t)n ? 0 : -1;
+}
+
+static void pend(const char *p, size_t n)
+{
+    if (n > sizeof(g_pend) - g_pend_len)
+        n = sizeof(g_pend) - g_pend_len;
+    memcpy(g_pend + g_pend_len, p, n);
+    g_pend_len += n;
+}
+
+static long now_ms(void)
+{
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) < 0)
+        return 0;
+    return (long)ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
+
+/*
+ * query 를 보내고 prefix ... term 꼴의 답을 기다린다 (최대 500ms). 답의 가운데를 body 에.
+ * 그사이에 온 다른 바이트(키)는 g_pend 로 돌려 둔다. TUI 밖이면 잠시 raw 모드로 바꾼다. 성공 0
+ */
+static int win_ask(const char *query, const char *prefix, const char *term, char *body, size_t cap)
+{
+    int fd = win_fd();
+    struct termios saved;
+    struct termios t;
+    int raw_changed = 0;
+    char got[256];
+    size_t len = 0;
+    long deadline;
+    int result = -1;
+
+    if (fd < 0)
+        return -1;
+    if (fd != g_tty) {
+        if (tcgetattr(fd, &saved) < 0)
+            return -1;
+        t = saved;
+        t.c_lflag &= ~(tcflag_t)(ICANON | ECHO);
+        t.c_cc[VMIN] = 0;
+        t.c_cc[VTIME] = 1;
+        if (tcsetattr(fd, TCSANOW, &t) < 0)
+            return -1;
+        raw_changed = 1;
+    }
+    if (win_write(query) < 0)
+        goto out;
+    deadline = now_ms() + 500;
+    while (now_ms() < deadline && len < sizeof(got) - 1) {
+        unsigned char c;
+        char *start;
+        char *end;
+
+        if (read(fd, &c, 1) != 1)
+            continue;
+        got[len++] = (char)c;
+        got[len] = '\0';
+        start = strstr(got, prefix);
+        if (start == NULL)
+            continue;
+        end = strstr(start + strlen(prefix), term);
+        if (end == NULL)
+            continue;
+        {
+            size_t blen = (size_t)(end - (start + strlen(prefix)));
+            size_t after = (size_t)(end + strlen(term) - got);
+
+            if (blen >= cap)
+                blen = cap - 1;
+            memcpy(body, start + strlen(prefix), blen);
+            body[blen] = '\0';
+            pend(got, (size_t)(start - got));            /* 답 앞뒤의 키는 돌려 둔다 */
+            pend(got + after, len - after);
+            len = 0;
+            result = 0;
+            break;
+        }
+    }
+    if (result < 0)
+        pend(got, len);
+out:
+    if (raw_changed)
+        (void)tcsetattr(fd, TCSANOW, &saved);
+    return result;
+}
+
+int nx64_ntui_present(void)
+{
+    const char *d = getenv("NWP_DISPLAY");
+    char body[64];
+
+    if (g_present >= 0)
+        return g_present;
+    g_present = 0;
+    /* ntui 가 띄운 것이 아니면 묻지 않는다 (다른 터미널에 모르는 시퀀스를 보내지 않게) */
+    if (d == NULL || d[0] == '\0' || win_fd() < 0)
+        return 0;
+    if (win_ask("\033[>0q", "\033P>|", "\033\\", body, sizeof(body)) == 0 && strncmp(body, "nterm", 5) == 0)
+        g_present = 1;
+    return g_present;
+}
+
+void nx64_ntui_require(const char *prog)
+{
+    if (nx64_ntui_present())
+        return;
+    nx64_tui_end();
+    fprintf(stderr, "%s: this program runs only in an ntui terminal window (open one with Super+Enter)\n",
+            prog != NULL ? prog : "program");
+    exit(1);
+}
+
+static int not_present(void)
+{
+    if (nx64_ntui_present())
+        return 0;
+    errno = ENOTSUP;
+    return 1;
+}
+
+/* CSI code t 를 묻고 CSI want ; a ; b t 를 받는다 */
+static int win_query(int code, int want, int *a, int *b)
+{
+    char q[16];
+    char prefix[8];
+    char body[32];
+    char *semi;
+
+    sprintf(q, "\033[%dt", code);
+    sprintf(prefix, "\033[%d;", want);
+    if (win_ask(q, prefix, "t", body, sizeof(body)) < 0) {
+        errno = ETIMEDOUT;
+        return -1;
+    }
+    *a = atoi(body);
+    semi = strchr(body, ';');
+    *b = semi != NULL ? atoi(semi + 1) : 0;
+    return 0;
+}
+
+int nx64_win_info(struct nx64_win *out)
+{
+    int a;
+    int b;
+
+    if (out == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (not_present())
+        return -1;
+    memset(out, 0, sizeof(*out));
+    /* 11 은 답의 첫 숫자가 1(보통) 또는 2(최소화)라 둘 다 받는다: 접두어를 "ESC [" 로 하고 따로 나눈다 */
+    {
+        char body[32];
+        char *semi;
+
+        if (win_ask("\033[11t", "\033[", "t", body, sizeof(body)) < 0) {
+            errno = ETIMEDOUT;
+            return -1;
+        }
+        semi = strchr(body, ';');
+        out->state = semi != NULL ? atoi(semi + 1) : (atoi(body) == 2 ? NX64_WIN_MINIMIZED : NX64_WIN_NORMAL);
+    }
+    if (win_query(13, 3, &a, &b) < 0)
+        return -1;
+    out->x = a;
+    out->y = b;
+    if (win_query(18, 8, &a, &b) < 0)
+        return -1;
+    out->rows = a;
+    out->cols = b;
+    if (win_query(19, 9, &a, &b) < 0)
+        return -1;
+    out->area_rows = a;
+    out->area_cols = b;
+    return 0;
+}
+
+/* 끝날 때 되돌린다 */
+static void win_restore(void)
+{
+    char seq[48];
+
+    if (!g_saved || g_keep)
+        return;
+    g_saved = 0;
+    (void)win_write("\033[1t");         /* 최소화돼 있으면 되살린다 */
+    switch (g_orig_win.state) {
+    case NX64_WIN_MAXIMIZED:
+        (void)win_write("\033[9;1t");
+        break;
+    case NX64_WIN_FULLSCREEN:
+        (void)win_write("\033[10;1t");
+        break;
+    case NX64_WIN_MINIMIZED:
+        (void)win_write("\033[2t");
+        break;
+    default:
+        (void)win_write("\033[9;0t");
+        sprintf(seq, "\033[8;%d;%dt\033[3;%d;%dt", g_orig_win.rows, g_orig_win.cols, g_orig_win.x, g_orig_win.y);
+        (void)win_write(seq);
+        break;
+    }
+}
+
+/* 처음 바꿀 때 지금 창을 적어 둔다 */
+static int win_change(void)
+{
+    if (not_present())
+        return -1;
+    if (!g_saved && !g_keep && nx64_win_info(&g_orig_win) == 0) {
+        g_saved = 1;
+        atexit(win_restore);
+    }
+    return 0;
+}
+
+void nx64_win_keep(void)
+{
+    g_keep = 1;
+}
+
+int nx64_win_resize(int cols, int rows)
+{
+    char seq[32];
+
+    if (cols < 0 || rows < 0 || cols > 1000 || rows > 1000) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (win_change() < 0)
+        return -1;
+    sprintf(seq, "\033[8;%d;%dt", rows, cols);
+    return win_write(seq);
+}
+
+int nx64_win_move(int x, int y)
+{
+    char seq[32];
+
+    if (x < 0 || y < 0 || x > 1000 || y > 1000) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (win_change() < 0)
+        return -1;
+    sprintf(seq, "\033[3;%d;%dt", x, y);
+    return win_write(seq);
+}
+
+int nx64_win_center(void)
+{
+    struct nx64_win w;
+    int x;
+    int y;
+
+    if (nx64_win_info(&w) < 0)
+        return -1;
+    x = (w.area_cols - (w.cols + 2)) / 2;
+    y = (w.area_rows - (w.rows + 2)) / 2;
+    return nx64_win_move(x > 0 ? x : 0, y > 0 ? y : 0);
+}
+
+int nx64_win_set_state(int state)
+{
+    const char *seq;
+
+    switch (state) {
+    case NX64_WIN_NORMAL:     seq = "\033[1t\033[9;0t"; break;
+    case NX64_WIN_MAXIMIZED:  seq = "\033[9;1t"; break;
+    case NX64_WIN_FULLSCREEN: seq = "\033[10;1t"; break;
+    case NX64_WIN_MINIMIZED:  seq = "\033[2t"; break;
+    default:
+        errno = EINVAL;
+        return -1;
+    }
+    if (win_change() < 0)
+        return -1;
+    return win_write(seq);
+}
+
+int nx64_win_title(const char *title)
+{
+    char seq[48];
+    size_t i;
+
+    if (title == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (not_present())
+        return -1;
+    strcpy(seq, "\033]2;");
+    for (i = 0; title[i] != '\0' && i < 31; i++)
+        seq[4 + i] = (unsigned char)title[i] >= 0x20 && (unsigned char)title[i] < 0x7F ? title[i] : '?';
+    seq[4 + i] = '\007';
+    seq[5 + i] = '\0';
+    return win_write(seq);
 }

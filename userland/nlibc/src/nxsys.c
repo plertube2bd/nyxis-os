@@ -462,6 +462,8 @@ static int type_of(unsigned int t)
     case NX_TYPE_CHANNEL: return NL_T_FIFO;
     case NX_TYPE_DEVICE:  return NL_T_CHR;
     case NX_TYPE_PTY:     return NL_T_CHR;
+    case NX_TYPE_PIPE:    return NL_T_FIFO;
+    case NX_TYPE_SHM:     return NL_T_OTHER;
     default:              return NL_T_OTHER;
     }
 }
@@ -1109,6 +1111,75 @@ long __nl_channel_open(const char *path)
 long __nl_channel_send(long h, const void *buf, size_t len)
 {
     return ret(nx_sc(NX_SYS_CHANNEL_SEND, (unsigned long)h, (unsigned long)buf, (unsigned long)len));
+}
+
+int __nl_adopt_handle(long h, int flags)
+{
+    if (slot_of(h) < 0) {
+        errno = EBADF;
+        return -1;
+    }
+    fd_register(h, flags);
+    return slot_of(h);
+}
+
+int __nl_channel_send_handle(long h, const void *buf, size_t len, long attach)
+{
+    return (int)ret(nx_sc5(NX_SYS_CHANNEL_SEND_HANDLE, (unsigned long)h, (unsigned long)buf, (unsigned long)len,
+                           (unsigned long)attach, 0));
+}
+
+long __nl_channel_receive_handle(long h, void *buf, size_t cap, unsigned long sender[3], long timeout_ms, int *out_fd)
+{
+    struct nx_msginfo_ex info;
+    long r;
+
+    memset(&info, 0, sizeof(info));
+    info.handle = NX_HANDLE_INVALID_VALUE;
+    if (out_fd != NULL)
+        *out_fd = -1;
+    r = ret(nx_sc5(NX_SYS_CHANNEL_RECEIVE_EX, (unsigned long)h, (unsigned long)buf, (unsigned long)cap,
+                   (unsigned long)&info, timeout_ms < 0 ? NX_WAIT_INFINITE : (unsigned long)timeout_ms));
+    if (r >= 0 && sender != NULL) {
+        sender[0] = info.sender_pid;
+        sender[1] = info.sender_uid;
+        sender[2] = info.sender_gid;
+    }
+    if (r >= 0 && info.handle != NX_HANDLE_INVALID_VALUE) {
+        struct nx_stat st;
+        int flags = 0;
+
+        if (nx_sc(NX_SYS_STAT, info.handle, (unsigned long)&st, 0) >= 0)
+            flags = ((st.rights & NX_RIGHT_READ) ? NL_O_READ : 0) | ((st.rights & NX_RIGHT_WRITE) ? NL_O_WRITE : 0);
+        fd_register((long)info.handle, flags);
+        if (out_fd != NULL)
+            *out_fd = slot_of((long)info.handle);
+        else
+            (void)nx_sc(NX_SYS_CLOSE, info.handle, 0, 0);
+    }
+    return r;
+}
+
+long __nl_shm_create(size_t size, int cloexec)
+{
+    long r = nx_sc(NX_SYS_SHM_CREATE, (unsigned long)size, cloexec ? NX_DUP_CLOEXEC : 0, 0);
+
+    if (r < 0)
+        return ret(r);
+    fd_register(r, NL_O_READ | NL_O_WRITE);
+    return r;
+}
+
+void *__nl_shm_map(long h)
+{
+    unsigned long va = 0;
+    long r = nx_sc(NX_SYS_SHM_MAP, (unsigned long)h, (unsigned long)&va, 0);
+
+    if (r < 0) {
+        (void)ret(r);
+        return NULL;
+    }
+    return (void *)va;
 }
 
 long __nl_channel_receive(long h, void *buf, size_t cap, unsigned long sender[3], long timeout_ms)

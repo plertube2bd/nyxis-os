@@ -16,13 +16,16 @@ mkrootfs.py - NyxisOS 루트 파일시스템(fs:/) 매니페스트를 만든다 
   /roi/hostname    0644 root      <roi>/hostname   (info:/hostname 으로 공개)
   /roi/timezone    0644 root      <roi>/timezone   (info:/timezone 으로 공개)
   /roi/app/        <roi>/app/ 통째로, root 전용 (디렉터리 0700, 파일 0600). 시스템 프로그램 설정
-                   (예: /roi/app/0/init/sudoers.dat = sudo 를 쓸 수 있는 uid)
+                   (예: /roi/app/0/init/sudoers.dat = elev 를 쓸 수 있는 uid)
   /roi/default/    <roi>/default/ 틀. "새 사용자 소유" 항목은 소유자 NX_UID_TEMPLATE
   /roi/<uid>/      DB 의 각 사용자(root 포함): 틀을 복사하고 NX_UID_TEMPLATE 을 그 uid/gid 로 바꾼다
   /home            0755 root
   /home/<이름>     0700 <uid>     face:/  (DB 의 각 사용자)
 --template-file <틀 안의 경로>=<호스트 파일> 로 틀(<roi>/default/)의 파일 내용을 바꿔 넣는다 (모든 사용자에게 복사된다).
 예: SELFTEST 이미지는 테스트 하네스가 셸 명령을 치므로 shell 을 app:/nysh.run 으로 바꾼다.
+--link <이미지경로>=<대상> 으로 심볼릭 링크를 넣는다 (0777 root, 커널 VFS 가 열 때 따라간다). 대상 형식:
+"ns:/경로"(절대), "/경로"(같은 네임스페이스), "경로"(링크가 있는 디렉터리 기준). 예: /usr/sudo.run=elev.run
+(app:/sudo.run -> app:/elev.run). --bin 에 같은 이름의 *.run 이 남아 있으면(이름을 바꾸기 전의 빌드 산출물) 링크가 이긴다.
 --file 로 추가 파일을 넣는다 (예: 테스트 이미지의 /roi/test_password). 모드 기본값 0644, 소유자 root.
 --tree <이미지경로>=<호스트 디렉터리> 로 디렉터리를 통째로 넣는다 (디렉터리 0755, 파일 0644 — 실행 비트가
 있는 파일과 *.run 은 0755, 소유자 root). 예: nlcc 의 헤더/라이브러리(/usr/lib), 부트스트랩용 소스(/usr/src).
@@ -94,6 +97,7 @@ def emit_template(out, entries, dest, uid, gid):
 
 def main():
     users_db, bin_dir, roi_dir, app_dir, extra, trees, overrides = None, None, None, None, [], [], {}
+    links = []
     args = sys.argv[1:]
     while args:
         a = args.pop(0)
@@ -112,6 +116,11 @@ def main():
             extra.append(args.pop(0))
         elif a == "--tree":
             trees.append(args.pop(0))
+        elif a == "--link":
+            dest, target = args.pop(0).split("=", 1)
+            if not dest.startswith("/") or not target or any(c.isspace() for c in dest + target):
+                sys.exit(f"--link: expected /<path>=<target> without whitespace: {dest}={target}")
+            links.append((dest.rstrip("/"), target))
         else:
             sys.exit(__doc__)
     if not users_db or not bin_dir or not roi_dir:
@@ -130,7 +139,8 @@ def main():
             users.append((name, uid, gid))
 
     out = ["d / 0755 0 0", "d /usr 0755 0 0"]
-    runs = sorted(n for n in os.listdir(bin_dir) if n.endswith(".run"))
+    linked = {d for d, _ in links}
+    runs = sorted(n for n in os.listdir(bin_dir) if n.endswith(".run") and f"/usr/{n}" not in linked)
     defaults = set()
     if app_dir and os.path.isdir(app_dir):
         defaults = {n for n in os.listdir(app_dir) if os.path.isdir(os.path.join(app_dir, n))}
@@ -215,6 +225,9 @@ def main():
         if ":" in src and src.rsplit(":", 1)[1].isdigit():
             src, mode = src.rsplit(":", 1)
         out.append(f"f {dest} {mode} 0 0 {os.path.abspath(src)}")
+
+    for dest, target in links:
+        out.append(f"l {dest} 0777 0 0 {target}")
 
     print("\n".join(out))
 

@@ -136,21 +136,36 @@ void channel_retain(channel_t *c)
     irq_restore(irq);
 }
 
-static void drop_messages_locked(channel_t *c)
+/* 메시지를 모두 떼어 낸다 (인터럽트가 꺼진 상태에서). 해제는 free_messages 로 (붙은 핸들을 닫는다: 파일이면
+ * 디스크를 건드릴 수 있으므로 인터럽트를 켠 뒤에) */
+static chan_msg_t *detach_messages_locked(channel_t *c)
 {
-    while (c->head) {
-        chan_msg_t *m = c->head;
+    chan_msg_t *m = c->head;
 
-        c->head = m->next;
-        kfree(m);
-    }
+    c->head = nNULL;
     c->tail = nNULL;
     c->count = 0;
+    return m;
+}
+
+static void free_messages(chan_msg_t *m)
+{
+    while (m) {
+        chan_msg_t *next = m->next;
+
+        if (m->has_handle)
+            nx_handle_release(&m->handle, nNULL);
+        kfree(m);
+        m = next;
+    }
 }
 
 void channel_release(channel_t *c, bool receiver)
 {
     u64 irq = irq_save();
+    chan_msg_t *dead = nNULL;
+    chan_msg_t *dead2 = nNULL;
+    bool gone = false;
     u32 i;
 
     if (receiver && c->receiver_alive) {
@@ -159,7 +174,7 @@ void channel_release(channel_t *c, bool receiver)
             if (g_registry[i] == c)
                 g_registry[i] = nNULL;     /* 이름은 즉시 사라진다 (같은 이름으로 다시 만들 수 있다) */
         }
-        drop_messages_locked(c);
+        dead = detach_messages_locked(c);
         (void)waitq_wake_all(&c->send_q);  /* 보내려고 기다리던 쪽은 HUP 을 보게 된다 */
         (void)waitq_wake_all(&c->recv_q);
     }
@@ -167,13 +182,27 @@ void channel_release(channel_t *c, bool receiver)
     if (c->refs > 0)
         c->refs--;
     if (c->refs == 0) {
-        drop_messages_locked(c);
-        kfree(c);
+        dead2 = detach_messages_locked(c);
+        gone = true;
     }
     irq_restore(irq);
+    free_messages(dead);
+    free_messages(dead2);
+    if (gone)
+        kfree(c);
 }
 
 Nstatus channel_send(channel_t *c, const void *buf, usize len)
+{
+    return channel_send_handle(c, buf, len, nNULL);
+}
+
+bool channel_head_has_handle_locked(const channel_t *c)
+{
+    return c->head && c->head->has_handle;
+}
+
+Nstatus channel_send_handle(channel_t *c, const void *buf, usize len, const nx_handle_t *attach)
 {
     process_t *self = current_process;
     chan_msg_t *m;
@@ -190,6 +219,9 @@ Nstatus channel_send(channel_t *c, const void *buf, usize len)
     m->uid = self ? self->uid : 0;
     m->gid = self ? self->gid : 0;
     m->len = (u32)len;
+    m->has_handle = attach ? true : false;
+    if (attach)
+        m->handle = *attach;
     if (len)
         memcpy(m->data, buf, len);
 
@@ -218,8 +250,21 @@ Nstatus channel_send(channel_t *c, const void *buf, usize len)
 
 Nstatus channel_take_locked(channel_t *c, void *buf, usize len, struct nx_msginfo *info)
 {
+    nx_handle_t h;
+    bool got = false;
+    Nstatus status = channel_take_handle_locked(c, buf, len, info, &h, &got);
+
+    if (got)
+        nx_handle_release(&h, nNULL);       /* 핸들을 받을 수 없는 호출: 닫는다 */
+    return status;
+}
+
+Nstatus channel_take_handle_locked(channel_t *c, void *buf, usize len, struct nx_msginfo *info,
+                                   nx_handle_t *out, bool *got)
+{
     chan_msg_t *m = c->head;
 
+    *got = false;
     if (!m)
         return Ntimeout;
 
@@ -232,6 +277,10 @@ Nstatus channel_take_locked(channel_t *c, void *buf, usize len, struct nx_msginf
 
     if (m->len)
         memcpy(buf, m->data, m->len);
+    if (m->has_handle) {
+        *out = m->handle;
+        *got = true;
+    }
     c->head = m->next;
     if (!c->head)
         c->tail = nNULL;

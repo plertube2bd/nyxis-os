@@ -284,6 +284,11 @@ int __nl_proc_list(struct __nl_procent *out, int max) { (void)out; (void)max; er
 int __nl_signal_pid(unsigned long pid, int sig) { (void)pid; (void)sig; errno = ENOSYS; return -1; }
 unsigned long __nl_timer_hz(void) { return 100; }
 int __nl_check_password(const char *name, const char *password) { (void)name; (void)password; errno = ENOSYS; return -1; }
+int __nl_channel_send_handle(long h, const void *buf, size_t len, long attach) { (void)h; (void)buf; (void)len; (void)attach; errno = ENOSYS; return -1; }
+long __nl_channel_receive_handle(long h, void *buf, size_t cap, unsigned long sender[3], long timeout_ms, int *out_fd) { (void)h; (void)buf; (void)cap; (void)sender; (void)timeout_ms; if (out_fd) *out_fd = -1; errno = ENOSYS; return -1; }
+int __nl_adopt_handle(long h, int flags) { (void)flags; return (int)h; }
+long __nl_shm_create(size_t size, int cloexec) { (void)size; (void)cloexec; errno = ENOSYS; return -1; }
+void *__nl_shm_map(long h) { (void)h; errno = ENOSYS; return 0; }
 int __nl_openpty(long out[2], int cloexec) { (void)out; (void)cloexec; errno = ENOSYS; return -1; }
 long __nl_devcmd(long h, unsigned long cmd, unsigned long arg) { (void)h; (void)cmd; (void)arg; errno = ENOSYS; return -1; }
 void *__nl_map_mmio(long h) { (void)h; errno = ENOSYS; return 0; }

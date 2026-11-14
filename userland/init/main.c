@@ -4,7 +4,7 @@
  * 하는 일:
  *  1. svc:/sys/init 채널을 등록한다 (누구나 보낼 수 있음). 다른 프로세스는 여기로 요청을 보낸다.
  *  2. 콘솔 로그인(app:/login.run)을 띄우고, 끝나면(죽으면) 다시 띄운다.
- *  3. NxPoll 로 "요청 도착", "login 종료", "sudo 로 띄운 명령 종료" 를 함께 기다린다 (바쁜 대기 없음).
+ *  3. NxPoll 로 "요청 도착", "login 종료", "elev 로 띄운 명령 종료" 를 함께 기다린다 (바쁜 대기 없음).
  *
  * 요청 (메시지 본문):
  *   "poweroff"  시스템을 끈다. 정책: 이 기계의 콘솔에 로그인한 사용자가 끄는 것을 허용한다 —
@@ -12,33 +12,37 @@
  *               세션에서 시작된 것이다. 커널은 메시지에 보낸 쪽의 uid/pid 를 붙여 주므로 정책을 바꾸고
  *               싶으면 여기서 info.sender_uid 로 거르면 된다. 실제로 끄는 일(NxPowerOff)은 uid 0 만 할 수 있고,
  *               init 이 그 uid 0 이다.
- *   "sudo\0..." 명령을 root 로 실행한다 (app:/sudo.run 이 보낸다). 필드는 NUL 로 나뉜다:
- *               sudo, pgid, 사용자 이름, 답장 채널, 비밀번호, PWD, 실행 파일 경로, argv[0], argv[1], ...
+ *   "elev\0..." 명령을 root 로 실행한다 (app:/elev.run 이 보낸다). 필드는 NUL 로 나뉜다:
+ *               elev, pgid, 사용자 이름, 답장 채널, 비밀번호, PWD, 실행 파일 경로, argv[0], argv[1], ...
  *               허용 조건: 보낸 uid 가 SUDOERS_PATH 에 있고, uid 0 이 아니면 비밀번호가 맞아야 한다
  *               (NxAuthenticate 로 확인하고, 토큰의 uid 가 보낸 uid 와 같아야 한다: 남의 비밀번호로는 안 된다).
  *               답장 채널은 "svc:/<그 사용자 이름>/" 아래여야 한다. 자식은 root 로, 콘솔 0/1/2 로, 보낸 쪽의
  *               프로세스 그룹에서 시작한다 (Ctrl-C 가 함께 끝낸다). 끝나면 답장 채널로 "exit <코드>" 를,
  *               거부/실패면 "deny <이유>" 를 보낸다. 비밀번호가 틀리면 NxAuthenticate 가 1초 잠들고 그동안
  *               init 의 다른 요청도 기다린다 (무차별 대입을 늦추는 효과도 된다).
+ *   "nex\0..."  서비스 관리 (app:/nex.run 이 보낸다). service.c 머리말
+ *   "journal-ready"  journald 가 떴다 (uid 0 만): 서비스 출력 파이프와 모아 둔 로그를 넘긴다
+ * 서비스(유닛): 부팅 때 boot 가 켜진 유닛을 login 보다 먼저 시작하고, 끝나면 restart 정책대로 다시 시작한다 (service.c).
  * init 이 끝나면 커널은 멈춘다 (패닉) — 로그인도 전원 끄기도 할 수 없게 되기 때문이다.
  * 설정 welcome (nx_setting_get: app:/init.run/welcome): 부팅 후 로그인 전에 보이는 문구 (기본 "Welcome to Nyxis OS!").
  */
 #include "nyx.h"
+#include "service.h"
 
 #define LOGIN_PATH "app:/login.run"
 
-/* sudo 를 쓸 수 있는 uid 목록: 한 줄에 uid 하나 (10진수), '#' 부터 줄 끝은 주석. 없으면 uid 0 만 */
+/* elev 를 쓸 수 있는 uid 목록: 한 줄에 uid 하나 (10진수), '#' 부터 줄 끝은 주석. 없으면 uid 0 만 */
 #define SUDOERS_PATH  "roi:/app/0/init/sudoers.dat"
 #define SUDOERS_MAX   1024UL
-#define SUDO_FIELDS   (7 + 16)           /* 고정 필드 7 + argv 최대 16 */
-#define SUDO_JOBS     8                  /* 동시에 실행 중인 sudo 명령 */
+#define ELEV_FIELDS   (7 + 16)           /* 고정 필드 7 + argv 최대 16 */
+#define ELEV_JOBS     8                  /* 동시에 실행 중인 elev 명령 */
 
-struct sudo_job {
+struct elev_job {
     long proc;                           /* 프로세스 핸들 (-1 = 빈 칸) */
     long reply;                          /* 답장 채널 송신 핸들 */
 };
 
-static struct sudo_job g_jobs[SUDO_JOBS];
+static struct elev_job g_jobs[ELEV_JOBS];
 
 static long spawn_login(void)
 {
@@ -71,7 +75,7 @@ static long parse_ulong(const char *s, unsigned long n)
 }
 
 /* uid 가 sudoers 에 있는지. 파일을 요청마다 다시 읽는다 (root 가 고치면 바로 반영) */
-static int sudo_allowed(unsigned long uid)
+static int elev_allowed(unsigned long uid)
 {
     char buf[SUDOERS_MAX];
     long len = nx_read_value(SUDOERS_PATH, buf, sizeof(buf));
@@ -98,14 +102,14 @@ static int sudo_allowed(unsigned long uid)
     return 0;
 }
 
-static void sudo_reply(long reply, const char *text)
+static void elev_reply(long reply, const char *text)
 {
     if (reply >= 0)
         (void)nx_channel_send(reply, text, nx_strlen(text));
 }
 
 /* 숫자를 붙인 답장 ("exit 3", "exit -2") */
-static void sudo_reply_num(long reply, const char *prefix, long v)
+static void elev_reply_num(long reply, const char *prefix, long v)
 {
     char out[48];
     char tmp[21];
@@ -126,12 +130,12 @@ static void sudo_reply_num(long reply, const char *prefix, long v)
     while (k)
         out[n++] = tmp[--k];
     out[n] = '\0';
-    sudo_reply(reply, out);
+    elev_reply(reply, out);
 }
 
-static void handle_sudo(char *msg, unsigned long len, const struct nx_msginfo *info)
+static void handle_elev(char *msg, unsigned long len, const struct nx_msginfo *info)
 {
-    const char *f[SUDO_FIELDS + 1];
+    const char *f[ELEV_FIELDS + 1];
     char env_pwd[NX_CHAN_MSG_MAX + 4];
     const char *envp[5];
     unsigned long nf = 0;
@@ -148,14 +152,14 @@ static void handle_sudo(char *msg, unsigned long len, const struct nx_msginfo *i
         return;
     for (i = 0; i < len; i++) {
         if (msg[i] == '\0') {
-            if (nf == SUDO_FIELDS)
+            if (nf == ELEV_FIELDS)
                 return;
             f[nf++] = msg + start;
             start = i + 1;
         }
     }
     f[nf] = 0;
-    if (nf < 8)                          /* sudo pgid 이름 답장 비밀번호 PWD 경로 argv[0] */
+    if (nf < 8)                          /* elev pgid 이름 답장 비밀번호 PWD 경로 argv[0] */
         return;
 
     /* 답장 채널: svc:/<이름>/ 아래만 (남의 채널로 보내지 않는다). 이름은 아래에서 비밀번호로 확인한다 */
@@ -167,12 +171,13 @@ static void handle_sudo(char *msg, unsigned long len, const struct nx_msginfo *i
         reply = nx_open(f[3], NX_O_WRITE);
     if (reply < 0)
         return;
+    set_cloexec(reply);                  /* 서비스 프로세스(fork + exec)에 새지 않게 */
 
-    if (!sudo_allowed(info->sender_uid)) {
-        nx_puts("init: sudo denied for uid ");
+    if (!elev_allowed(info->sender_uid)) {
+        nx_puts("init: elev denied for uid ");
         nx_putu(info->sender_uid);
         nx_puts(" (not in " SUDOERS_PATH ")\n");
-        sudo_reply(reply, "deny not in sudoers");
+        elev_reply(reply, "deny not in sudoers");
         (void)nx_close(reply);
         return;
     }
@@ -187,20 +192,20 @@ static void handle_sudo(char *msg, unsigned long len, const struct nx_msginfo *i
             (void)nx_close(token);
         }
         if (!ok) {
-            sudo_reply(reply, "deny authentication failed");
+            elev_reply(reply, "deny authentication failed");
             (void)nx_close(reply);
             return;
         }
     }
 
-    for (i = 0; i < SUDO_JOBS; i++) {
+    for (i = 0; i < ELEV_JOBS; i++) {
         if (g_jobs[i].proc < 0) {
             slot = (int)i;
             break;
         }
     }
     if (slot < 0) {
-        sudo_reply(reply, "deny too many sudo commands");
+        elev_reply(reply, "deny too many elev commands");
         (void)nx_close(reply);
         return;
     }
@@ -219,7 +224,7 @@ static void handle_sudo(char *msg, unsigned long len, const struct nx_msginfo *i
 
     proc = nx_spawn(f[6], f + 7, envp, NX_NO_TOKEN);
     if (proc < 0) {
-        sudo_reply_num(reply, "deny cannot run ", proc);
+        elev_reply_num(reply, "deny cannot run ", proc);
         (void)nx_close(reply);
         return;
     }
@@ -227,7 +232,7 @@ static void handle_sudo(char *msg, unsigned long len, const struct nx_msginfo *i
     if (pgid > 0)
         (void)nx_syscall(NX_SYS_PROCESS_GROUP, (unsigned long)proc, (unsigned long)pgid, 0, 0, 0);
 
-    nx_puts("init: sudo by uid ");
+    nx_puts("init: elev by uid ");
     nx_putu(info->sender_uid);
     nx_puts(": ");
     nx_puts(f[6]);
@@ -236,24 +241,26 @@ static void handle_sudo(char *msg, unsigned long len, const struct nx_msginfo *i
     g_jobs[slot].reply = reply;
 }
 
-/* sudo 로 띄운 명령이 끝났다: 종료 코드를 답장하고 칸을 비운다 */
-static void sudo_finish(int slot)
+/* elev 로 띄운 명령이 끝났다: 종료 코드를 답장하고 칸을 비운다 */
+static void elev_finish(int slot)
 {
     int code = 0;
 
     if (nx_wait(g_jobs[slot].proc, 0, &code) < 0)
         code = -1;
-    sudo_reply_num(g_jobs[slot].reply, "exit ", code);
+    elev_reply_num(g_jobs[slot].reply, "exit ", code);
     (void)nx_close(g_jobs[slot].reply);
     (void)nx_close(g_jobs[slot].proc);
     g_jobs[slot].proc = -1;
     g_jobs[slot].reply = -1;
 }
 
-static void handle_request(char *msg, unsigned long len, const struct nx_msginfo *info)
+static void handle_request(char *msg, unsigned long len, const struct nx_msginfo *info, long *attached)
 {
-    if (len >= 5 && nx_memcmp(msg, "sudo", 5) == 0) {
-        handle_sudo(msg, len, info);
+    if (svc_request(msg, len, info, attached))
+        return;
+    if (len >= 5 && nx_memcmp(msg, "elev", 5) == 0) {
+        handle_elev(msg, len, info);
         return;
     }
 
@@ -265,6 +272,7 @@ static void handle_request(char *msg, unsigned long len, const struct nx_msginfo
         nx_puts(" (pid ");
         nx_putu(info->sender_pid);
         nx_puts(")\n");
+        ilog(LOG_NOTICE, 0, "System power off requested.");
         r = nx_power_off();
         nx_puts("init: power off failed (status ");
         nx_puti(r);
@@ -288,7 +296,7 @@ int main(int argc, char **argv, char **envp)
     (void)argv;
     (void)envp;
 
-    for (i = 0; i < SUDO_JOBS; i++) {
+    for (i = 0; i < ELEV_JOBS; i++) {
         g_jobs[i].proc = -1;
         g_jobs[i].reply = -1;
     }
@@ -316,11 +324,14 @@ int main(int argc, char **argv, char **envp)
             nx_puts("Welcome to Nyxis OS!\n");
         }
     }
+    svc_load();
+    svc_boot();
     login = spawn_login();
 
     for (;;) {
-        struct nx_pollfd fds[2 + SUDO_JOBS];
-        int job_of[2 + SUDO_JOBS];          /* fds[k] 가 sudo 명령이면 그 칸, 아니면 -1 */
+        struct nx_pollfd fds[NX_POLL_MAX];
+        int job_of[NX_POLL_MAX];            /* fds[k] 가 elev 명령이면 그 칸, 아니면 -1 */
+        int unit_of[NX_POLL_MAX];           /* fds[k] 가 서비스면 그 유닛, 아니면 -1 */
         unsigned long n = 0;
         unsigned long k;
         long r;
@@ -330,6 +341,7 @@ int main(int argc, char **argv, char **envp)
             fds[n].events = NX_POLL_IN;
             fds[n].revents = 0;
             job_of[n] = -1;
+            unit_of[n] = -1;
             n++;
         }
         if (login >= 0) {
@@ -337,16 +349,25 @@ int main(int argc, char **argv, char **envp)
             fds[n].events = NX_POLL_EXIT;
             fds[n].revents = 0;
             job_of[n] = -1;
+            unit_of[n] = -1;
             n++;
         }
-        for (i = 0; i < SUDO_JOBS; i++) {
+        for (i = 0; i < ELEV_JOBS; i++) {
             if (g_jobs[i].proc >= 0) {
                 fds[n].handle = (unsigned long)g_jobs[i].proc;
                 fds[n].events = NX_POLL_EXIT;
                 fds[n].revents = 0;
                 job_of[n] = i;
+                unit_of[n] = -1;
                 n++;
             }
+        }
+        {
+            unsigned long first = n;
+
+            n += svc_poll_fill(fds, unit_of, n, NX_POLL_MAX);
+            for (k = first; k < n; k++)
+                job_of[k] = -1;
         }
         if (n == 0) {
             (void)nx_sleep(1000);
@@ -354,26 +375,46 @@ int main(int argc, char **argv, char **envp)
             continue;
         }
 
-        r = nx_poll(fds, n, NX_WAIT_INFINITE);
+        r = nx_poll(fds, n, svc_timeout_ms());
         if (r < 0) {
             (void)nx_sleep(100);
             continue;
         }
+        svc_tick();
 
         for (k = 0; k < n; k++) {
+            if (unit_of[k] >= 0) {
+                if (fds[k].revents & NX_POLL_EXIT)
+                    svc_exited(unit_of[k]);
+                continue;
+            }
             if (job_of[k] >= 0) {
                 if (fds[k].revents & NX_POLL_EXIT)
-                    sudo_finish(job_of[k]);
+                    elev_finish(job_of[k]);
                 continue;
             }
             if ((long)fds[k].handle == ch && (fds[k].revents & NX_POLL_IN)) {
                 char msg[NX_CHAN_MSG_MAX];
+                struct nx_msginfo_ex ex;
                 struct nx_msginfo info;
-                long len = nx_channel_receive(ch, msg, sizeof(msg), &info, 0);
+                long len;
 
+                ex.handle = NX_HANDLE_INVALID_VALUE;
+                len = nx_syscall(NX_SYS_CHANNEL_RECEIVE_EX, (unsigned long)ch, (unsigned long)msg, sizeof(msg),
+                                 (unsigned long)&ex, 0);
                 if (len >= 0) {
-                    handle_request(msg, (unsigned long)len, &info);
-                    nx_wipe(msg, sizeof(msg));     /* sudo 비밀번호가 스택에 남지 않게 */
+                    /* 붙어 온 핸들 (nex 의 답장 채널). 쓰지 않으면 닫는다 */
+                    long attached = ex.handle == NX_HANDLE_INVALID_VALUE ? -1 : (long)ex.handle;
+
+                    set_cloexec(attached);
+                    info.sender_pid = ex.sender_pid;
+                    info.sender_uid = ex.sender_uid;
+                    info.sender_gid = ex.sender_gid;
+                    info.length = ex.length;
+                    handle_request(msg, (unsigned long)len, &info, &attached);
+                    if (attached >= 0)
+                        (void)nx_close(attached);
+                    nx_wipe(msg, sizeof(msg));     /* elev 비밀번호가 스택에 남지 않게 */
                 }
             }
             if ((long)fds[k].handle == login && (fds[k].revents & NX_POLL_EXIT)) {

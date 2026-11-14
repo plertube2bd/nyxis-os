@@ -19,7 +19,7 @@
 #include "ntui.h"
 
 enum mitem {
-    A_NONE, A_TERMINAL, A_FILES, A_RUN, A_CLOCK, A_SYSMON, A_NTOP, A_THEME, A_HELP, A_SHELL, A_LOGOUT, A_POWEROFF
+    A_NONE, A_TERMINAL, A_FILES, A_RUN, A_CLOCK, A_SYSMON, A_NTOP, A_THEME, A_KEYS, A_HELP, A_SHELL, A_LOGOUT, A_POWEROFF
 };
 
 struct item {
@@ -40,6 +40,7 @@ static const struct item g_items[] = {
     { "Processes (ntop)", NULL, 'o', ACT_NONE, A_NTOP },
     { NULL, "System", 0, ACT_NONE, A_NONE },
     { "Change theme", NULL, 'c', ACT_THEME, A_THEME },
+    { "Shortcuts...", NULL, 'y', ACT_KEYS, A_KEYS },
     { "Help", NULL, 'h', ACT_HELP, A_HELP },
     { "Shell (nysh)", NULL, 's', ACT_NONE, A_SHELL },
     { NULL, "Power", 0, ACT_NONE, A_NONE },
@@ -158,22 +159,23 @@ static int perform(enum mitem a)
     menuClose();
     switch (a) {
     case A_TERMINAL:
-        (void)nterminalOpen();
+        (void)launchTerminal(NULL);
         break;
     case A_FILES:
-        (void)nfilesOpen(NULL);
+        (void)launchApp("nfiles");
         break;
     case A_RUN:
         nrunnerOpen();
         break;
     case A_CLOCK:
-        (void)clockOpen();
+        if (!serverActivateApp("nclock"))
+            (void)launchApp("nclock");
         break;
     case A_SYSMON:
-        (void)nterminalRunEx("sysmon", RUN_AUTOCLOSE, "system monitor", 76, 21);
+        (void)launchCommand("sysmon", LAUNCH_AUTOCLOSE, "system monitor", 76, 21);
         break;
     case A_NTOP:
-        (void)nterminalRunEx("ntop", RUN_AUTOCLOSE, "processes", 90, 28);
+        (void)launchCommand("ntop", LAUNCH_AUTOCLOSE, "processes", 90, 28);
         break;
     case A_THEME:
         themeNext();
@@ -184,8 +186,11 @@ static int perform(enum mitem a)
     case A_HELP:
         helpOpen();
         break;
+    case A_KEYS:
+        runAction(ACT_KEYS);
+        break;
     case A_SHELL:
-        (void)nterminalRunEx("nysh", RUN_MAXIMIZED | RUN_AUTOCLOSE, "nysh", 0, 0);
+        (void)launchCommand("nysh", LAUNCH_MAXIMIZED | LAUNCH_AUTOCLOSE, "nysh", 0, 0);
         break;
     case A_LOGOUT:
         return MENU_QUIT;

@@ -4,7 +4,7 @@ e2e_login_test.py - NyxisOS 종단 간 검사 (make test-e2e)
 
 SELFTEST 이미지를 QEMU 로 부팅해 콘솔로 실제 사용 흐름을 흉내 낸다:
   selftest 통과 -> init 이 띄운 login -> 틀린 비밀번호 거부 -> test 계정 로그인(비밀번호 에코 없음)
-  -> nysh 에서 whoami / 없는 명령 / nlibctest(C 라이브러리 검사) / fputest(FPU 상태) / sudo -> poweroff -> init 이 요청자 uid 를 확인하고 ACPI S5 로 전원 끔(QEMU 종료)
+  -> nysh 에서 whoami / 없는 명령 / nlibctest(C 라이브러리 검사) / fputest(FPU 상태) / elev(+ sudo 링크) / nex·journalman -> poweroff -> init 이 요청자 uid 를 확인하고 ACPI S5 로 전원 끔(QEMU 종료)
 
   python3 tools/e2e_login_test.py <out 디렉터리> [serial|ps2]
     serial: COM1 로 입력 (IRQ4),  ps2: QEMU 모니터 sendkey 로 PS/2 키보드 입력 (IRQ1)
@@ -87,6 +87,8 @@ o = run("ls tmp:/cu"); o2 = run("ls tmp:/cu/sub")
 step("coreutils: touch, mv, ls", b"\ne\nsub/\n" in o and b"\nh\n" in o2)
 step("coreutils: wc", b"      1       1       6 tmp:/cu/sub/h" in run("wc tmp:/cu/sub/h"))
 run("rm -r tmp:/cu")
+o = run("nfiles; echo rc=$?")
+step("window program outside the compositor fails cleanly", b"run it inside ntui" in o and b"\nrc=1\n" in o)
 o = run("ntop -b")
 step("ntop -b lists init, nysh and itself", b" init [system]\n" in o and b"nysh" in o and b" ntop" in o and b"PID" in o)
 o = run("nyfetch"); print(o.decode(errors="replace"), flush=True)
@@ -177,26 +179,38 @@ step("nlibc example built by nlcc (app:/hello.run)", wait_for("now: ", 20, mark)
 mark = len(buf); send("fputest\r")
 ok = wait_for("fputest: ", 90, mark) and wait_for("\n", 5, buf.index(b"fputest: ", mark))
 step("per-process FPU/SSE state (app:/fputest.run)", b"fputest: OK" in buf[mark:])
-# sudo: init 이 sudoers(roi:/app/0/init/sudoers.dat: 0, 1000)와 비밀번호를 확인하고 명령을 root 로 띄운다
-def sudo(cmd, password, t=20):
+# elev: init 이 sudoers(roi:/app/0/init/sudoers.dat: 0, 1000)와 비밀번호를 확인하고 명령을 root 로 띄운다
+def elev(cmd, password, t=20):
     mark = len(buf); send(cmd + "\r")
     if not wait_for("password for test: ", 10, mark): return b""
     send(password + "\r"); wait_for("\n~* ", t, mark)
     return buf[mark:].replace(b"\r", b"")
-o = sudo("sudo cat roi:/hostname", "wrong-password")
-step("sudo: wrong password is refused", b"sudo: authentication failed" in o and b"\nnyxis\n" not in o)
-o = sudo("sudo cat roi:/hostname", pw)
-step("sudo: runs the command as root (reads roi:/hostname)", b"\nnyxis\n" in o and b"init: sudo by uid 1000: app:/cat.run" in o)
-o = sudo("sudo false; echo rc=$?", pw)
-step("sudo: passes the exit code back", b"\nrc=1\n" in o)
-# 보호 프로세스: init 과 login 은 root(sudo)도 kill 로 끝낼 수 없다. 내 프로세스는 kill 로 끝난다
+o = elev("elev cat roi:/hostname", "wrong-password")
+step("elev: wrong password is refused", b"elev: authentication failed" in o and b"\nnyxis\n" not in o)
+o = elev("elev cat roi:/hostname", pw)
+step("elev: runs the command as root (reads roi:/hostname)", b"\nnyxis\n" in o and b"init: elev by uid 1000: app:/cat.run" in o)
+o = elev("elev false; echo rc=$?", pw)
+step("elev: passes the exit code back", b"\nrc=1\n" in o)
+# 심볼릭 링크: app:/sudo.run -> elev.run (VFS 가 링크를 따라가 elev 를 실행한다)
+o = elev("sudo cat roi:/hostname", pw)
+step("symlink: sudo runs elev (app:/sudo.run -> elev.run)", b"[elev] password for" in o and b"\nnyxis\n" in o)
+# 서비스 관리(nex)와 저널: init 이 부팅 때 띄운 journald 가 돌고, 사용자는 자기 항목만 본다
+o = run("nex")
+step("nex: journald unit is active", re.search(rb"journald +active +\d+ +enabled", o) is not None)
+o = run("nex restart journald; echo rc=$?")
+step("nex: changing units needs root", b"permission denied" in o and b"\nrc=3\n" in o)
+o = run("journalman log -p warning e2e-mark; journalman -p warning")
+step("journalman: log and read own entries", b"test[" in o and b"e2e-mark" in o and b"Journal started" not in o)
+o = elev("elev nex status journald", pw)
+step("nex status as root shows the journal", b"Active: active (running)" in o and b"Started journald" in o)
+# 보호 프로세스: init 과 login 은 root(elev)도 kill 로 끝낼 수 없다. 내 프로세스는 kill 로 끝난다
 m = re.search(rb"init started \(pid (\d+)\)", buf)
 initpid = m.group(1).decode() if m else "1"
 o = run("ntop -b")
 m = re.search(rb"\s(\d+)\s+" + initpid.encode() + rb"\s+root\s+\S\s+\S+\s+\S+\s+login \[system\]", o)
 loginpid = m.group(1).decode() if m else "0"
 step("ntop marks init and login as [system]", b"init [system]" in o and loginpid != "0")
-o = sudo(f"sudo kill -9 {initpid} {loginpid}; echo rc=$?", pw)
+o = elev(f"elev kill -9 {initpid} {loginpid}; echo rc=$?", pw)
 step("protected: root cannot kill init or login", b"Operation not permitted" in o and b"\nrc=1\n" in o)
 o = run(f"kill {initpid}; echo rc=$?")
 step("protected: user cannot kill init", b"Operation not permitted" in o and b"\nrc=1\n" in o)

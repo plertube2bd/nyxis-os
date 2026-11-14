@@ -28,6 +28,7 @@
 #include "kernel/security/auth.h"
 #include "kernel/ipc/channel.h"
 #include "kernel/ipc/pipe.h"
+#include "kernel/mm/shm.h"
 #include "kernel/security/perm.h"
 #include "kernel/syscall/syscall_internal.h"
 #include "kernel/dev/device.h"
@@ -697,7 +698,10 @@ static i64 sys_stat(const u64 *a)
         st.type = slot->info_dir ? NX_TYPE_DIR : NX_TYPE_FILE;
         st.size = slot->info_len;
         st.mode = slot->info_dir ? 0555U : 0444U;   /* 누구나 읽기만 */
-    } else if (slot->type == NX_HANDLE_PTY) {
+    } else if (slot->type == NX_HANDLE_SHM) {
+        st.type = NX_TYPE_SHM;
+        st.size = slot->shm->size;
+  } else if (slot->type == NX_HANDLE_PTY) {
         st.type = NX_TYPE_PTY;
     } else if (slot->type == NX_HANDLE_PIPE) {
         st.type = NX_TYPE_PIPE;
@@ -1375,12 +1379,21 @@ static i64 sys_channel_send(const u64 *a)
     return (i64)channel_send(slot->chan, buf, (usize)a[2]);
 }
 
-/* NxChannelReceive(h, void *buf, len, struct nx_msginfo *info, timeout_ms) -> 메시지 바이트 수 */
-static i64 sys_channel_receive(const u64 *a)
+/*
+ * NxChannelReceive / NxChannelReceiveEx 공통. ex 이면 붙은 핸들을 받는 쪽 테이블에 넣고 info 는 nx_msginfo_ex,
+ * 아니면 붙은 핸들은 닫는다 (인터럽트를 켠 뒤에: 파일이면 디스크를 건드릴 수 있다).
+ */
+static i64 do_channel_receive(const u64 *a, bool ex)
 {
     u8 buf[NX_CHAN_MSG_MAX];
     struct nx_msginfo info;
+    struct nx_msginfo_ex info_ex;
+    nx_handle_table_t *table = cur_handles();
     nx_handle_t *slot;
+    nx_handle_t *dst = nNULL;
+    nx_handle_t got_h;
+    bool got = false;
+    u64 dst_handle = NX_HANDLE_INVALID_VALUE;
     usize len = (usize)(a[2] < NX_CHAN_MSG_MAX ? a[2] : NX_CHAN_MSG_MAX);
     u64 ticks;
     u64 deadline;
@@ -1395,12 +1408,21 @@ static i64 sys_channel_receive(const u64 *a)
         return (i64)status;
     deadline = timer_get_tick() + ticks;
     memset(&info, 0, sizeof(info));
+    memset(&got_h, 0, sizeof(got_h));
 
     flags = irq_save();
     for (;;) {
         u64 now;
 
-        status = channel_take_locked(slot->chan, buf, len, &info);
+        /* 핸들이 붙은 메시지면 받을 자리를 먼저 잡는다 (없으면 메시지는 큐에 남는다) */
+        if (ex && !dst && channel_head_has_handle_locked(slot->chan)) {
+            /* 자리표: 빈 info 디렉터리 핸들 (잠든 동안 끝나도 닫기에 문제가 없다) */
+            status = nx_handle_alloc(table, NX_HANDLE_INFO, 0, &dst_handle, &dst);
+            if (NSTATUS_IS_ERR(status))
+                break;
+            dst->info_dir = true;
+        }
+        status = channel_take_handle_locked(slot->chan, buf, len, &info, &got_h, &got);
         if (status != Ntimeout)
             break;                          /* 받았거나 버퍼가 작다 */
         now = timer_get_tick();
@@ -1410,13 +1432,39 @@ static i64 sys_channel_receive(const u64 *a)
         if (NSTATUS_IS_ERR(status) && status != Ntimeout)
             break;
     }
+    if (got && dst) {
+        u32 gen = dst->generation;
+
+        *dst = got_h;                       /* 객체 참조를 그대로 옮긴다 */
+        dst->generation = gen;
+        dst->hflags = 0;
+        got = false;
+    } else if (dst) {
+        nx_handle_discard(dst);             /* 자리를 잡았지만 핸들이 오지 않았다 */
+        dst = nNULL;
+        dst_handle = NX_HANDLE_INVALID_VALUE;
+    }
     irq_restore(flags);
+    if (got)
+        nx_handle_release(&got_h, nNULL);   /* NxChannelReceive: 받을 수 없으니 닫는다 */
+    if (!dst)
+        dst_handle = NX_HANDLE_INVALID_VALUE;
 
     if (a[3] != 0) {
-        Nstatus st2 = copy_to_user(a[3], &info, sizeof(info));
+        Nstatus st2;
 
+        if (ex) {
+            info_ex.sender_pid = info.sender_pid;
+            info_ex.sender_uid = info.sender_uid;
+            info_ex.sender_gid = info.sender_gid;
+            info_ex.length = info.length;
+            info_ex.handle = NSTATUS_IS_ERR(status) ? NX_HANDLE_INVALID_VALUE : dst_handle;
+            st2 = copy_to_user(a[3], &info_ex, sizeof(info_ex));
+        } else {
+            st2 = copy_to_user(a[3], &info, sizeof(info));
+        }
         if (NSTATUS_IS_ERR(st2))
-            return (i64)st2;
+            return (i64)st2;                /* 받은 핸들은 테이블에 남는다 (프로세스가 끝나면 닫힌다) */
     }
     if (NSTATUS_IS_ERR(status))
         return (i64)status;
@@ -1424,6 +1472,112 @@ static i64 sys_channel_receive(const u64 *a)
     if (NSTATUS_IS_ERR(status))
         return (i64)status;
     return (i64)info.length;
+}
+
+/* NxChannelReceive(h, void *buf, len, struct nx_msginfo *info, timeout_ms) -> 메시지 바이트 수 */
+static i64 sys_channel_receive(const u64 *a)
+{
+    return do_channel_receive(a, false);
+}
+
+/* NxChannelReceiveEx(h, void *buf, len, struct nx_msginfo_ex *info, timeout_ms) */
+static i64 sys_channel_receive_ex(const u64 *a)
+{
+    return do_channel_receive(a, true);
+}
+
+/* NxChannelSendHandle(h, buf, len, handle) */
+static i64 sys_channel_send_handle(const u64 *a)
+{
+    u8 buf[NX_CHAN_MSG_MAX];
+    nx_handle_table_t *table = cur_handles();
+    nx_handle_t *slot;
+    nx_handle_t *src;
+    nx_handle_t copy;
+    Nstatus status = lookup_channel(a[0], (u32)NX_RIGHT_SEND, &slot);
+
+    if (NSTATUS_IS_ERR(status))
+        return (i64)status;
+    if (a[2] > NX_CHAN_MSG_MAX)
+        return (i64)NinvalidArg;
+    status = copy_from_user(buf, a[1], (usize)a[2]);
+    if (NSTATUS_IS_ERR(status))
+        return (i64)status;
+    status = nx_handle_lookup(table, a[3], 0, &src);
+    if (NSTATUS_IS_ERR(status))
+        return (i64)status;
+    if (src->type == NX_HANDLE_PROCESS || src->type == NX_HANDLE_TOKEN || src->type == NX_HANDLE_DEVICE ||
+        (src->type == NX_HANDLE_CHANNEL && src->chan_receiver))
+        return (i64)Nunsupported;           /* 보낼 수 없는 종류 */
+    if (!(src->rights & (u32)NX_RIGHT_DUP))
+        return (i64)Npermission;
+
+    memset(&copy, 0, sizeof(copy));
+    status = nx_handle_share(src, &copy, true);
+    if (NSTATUS_IS_ERR(status))
+        return (i64)status;
+    copy.type = src->type;
+    copy.rights = src->rights;
+    status = channel_send_handle(slot->chan, buf, (usize)a[2], &copy);
+    if (NSTATUS_IS_ERR(status))
+        nx_handle_release(&copy, nNULL);
+    return (i64)status;
+}
+
+/* ------------------------------------------------------------------ */
+/* 공유 메모리                                                           */
+/* ------------------------------------------------------------------ */
+
+/* NxSharedMemoryCreate(size, flags) -> 핸들 */
+static i64 sys_shm_create(const u64 *a)
+{
+    nx_handle_table_t *table = cur_handles();
+    nx_handle_t *slot;
+    nx_shm_t *shm;
+    u64 handle;
+    Nstatus status;
+
+    if (!table)
+        return (i64)NnotInitialized;
+    if (a[1] & ~NX_DUP_CLOEXEC)
+        return (i64)NinvalidArg;
+    status = nx_handle_alloc(table, NX_HANDLE_SHM, (u32)(NX_RIGHT_READ | NX_RIGHT_WRITE | NX_RIGHT_STAT | NX_RIGHT_DUP),
+                             &handle, &slot);
+    if (NSTATUS_IS_ERR(status))
+        return (i64)status;
+    status = shm_create(a[0], &shm);
+    if (NSTATUS_IS_ERR(status)) {
+        nx_handle_discard(slot);
+        return (i64)status;
+    }
+    slot->shm = shm;
+    slot->hflags = (a[1] & NX_DUP_CLOEXEC) ? (u32)NX_HFLAG_CLOEXEC : 0U;
+    return (i64)handle;
+}
+
+/* NxSharedMemoryMap(h, u64 *out_addr) -> 0 */
+static i64 sys_shm_map(const u64 *a)
+{
+    nx_handle_table_t *table = cur_handles();
+    nx_handle_t *slot;
+    u64 va;
+    Nstatus status;
+
+    if (!table)
+        return (i64)NnotInitialized;
+    status = nx_handle_lookup(table, a[0], (u32)NX_RIGHT_READ, &slot);
+    if (NSTATUS_IS_ERR(status))
+        return (i64)status;
+    if (slot->type != NX_HANDLE_SHM || !slot->shm)
+        return (i64)NinvalidArg;
+    if (!slot->shm_va) {
+        va = NX_USER_SHM_BASE + (a[0] & 0xFFFFFFFFUL) * NX_SHM_SLOT_SIZE;   /* 슬롯마다 자리가 정해져 있다 */
+        status = shm_map(slot->shm, current_process, va, (slot->rights & (u32)NX_RIGHT_WRITE) ? true : false);
+        if (NSTATUS_IS_ERR(status))
+            return (i64)status;
+        slot->shm_va = va;
+    }
+    return (i64)copy_to_user(a[1], &slot->shm_va, sizeof(slot->shm_va));
 }
 
 /* ------------------------------------------------------------------ */
@@ -1545,8 +1699,14 @@ static i64 sys_device_command(const u64 *a)
         return (i64)status;
 
     if (slot->type == NX_HANDLE_PTY) {
-        /* pty 주 끝: 창 크기 */
+        /* pty 주 끝: 창 크기, 포그라운드 그룹 조회 (터미널 에뮬레이터가 단축키로 신호를 보낼 때) */
         struct nx_winsize ws;
+
+        if (a[1] == NX_DEVCMD_TTY_FOREGROUND) {
+            if (a[2] != NX_PGID_QUERY)
+                return (i64)Nunsupported;   /* 정하는 것은 종속 끝(작업을 띄우는 셸)이 한다 */
+            return (i64)tty_get_foreground(pty_tty(slot->pty));
+        }
 
         if (a[1] == NX_DEVCMD_TTY_WINSIZE) {
             tty_get_winsize(pty_tty(slot->pty), &ws);
@@ -1656,6 +1816,11 @@ static i64 sys_device_map_mmio(const u64 *a)
 /* Debug                                                               */
 /* ------------------------------------------------------------------ */
 
+/*
+ * 디버그 시스템 콜 (0x0300 구역, NX_SYS_DEBUG_FIRST..NX_SYS_DEBUG_LAST). make DEBUG_SYSCALLS=1 (또는 SELFTEST=1)
+ * 일 때만 커널에 들어간다. 기본 빌드에는 코드가 없고 그 번호는 NsyscallFailed 다 (syscall_dispatch 도 막는다).
+ */
+#ifdef NYX_DEBUG_SYSCALLS
 /* NxKernelPrint(const char *str): 커널 로그에 문자열 출력 (서식 문자열이 아니며 제어 문자는 제거됨) */
 static i64 sys_kernel_print(const u64 *a)
 {
@@ -1674,6 +1839,7 @@ static i64 sys_debug_nop(const u64 *a)
     (void)a;
     return 0;
 }
+#endif /* NYX_DEBUG_SYSCALLS */
 
 /* ------------------------------------------------------------------ */
 /* 표                                                                  */
@@ -1713,6 +1879,10 @@ static const struct syscall_entry g_syscalls[] = {
     { NX_SYS_CHANNEL_CREATE,   sys_channel_create },
     { NX_SYS_CHANNEL_SEND,     sys_channel_send },
     { NX_SYS_CHANNEL_RECEIVE,  sys_channel_receive },
+    { NX_SYS_CHANNEL_SEND_HANDLE, sys_channel_send_handle },
+    { NX_SYS_CHANNEL_RECEIVE_EX,  sys_channel_receive_ex },
+    { NX_SYS_SHM_CREATE,       sys_shm_create },
+    { NX_SYS_SHM_MAP,          sys_shm_map },
 
     { NX_SYS_CREATE_NODE,      sys_create_node },
     { NX_SYS_REMOVE_NODE,      sys_remove_node },
@@ -1739,10 +1909,13 @@ static const struct syscall_entry g_syscalls[] = {
     { NX_SYS_PROCESS_WAIT,     sys_process_wait },
     { NX_SYS_PROCESS_INFO,     sys_process_info },
 
-    { NX_SYS_VIRTUAL_ALLOC,    sys_virtual_alloc },
+    { NX_SYS_VIRTUAL_ALLOC,    sys_virtual_alloc }
 
+#ifdef NYX_DEBUG_SYSCALLS
+    ,
     { NX_SYS_KERNEL_PRINT,     sys_kernel_print },
     { NX_SYS_DEBUG_NOP,        sys_debug_nop }
+#endif
 };
 
 #define SYSCALL_COUNT (sizeof(g_syscalls) / sizeof(g_syscalls[0]))
@@ -1765,6 +1938,12 @@ i64 syscall_dispatch(
     args[3] = a3;
     args[4] = a4;
     args[5] = a5;
+
+#ifndef NYX_DEBUG_SYSCALLS
+    /* 디버그 구역은 표에 무엇이 있든 막는다 (나중에 #ifdef 밖에 디버그 콜을 실수로 넣어도 열리지 않게) */
+    if (syscall_nr >= NX_SYS_DEBUG_FIRST && syscall_nr <= NX_SYS_DEBUG_LAST)
+        return (i64)NsyscallFailed;
+#endif
 
     for (i = 0; i < SYSCALL_COUNT; i++) {
         if (g_syscalls[i].nr == syscall_nr)

@@ -239,6 +239,83 @@ static int device_tests(void)
     return 0;
 }
 
+/* ---------------- 공유 메모리 / 핸들 보내기 (root) ---------------- */
+
+static long send_handle(long ch, const char *msg, long h)
+{
+    return nx_syscall(NX_SYS_CHANNEL_SEND_HANDLE, (unsigned long)ch, (unsigned long)msg, nx_strlen(msg), (unsigned long)h, 0);
+}
+
+static long recv_ex(long ch, char *buf, unsigned long cap, struct nx_msginfo_ex *info)
+{
+    return nx_syscall(NX_SYS_CHANNEL_RECEIVE_EX, (unsigned long)ch, (unsigned long)buf, cap, (unsigned long)info, 0);
+}
+
+static int shm_tests(void)
+{
+    struct nx_stat st;
+    struct nx_msginfo_ex mi;
+    struct nx_msginfo mi0;
+    unsigned long a1 = 0;
+    unsigned long a2 = 0;
+    unsigned long p[2];
+    char buf[64];
+    long h;
+    long ro;
+    long rx;
+    long tx;
+    long got;
+
+    /* 만들기, 매핑, 읽기 전용 사본이 같은 프레임을 본다 */
+    h = nx_syscall(NX_SYS_SHM_CREATE, 10000, 0, 0, 0, 0);
+    CHECK(h >= 0 && nx_stat(h, &st) == 0 && st.type == NX_TYPE_SHM && st.size == 12288, 740);
+    CHECK(nx_syscall(NX_SYS_SHM_MAP, (unsigned long)h, (unsigned long)&a1, 0, 0, 0) == 0 && a1 != 0, 741);
+    CHECK(((volatile unsigned char *)a1)[0] == 0 && ((volatile unsigned char *)a1)[12287] == 0, 742);   /* 0 으로 시작 */
+    ((volatile unsigned int *)a1)[5] = 0xC0FFEEU;
+    ro = nx_dup(h, NX_RIGHT_READ | NX_RIGHT_STAT | NX_RIGHT_DUP);
+    CHECK(ro >= 0 && nx_syscall(NX_SYS_SHM_MAP, (unsigned long)ro, (unsigned long)&a2, 0, 0, 0) == 0 && a2 != a1 &&
+          ((volatile unsigned int *)a2)[5] == 0xC0FFEEU, 743);
+    CHECK(nx_close(h) == 0 && ((volatile unsigned int *)a2)[5] == 0xC0FFEEU, 744);   /* 사본이 살아 있는 동안은 남는다 */
+    CHECK(nx_syscall(NX_SYS_SHM_CREATE, NX_SHM_MAX + 1, 0, 0, 0, 0) == NX_E_INVALID_ARG &&
+          nx_syscall(NX_SYS_SHM_CREATE, 0, 0, 0, 0, 0) == NX_E_INVALID_ARG, 745);
+
+    /* 채널로 핸들 보내기: 받은 쪽의 새 핸들이 같은 객체 */
+    rx = nx_channel_create("svc:/sys/elftest-h", 0);
+    tx = nx_open("svc:/sys/elftest-h", NX_O_WRITE);
+    CHECK(rx >= 0 && tx >= 0 && send_handle(tx, "shm", ro) == 0, 746);
+    nx_memset(&mi, 0, sizeof(mi));
+    got = recv_ex(rx, buf, sizeof(buf), &mi);
+    CHECK(got == 3 && mi.handle != NX_HANDLE_INVALID_VALUE && (long)mi.handle != ro, 747);
+    a1 = 0;
+    CHECK(nx_syscall(NX_SYS_SHM_MAP, mi.handle, (unsigned long)&a1, 0, 0, 0) == 0 &&
+          ((volatile unsigned int *)a1)[5] == 0xC0FFEEU, 748);
+    CHECK(nx_close((long)mi.handle) == 0 && nx_close(ro) == 0, 749);
+
+    /* 파이프 끝을 보내고 받은 핸들로 쓴다 */
+    CHECK(nx_syscall(NX_SYS_PIPE_CREATE, (unsigned long)p, 0, 0, 0, 0) == 0, 750);
+    CHECK(send_handle(tx, "w", (long)p[1]) == 0 && nx_close((long)p[1]) == 0, 751);
+    got = recv_ex(rx, buf, sizeof(buf), &mi);
+    CHECK(got == 1 && mi.handle != NX_HANDLE_INVALID_VALUE && nx_write((long)mi.handle, "hi", 2) == 2 &&
+          nx_read((long)p[0], buf, sizeof(buf)) == 2 && buf[0] == 'h', 752);
+    CHECK(nx_close((long)mi.handle) == 0 && nx_read((long)p[0], buf, sizeof(buf)) == 0, 753);   /* 마지막 쓰기 끝: EOF */
+    CHECK(nx_close((long)p[0]) == 0, 754);
+
+    /* 핸들 없이 받으면(NxChannelReceive) 붙은 핸들은 닫힌다 / 받지 않은 채 채널이 사라져도 닫힌다 */
+    CHECK(nx_syscall(NX_SYS_PIPE_CREATE, (unsigned long)p, 0, 0, 0, 0) == 0, 755);
+    CHECK(send_handle(tx, "w", (long)p[1]) == 0 && send_handle(tx, "w", (long)p[1]) == 0 &&
+          nx_close((long)p[1]) == 0, 756);
+    CHECK(nx_channel_receive(rx, buf, sizeof(buf), &mi0, 0) == 1, 757);
+    CHECK(nx_close(rx) == 0 && nx_read((long)p[0], buf, sizeof(buf)) == 0, 758);    /* 두 사본 모두 닫혔다: EOF */
+    CHECK(nx_close((long)p[0]) == 0 && nx_close(tx) == 0, 759);
+
+    /* 보낼 수 없는 종류 */
+    rx = nx_channel_create("svc:/sys/elftest-h", 0);
+    tx = nx_open("svc:/sys/elftest-h", NX_O_WRITE);
+    CHECK(send_handle(tx, "rx", rx) == NX_E_UNSUPPORTED, 760);                      /* 받는 끝 */
+    CHECK(nx_close(tx) == 0 && nx_close(rx) == 0, 761);
+    return 0;
+}
+
 /* ---------------- 의사 터미널 (root) ---------------- */
 
 static long pty_create(long h[2])
@@ -831,6 +908,9 @@ int elftest_system_tests(void)
     if (r)
         return r;
     r = pty_tests();
+    if (r)
+        return r;
+    r = shm_tests();
     if (r)
         return r;
     r = registry_tests();

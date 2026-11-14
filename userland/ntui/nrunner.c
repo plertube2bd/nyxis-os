@@ -103,27 +103,16 @@ static void run(void)
         return;
     }
     strcpy(g_last, g_input);
-    if (strcmp(line, "files") == 0 || strcmp(line, "nfiles") == 0) {
-        g_open = 0;
-        if (nfilesOpen(NULL) == NULL) {
-            g_open = 1;
-            strcpy(g_msg, "cannot open a window (too many windows?)");
-        }
+    g_open = 0;
+    if (strcmp(line, "files") == 0) {
+        (void)launchApp("nfiles");
         return;
     }
     if (strcmp(line, "nterminal") == 0 || strcmp(line, "term") == 0 || strcmp(line, "terminal") == 0) {
-        g_open = 0;
-        if (nterminalOpen() == NULL) {
-            g_open = 1;                 /* 상자를 그대로 두고 알린다 */
-            strcpy(g_msg, "cannot open a terminal (too many windows?)");
-        }
+        (void)launchTerminal(NULL);
         return;
     }
-    g_open = 0;
-    if (nterminalRunEx(line, g_fullscreen ? RUN_MAXIMIZED : 0, NULL, 0, 0) == NULL) {
-        g_open = 1;
-        strcpy(g_msg, "cannot open a window (too many windows?)");
-    }
+    (void)launchAuto(line, g_fullscreen ? LAUNCH_MAXIMIZED : 0);
 }
 
 /* 열려 있으면 모든 키를 먹는다 (1) */

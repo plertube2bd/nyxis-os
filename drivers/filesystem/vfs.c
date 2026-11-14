@@ -18,6 +18,8 @@
  *    vnode 는 참조 수를 가진다: dentry 하나 + 열린 핸들마다 하나 (vfs_open/vfs_reopen 이 늘리고 vfs_close
  *    가 줄인다). 열린 파일의 vnode 는 지우지 않으며, 지운 파일(unlink)의 vnode 는 마지막 close 때 해제한다.
  *    마운트 지점과 이름공간 루트는 고정(pinned)이라 지우지 않는다.
+ *  - 심볼릭 링크: 경로를 해석할 때 VFS_NODE_SYMLINK 노드를 만나면 readlink 로 대상을 읽어 따라간다
+ *    (도중과 마지막 모두. 만들기/지우기/이름 바꾸기의 마지막 이름은 링크 자체). 형식은 follow_link 머리말.
  *  - 락: 이 VFS 는 현재 단일 코어 + 인터럽트 비사용 경로에서만 쓰인다.
  *    mount/unmount 는 g_vfs_lock 으로 보호하지만 resolve/open 경로는 락이 없다.
  *    멀티코어/선점 도입 전에 반드시 보완해야 한다.
@@ -531,23 +533,112 @@ static Nstatus resolve_namespace_path(const char *path, vfs_namespace_t **out_ns
     return Nok;
 }
 
+/* 심볼릭 링크를 따라가는 깊이 한도 (링크 -> 링크 -> ... 고리를 끊는다) */
+#define VFS_SYMLINK_DEPTH   8
+#define VFS_LINK_MAX        256     /* 링크 대상 경로의 최대 길이 (NUL 포함) */
+
 /*
- * 네임스페이스 안에서 path 를 따라 dentry 를 찾는다.
- * dentry 캐시에 없으면 파일시스템의 lookup 을 호출하고 결과를 캐시에 추가한다.
+ * current 아래의 name 자식 dentry 를 얻는다. 캐시에 없으면 파일시스템의 lookup 을 부르고 결과를 캐시에 넣는다
+ * (dentry 는 lookup 결과의 캐시일 뿐이므로 항상 만든다). 링크는 따라가지 않는다.
  */
-static Nstatus resolve_path_internal_ns(
-    vfs_namespace_t *ns,
-    const char *path,
-    dentry_t **out_dentry
-) {
+static Nstatus lookup_child(dentry_t *current, const char *name, Nstatus no_lookup, dentry_t **out_child)
+{
+    dentry_t *child = find_child(current, name);
+
+    if (!child) {
+        vnode_t *vnode = nNULL;
+        Nstatus status;
+
+        if (!current->node || !current->node->ops || !current->node->ops->lookup) {
+            return no_lookup;
+        }
+
+        status = current->node->ops->lookup(current->node, name, &vnode);
+        if (NSTATUS_IS_ERR(status)) {
+            return status;
+        }
+
+        if (!vnode) {
+            return no_lookup;
+        }
+
+        child = alloc_dentry(name, vnode, current);
+        if (!child) {
+            vnode_put(vnode);
+            return NoutOfMemory;
+        }
+        attach_child(current, child);
+    }
+
+    *out_child = child;
+    return Nok;
+}
+
+static bool is_symlink(const dentry_t *d)
+{
+    return (d && d->node && d->node->type == VFS_NODE_SYMLINK) ? true : false;
+}
+
+static Nstatus walk_path(vfs_namespace_t **ns_io, dentry_t *start, const char *path, u32 depth, dentry_t **out_dentry);
+
+/*
+ * 링크 dentry(link, 부모 dir, 네임스페이스 ns 안)를 따라가 대상 dentry 를 얻는다. 대상 경로의 형식:
+ *   "ns:/경로"  다른(또는 같은) 네임스페이스의 절대 경로
+ *   "/경로"     링크와 같은 네임스페이스의 절대 경로
+ *   "경로"      링크가 있는 디렉터리 기준의 상대 경로 (예: app:/sudo.run -> "elev.run")
+ * 대상도 링크면 계속 따라간다 (depth 가 VFS_SYMLINK_DEPTH 에 닿으면 NpathTooLong: 링크 고리).
+ * *ns_io 는 대상이 속한 네임스페이스로 바뀐다 (그 뒤의 "/..." 링크가 그 네임스페이스를 기준으로 하도록).
+ */
+static Nstatus follow_link(vfs_namespace_t **ns_io, dentry_t *dir, dentry_t *link, u32 depth, dentry_t **out_dentry)
+{
+    char target[VFS_LINK_MAX];
+    char namespace_name[VFS_NAME_MAX + 1];
+    const char *local = nNULL;
+    usize len = 0;
+    Nstatus status;
+
+    if (depth >= VFS_SYMLINK_DEPTH) {
+        return NpathTooLong;
+    }
+    if (!link->node->ops || !link->node->ops->readlink) {
+        return Nunsupported;
+    }
+
+    status = link->node->ops->readlink(link->node, target, sizeof(target), &len);
+    if (NSTATUS_IS_ERR(status)) {
+        return status;
+    }
+    if (len == 0 || len >= sizeof(target)) {
+        return NfileCorrupted;
+    }
+    target[len] = '\0';
+
+    status = parse_namespace_path(target, namespace_name, sizeof(namespace_name), &local);
+    if (NSTATUS_IS_ERR(status)) {
+        return status;
+    }
+    if (local != target) {                       /* "ns:/..." */
+        vfs_namespace_t *ns = get_namespace(namespace_name, false);
+
+        if (!ns) {
+            return NnotFound;
+        }
+        *ns_io = ns;
+        return walk_path(ns_io, ns->root, local, depth + 1U, out_dentry);
+    }
+    return walk_path(ns_io, dir, local, depth + 1U, out_dentry);
+}
+
+/*
+ * start 에서 path 를 따라 dentry 를 찾는다 ('/' 로 시작하면 네임스페이스 루트부터). 도중과 마지막의
+ * 심볼릭 링크를 모두 따라간다 (지우기/이름 바꾸기는 링크 자체를 다루므로 resolve_parent_ns 를 쓴다).
+ */
+static Nstatus walk_path(vfs_namespace_t **ns_io, dentry_t *start, const char *path, u32 depth, dentry_t **out_dentry)
+{
     dentry_t *current;
     const char *cursor;
 
-    if (!ns || !path || !out_dentry) {
-        return NinvalidArg;
-    }
-
-    current = (path[0] == '/') ? ns->root : ns->cwd;
+    current = (path[0] == '/') ? (*ns_io)->root : start;
     cursor = path;
 
     if (*cursor == '/') {
@@ -556,7 +647,7 @@ static Nstatus resolve_path_internal_ns(
 
     while (*cursor != '\0') {
         char name[VFS_NAME_MAX + 1];
-        dentry_t *child;
+        dentry_t *child = nNULL;
         Nstatus status = parse_segment(&cursor, name, sizeof(name));
 
         if (NSTATUS_IS_ERR(status)) {
@@ -567,29 +658,16 @@ static Nstatus resolve_path_internal_ns(
             break;
         }
 
-        child = find_child(current, name);
-        if (!child) {
-            vnode_t *vnode = nNULL;
+        status = lookup_child(current, name, NfileNotFound, &child);
+        if (NSTATUS_IS_ERR(status)) {
+            return status;
+        }
 
-            if (!current->node || !current->node->ops || !current->node->ops->lookup) {
-                return NfileNotFound;
-            }
-
-            status = current->node->ops->lookup(current->node, name, &vnode);
+        if (is_symlink(child)) {
+            status = follow_link(ns_io, current, child, depth, &child);
             if (NSTATUS_IS_ERR(status)) {
                 return status;
             }
-
-            if (!vnode) {
-                return NfileNotFound;
-            }
-
-            child = alloc_dentry(name, vnode, current);
-            if (!child) {
-                vnode_put(vnode);
-                return NoutOfMemory;
-            }
-            attach_child(current, child);
         }
 
         current = child;
@@ -599,6 +677,25 @@ static Nstatus resolve_path_internal_ns(
     return Nok;
 }
 
+/*
+ * 네임스페이스 안에서 path 를 따라 dentry 를 찾는다 (링크를 따라간다).
+ */
+static Nstatus resolve_path_internal_ns(
+    vfs_namespace_t *ns,
+    const char *path,
+    dentry_t **out_dentry
+) {
+    if (!ns || !path || !out_dentry) {
+        return NinvalidArg;
+    }
+
+    return walk_path(&ns, ns->cwd, path, 0, out_dentry);
+}
+
+/*
+ * path 의 부모 디렉터리 dentry 와 마지막 이름을 얻는다. 마지막 이름은 따라가지 않는다 (링크 자체를 만들기/
+ * 지우기/이름 바꾸기 한다). 도중의 링크는 따라간다.
+ */
 static Nstatus resolve_parent_ns(
     vfs_namespace_t *ns,
     const char *path,
@@ -623,7 +720,7 @@ static Nstatus resolve_parent_ns(
     while (*cursor != '\0') {
         char name[VFS_NAME_MAX + 1];
         const char *next_cursor;
-        dentry_t *child;
+        dentry_t *child = nNULL;
         Nstatus status = parse_segment(&cursor, name, sizeof(name));
 
         if (NSTATUS_IS_ERR(status)) {
@@ -646,29 +743,16 @@ static Nstatus resolve_parent_ns(
             return Nok;
         }
 
-        child = find_child(current, name);
-        if (!child) {
-            vnode_t *vnode = nNULL;
+        status = lookup_child(current, name, NnotFound, &child);
+        if (NSTATUS_IS_ERR(status)) {
+            return status;
+        }
 
-            if (!current->node || !current->node->ops || !current->node->ops->lookup) {
-                return NnotFound;
-            }
-
-            status = current->node->ops->lookup(current->node, name, &vnode);
+        if (is_symlink(child)) {
+            status = follow_link(&ns, current, child, 0, &child);
             if (NSTATUS_IS_ERR(status)) {
                 return status;
             }
-
-            if (!vnode) {
-                return NnotFound;
-            }
-
-            child = alloc_dentry(name, vnode, current);
-            if (!child) {
-                vnode_put(vnode);
-                return NoutOfMemory;
-            }
-            attach_child(current, child);
         }
 
         current = child;

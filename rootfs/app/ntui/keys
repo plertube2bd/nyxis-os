@@ -1,0 +1,89 @@
+# ntui shortcuts - default (app:/ntui.run/keys)
+#
+# Your own copy lives in roi:/<uid>/app/ntui/keys and wins over this file. Edit it with the
+# shortcut settings window (Super+I) or any editor, then reload (Super+Shift+R).
+#
+#   [keys] { commands; }
+#
+# keys      modifiers super ctrl alt shift + one key, several keys separated by ','.
+#           key names: enter tab esc space backspace delete insert home end pgup pgdn up down left right
+#           f1..f12 print menu, super (alone = press and release Super), plus comma lbracket rbracket
+#           lbrace rbrace semicolon, or one character. shift+1 is the same as '!'.
+#           "tty: ..." only when ntui runs inside a terminal (no Super key there),
+#           "display: ..." only when ntui owns the screen, "... @app" only when that window is active
+#           (nterminal, nfiles, nclock, nkeys, nhelp: the window program's app id).
+# commands  action <name> [n]   an ntui action (menu run terminal files close maximize minimize
+#                               restore-or-minimize snap-left snap-right fullscreen window-menu move resize
+#                               switch-next switch-prev task-view next prev desktop minimize-all
+#                               restore-all lock task-manager screenshot taskbar theme help window <n>
+#                               keys reload-keys)
+#           exec <command>      run in a window (nysh -c). nrunner nterminal nfiles ntop are built in.
+#           pass                give the key to the program in the active window
+#           send <key>          give a different key to the program
+#           signal <name>       send a signal (INT TERM KILL HUP ...) to the active terminal's job
+#           none                swallow the key
+#
+# Keys without a binding go to the program in the active window, except Super+... keys,
+# which belong to the desktop.
+
+# ---- desktop ----
+[super, super+q, alt+f1]          { action menu; }
+[super+r, alt+f2]                 { exec nrunner; }
+[super+enter, super+t, ctrl+alt+t] { exec nterminal; }
+[super+e]                         { exec nfiles; }
+[super+i]                         { action keys; }
+[super+shift+r]                   { action reload-keys; }
+[f1, super+/]                     { action help; }
+[super+l, ctrl+alt+l]             { action lock; }
+[ctrl+shift+esc, ctrl+alt+delete] { exec ntop; }
+[print]                           { action screenshot; }
+[super+b]                         { action taskbar; }
+[super+g]                         { action theme; }
+
+# ---- windows ----
+[alt+f4, super+w]                 { action close; }
+[alt+tab]                         { action switch-next; }
+[alt+shift+tab]                   { action switch-prev; }
+[super+tab]                       { action task-view; }
+[alt+esc, super+n]                { action next; }
+[alt+shift+esc, super+p]          { action prev; }
+[super+up, super+f, alt+f10]      { action maximize; }
+[super+down]                      { action restore-or-minimize; }
+[super+left]                      { action snap-left; }
+[super+right]                     { action snap-right; }
+[super+h, alt+f9]                 { action minimize; }
+[f11]                             { action fullscreen; }
+[alt+space, menu]                 { action window-menu; }
+[alt+f7]                          { action move; }
+[alt+f8]                          { action resize; }
+[super+d]                         { action desktop; }
+[super+m]                         { action minimize-all; }
+[super+shift+m]                   { action restore-all; }
+[super+1] { action window 1; }
+[super+2] { action window 2; }
+[super+3] { action window 3; }
+[super+4] { action window 4; }
+[super+5] { action window 5; }
+[super+6] { action window 6; }
+[super+7] { action window 7; }
+[super+8] { action window 8; }
+[super+9] { action window 9; }
+
+# ---- inside a terminal window (like other terminal emulators) ----
+[ctrl+shift+t, ctrl+shift+n @nterminal] { exec nterminal; }
+[ctrl+shift+w @nterminal]               { action close; }
+
+# ---- ntui inside a terminal (no Super key) ----
+[tty: ctrl+q] { action menu; }
+[tty: ctrl+r] { exec nrunner; }
+[tty: ctrl+t] { exec nterminal; }
+[tty: ctrl+e] { exec nfiles; }
+[tty: ctrl+w] { action close; }
+[tty: ctrl+f] { action maximize; }
+[tty: ctrl+y] { action minimize; }
+[tty: ctrl+o] { action move; }
+[tty: ctrl+n] { action next; }
+[tty: ctrl+p] { action prev; }
+[tty: ctrl+b] { action taskbar; }
+[tty: ctrl+g] { action theme; }
+[tty: ctrl+k] { action keys; }

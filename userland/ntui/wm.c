@@ -301,6 +301,30 @@ void wmSetLayout(struct window *w, int layout)
     applyLayout(w);
 }
 
+/* 프로그램의 부탁(NWP_REQ_MOVE/RESIZE)으로 옮기거나 크기를 바꾼다. 음수 = 그대로. 보통 배치가 되고 창 영역 안으로 맞춘다 */
+void wmPlace(struct window *w, int x, int y, int ww, int wh)
+{
+    if (w == NULL)
+        return;
+    if (w->layout != LAYOUT_NORMAL)
+        wmSetLayout(w, LAYOUT_NORMAL);
+    if (ww >= 0)
+        w->w = ww;
+    if (wh >= 0)
+        w->h = wh;
+    if (x >= 0)
+        w->x = x;
+    if (y >= 0)
+        w->y = y;
+    clampWindow(w);
+}
+
+/* 창 영역 (화면에서 작업 표시줄을 뺀 것) */
+int wmAreaRows(void)
+{
+    return areaRows();
+}
+
 void wmToggleMaximize(struct window *w)
 {
     if (w != NULL)
@@ -498,12 +522,28 @@ int wmKey(int key)
     return w->app->key ? w->app->key(w, key) : 0;
 }
 
+/* 활성 창을 닫는다: 클라이언트의 창이면 클라이언트에게 부탁한다 (requestClose) */
 void wmCloseActive(void)
 {
     struct window *w = wmActive();
 
-    if (w != NULL)
+    if (w == NULL)
+        return;
+    if (w->app->requestClose != NULL)
+        w->app->requestClose(w);
+    else
         w->wantClose = 1;
+}
+
+int wmIndexOf(const struct window *w)
+{
+    int i;
+
+    for (i = 0; i < g_count; i++) {
+        if (g_wins[i] == w)
+            return i;
+    }
+    return -1;
 }
 
 void wmMinimizeActive(void)
@@ -587,7 +627,7 @@ static void wmenuDo(char k)
     case 'n': wmMinimize(g_active); break;
     case 'x': wmSetLayout(w, LAYOUT_MAX); break;
     case 'f': wmToggleFullscreen(); break;
-    case 'c': w->wantClose = 1; break;
+    case 'c': wmCloseActive(); break;
     default: break;
     }
 }

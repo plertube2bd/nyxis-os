@@ -1,25 +1,28 @@
 /*
- * ntui.h - ntui 공용 선언
+ * ntui.h - ntui (컴포지터) 공용 선언
+ *
+ * ntui 는 Wayland 컴포지터 같은 자리다: 화면과 키보드를 혼자 가지고, 창 프로그램(nterm, nfiles, nclock, nkeys ...)은
+ * 따로 도는 프로세스로서 NWP(<nwp.h>, docs/NWP.md)로 연결해 자기 창의 내용만 그린다. ntui 가 하는 것은
+ * 창 배치/테두리/포커스, 작업 표시줄, 메뉴, 실행 상자, 창 전환기, 화면 잠금, 단축키(키를 어디로 보낼지), 스크린샷.
  *
  * ntui 는 두 가지로 돈다 (screen.c / term.c 가 고른다):
  *   - 화면 모드 (기본): 로그인 셸(콘솔 세션)로 시작하면 dev:/console 을 가져와 프레임버퍼에 직접 그리고, 키보드의
  *     키 이벤트를 받는다 (Shift/Ctrl/Alt/Super 구분). 커널 콘솔은 그동안 화면에 그리지 않는다.
  *   - 터미널 모드: 화면을 가져올 수 없으면(셸에서 띄움, 프레임버퍼 없음) 지금 터미널 위에서 ANSI 로 그린다.
- * 어느 모드든 창 안의 터미널은 ntui 의 터미널 에뮬레이터(vt.c)이고, 명령은 의사 터미널(openpty)에서 돈다.
  *
- *   term.c   입력: 키 (화면 모드의 키 이벤트 / 터미널 모드의 바이트 해석) -> KEY_* + 수정자
- *   sys.c    세션 정보: 사용자, 시간대 (init)
- *   theme.c  색 테마 (역할 -> 색)
- *   screen.c 화면: 셀 버퍼, 바뀐 칸만 그리기 (프레임버퍼 / ANSI)
- *   vt.c     터미널 에뮬레이터 (VT100/xterm 의 부분집합, 셀 격자 + 스크롤백)
+ *   term.c    입력: 키 (화면 모드의 키 이벤트 / 터미널 모드의 바이트 해석) -> KEY_* + 수정자
+ *   sys.c     세션 정보: 사용자, 시간대 (init)
+ *   theme.c   색 테마 (역할 -> 색. 클라이언트에게도 보낸다)
+ *   screen.c  화면: 셀 버퍼, 바뀐 칸만 그리기 (프레임버퍼 / ANSI)
+ *   server.c  NWP 서버: 클라이언트 연결, 창(서피스), 버퍼, 키/크기/포커스 이벤트
+ *   launch.c  창 프로그램 띄우기 (NWP_DISPLAY 를 물려준다)
  *   taskbar.c 작업 표시줄
- *   wm.c     창 관리: 창 목록, 테두리, 포커스, 앱에 키/이벤트 넘기기
- *   nterminal.c  터미널 창 (pty + vt.c, 대화형 nysh 또는 명령 하나)
- *   nrunner.c    실행 대화상자 (명령을 창/최대화된 창에서 실행, 터미널/파일 탐색기 열기)
- *   nfiles.c     파일 탐색기
- *   menu.c       메뉴: 앱, 테마, 셸, 로그아웃, 전원 끄기
- *   clock.c      시계 / 달력 창 (작업 표시줄의 시계 위젯)
- *   main.c   진입점, 이벤트 루프, 전역 단축키
+ *   wm.c      창 관리: 창 목록, 테두리, 포커스, 배치
+ *   nrunner.c 실행 상자
+ *   menu.c    메뉴: 앱, 테마, 로그아웃, 전원 끄기
+ *   switcher.c lock.c lineedit.c  창 전환기, 화면 잠금, 한 줄 입력 그리기
+ *   keymap.c  단축키 설정 (nkeys 와 함께 쓴다: keymap.h)
+ *   main.c    진입점, 이벤트 루프, 키를 어디로 보낼지
  */
 #ifndef NTUI_H
 #define NTUI_H
@@ -27,6 +30,9 @@
 #include <stddef.h>
 #include <sys/types.h>
 #include <poll.h>
+#include <nwp.h>
+
+#include "keymap.h"
 
 /* ---------------- sys.c: 세션 정보 ---------------- */
 
@@ -45,34 +51,10 @@ int init(void);
 
 /* ---------------- term.c: 입력 ---------------- */
 
-/*
- * 키 값 = 기본 키 | 수정자 비트.
- *   기본 키: 글자(Shift 반영, 0x20-0x7E), '\r' Enter, '\t' Tab, 0x7F Backspace, KEY_ESC, KEY_UP 등 특수 키.
- *   Ctrl+글자는 제어 문자(KEY_CTRL('t') = 0x14)가 기본 키다 (KEY_MOD_CTRL 은 붙지 않는다).
- *   글자에는 KEY_MOD_SHIFT 를 붙이지 않는다 (이미 대문자/기호로 반영). 특수 키와 Tab/Enter 에는 붙는다.
- *   Alt/Super 는 언제나 비트로 붙는다. 터미널 모드에서는 Super 가 없고, ESC + 글자는 Alt+글자로 읽는다.
- */
-enum {
-    KEY_ESC = 27,
-    KEY_UP = 0x100, KEY_DOWN, KEY_LEFT, KEY_RIGHT,
-    KEY_HOME, KEY_END, KEY_DEL, KEY_PGUP, KEY_PGDN, KEY_INS,
-    KEY_F1, KEY_F2, KEY_F3, KEY_F4, KEY_F5, KEY_F6, KEY_F7, KEY_F8, KEY_F9, KEY_F10, KEY_F11, KEY_F12,
-    KEY_SUPER_TAP,                      /* Super 를 눌렀다 뗐다 (그 사이 다른 키 없음) */
-    KEY_PRINT,                          /* PrintScreen (화면 모드) */
-    KEY_MENUKEY,                        /* 메뉴(애플리케이션) 키 (화면 모드) */
-    KEY_ALT_UP                          /* Alt 를 뗐다 (inputWantAltRelease 로 켰을 때만: 창 전환기) */
-};
-
-#define KEY_MOD_SHIFT 0x1000
-#define KEY_MOD_CTRL  0x2000
-#define KEY_MOD_ALT   0x4000
-#define KEY_MOD_SUPER 0x8000
-#define KEY_MODS      0xF000
-#define KEY_BASE(k)   ((k) & 0x0FFF)
+/* 키 값과 KEY_* 이름: keymap.h (= nwp.h 의 NWP_KEY_*) */
 
 #define KEY_TIMEOUT (-2)                /* getchTimeout: 시간 안에 키가 없었다 */
 
-#define KEY_CTRL(c)  ((c) & 0x1F)        /* KEY_CTRL('t') = 0x14 */
 
 int inputOpen(void);                    /* 화면 모드면 이미 열린 화면의 키, 아니면 터미널 raw 모드 */
 int inputFd(void);                      /* poll 로 기다릴 fd */
@@ -151,39 +133,6 @@ int screenShot(char *path, size_t cap); /* 화면 모드: 화면을 PPM 으로 �
 struct nx64_display;
 struct nx64_display *screenDisplay(void);   /* 화면 모드의 화면 (아니면 NULL) */
 
-/* ---------------- vt.c: 터미널 에뮬레이터 ---------------- */
-
-#define VT_ATTR_BOLD      ATTR_BOLD
-#define VT_ATTR_REVERSE   ATTR_REVERSE
-#define VT_ATTR_UNDERLINE ATTR_UNDERLINE
-#define VT_ATTR_FGDEF     0x10U         /* 기본 글자색 (그릴 때 창 색으로) */
-#define VT_ATTR_BGDEF     0x20U         /* 기본 배경색 */
-
-struct vtcell {
-    unsigned short ch;
-    unsigned char fg, bg;               /* 256색 번호 (VT_ATTR_*DEF 면 무시) */
-    unsigned char attr;
-};
-
-struct vt;
-
-/* 응답(커서 위치 보고 등)을 쓸 곳. ctx 는 vtNew 에 준 값 */
-typedef void (*vt_reply_fn)(void *ctx, const char *s, int n);
-
-struct vt *vtNew(int cols, int rows, vt_reply_fn reply, void *ctx);
-void vtFree(struct vt *v);
-void vtResize(struct vt *v, int cols, int rows);
-void vtWrite(struct vt *v, const char *buf, int n);    /* 프로그램 출력을 해석한다 */
-int vtCols(const struct vt *v);
-int vtRows(const struct vt *v);
-/* 보이는 줄 y (0..rows-1) 의 셀. scroll 만큼 스크롤백으로 올려 본다 (0 = 지금 화면) */
-const struct vtcell *vtLine(const struct vt *v, int y, int scroll);
-int vtScrollback(const struct vt *v);  /* 올려 볼 수 있는 줄 수 (보조 화면이면 0) */
-int vtCursor(const struct vt *v, int *x, int *y);  /* 커서가 보이면 1 */
-int vtAppCursorKeys(const struct vt *v);           /* DECCKM: 방향키를 ESC O A 로 */
-/* 키를 프로그램에 보낼 바이트로 바꾼다. 바이트 수 (보낼 것이 없으면 0) */
-int vtEncodeKey(const struct vt *v, int key, char *out, int cap);
-
 /* ---------------- taskbar.c: 작업 표시줄 (맨 아래 한 줄) ---------------- */
 
 #define TASKBAR_ROWS 1                  /* 창 영역은 screenRows - TASKBAR_ROWS 줄까지 */
@@ -213,6 +162,7 @@ struct app {
     void (*ready)(struct window *w, const struct pollfd *p);        /* 그 fd 가 준비됐다 */
     int (*tick)(struct window *w);                          /* 루프가 깰 때마다. 바뀌었으면 1 */
     void (*close)(struct window *w);                        /* 창이 닫힌다: data 를 정리 */
+    void (*requestClose)(struct window *w);                 /* 사용자가 닫으려 한다 (NULL 이면 바로 닫는다) */
 };
 
 struct window {
@@ -243,6 +193,8 @@ void wmMinimize(int i);
 void wmMinimizeActive(void);
 void wmCloseActive(void);
 void wmToggleMaximize(struct window *w);
+void wmPlace(struct window *w, int x, int y, int ww, int wh);   /* 음수 = 그대로 (보통 배치가 된다) */
+int wmAreaRows(void);                 /* 창 영역의 줄 수 (작업 표시줄을 뺀 것) */
 void wmSetLayout(struct window *w, int layout);
 void wmSnap(int side);                /* -1 왼쪽 절반, +1 오른쪽 절반 */
 void wmRestoreOrMinimize(void);
@@ -256,6 +208,7 @@ int wmFind(const char *title);
 const char *wmTitle(int i);
 int wmIsMinimized(int i);
 int wmActiveIndex(void);
+int wmIndexOf(const struct window *w);   /* 없으면 -1 */
 void wmStartMove(int resize);         /* 활성 창 옮기기(0)/크기 조절(1) 모드 */
 void wmMenuOpen(void);                /* 창 메뉴 (Alt+Space) */
 int wmMenuIsOpen(void);
@@ -269,16 +222,7 @@ int wmPollFds(struct pollfd *fds, int *owner, int max);
 int wmPollDone(const struct pollfd *fds, const int *owner, int n);
 int wmTick(void);
 
-/* ---------------- nterminal.c / nrunner.c ---------------- */
-
-#define RUN_MAXIMIZED 0x1               /* 최대화된 창으로 연다 */
-#define RUN_AUTOCLOSE 0x2               /* 명령이 끝나면 창을 바로 닫는다 */
-
-struct window *nterminalOpen(void);
-struct window *nterminalOpenIn(const char *dir);
-struct window *nterminalRun(const char *line);
-/* 명령 하나를 창에서 실행한다. title 이 NULL 이면 명령의 첫 낱말. cols/rows 가 0 이면 기본 크기 (안쪽 글자 칸) */
-struct window *nterminalRunEx(const char *line, int flags, const char *title, int cols, int rows);
+/* ---------------- nrunner.c: 실행 상자 ---------------- */
 
 void nrunnerOpen(void);
 int nrunnerIsOpen(void);
@@ -287,9 +231,33 @@ int nrunnerKey(int key);
 /* 창 없이 명령을 실행하고 끝날 때까지 기다린다 (poweroff). 종료 코드, 실패 -1 */
 int nrunnerExecHidden(const char *line);
 
-/* ---------------- nfiles.c: 파일 탐색기 ---------------- */
+/* ---------------- launch.c: 창 프로그램 띄우기 ---------------- */
 
-struct window *nfilesOpen(const char *dir);
+#define LAUNCH_MAXIMIZED 0x1            /* nterm -m */
+#define LAUNCH_AUTOCLOSE 0x2            /* nterm -x: 명령이 끝나면 창을 닫는다 */
+
+int launch(const char *const *argv);    /* NWP_DISPLAY 를 물려준 채로 띄운다. 성공 0 */
+/* 명령을 터미널 창(nterm)에서. title 이 NULL 이면 명령의 첫 낱말. cols/rows 0 = 기본 크기. 성공 0 */
+int launchCommand(const char *line, int flags, const char *title, int cols, int rows);
+int launchTerminal(const char *dir);    /* 대화형 터미널 (dir: 시작 디렉터리, NULL 이면 지금) */
+/* 자기 창을 여는 프로그램(nfiles, nclock ...)이면 그대로, 아니면 터미널 창에서 (실행 상자, 단축키의 exec) */
+int launchAuto(const char *line, int flags);
+int launchApp(const char *name);        /* 인자 없이 (nfiles, nclock, nkeys ...) */
+void launchReap(void);                  /* 끝난 자식을 거둔다 (이벤트 루프가 부른다) */
+
+/* ---------------- server.c: NWP 서버 (창 프로그램과의 연결) ---------------- */
+
+int serverInit(void);                   /* svc:/<사용자>/nwp 를 만들고 NWP_DISPLAY 를 정한다 */
+int serverPollFds(struct pollfd *fds, int max);  /* 기다릴 fd (채널, 클라이언트 파이프) */
+int serverPollDone(const struct pollfd *fds, int n);   /* 처리했다. 다시 그려야 하면 1 */
+int serverFlush(void);                  /* 쌓인 이벤트를 보낼 수 있는 만큼 보낸다 */
+void serverThemeChanged(void);          /* 모든 클라이언트에 새 테마 */
+int serverInhibited(void);              /* 활성 창이 단축키 없이 모든 키를 원한다 (NWP_REQ_INHIBIT) */
+int serverSignalActive(int sig);        /* 활성 창의 클라이언트에 NWP_EV_SIGNAL. 보냈으면 1 */
+int serverActivateApp(const char *app_id);  /* 그 앱의 창이 있으면 활성으로 하고 1 */
+void serverShutdown(void);              /* 모든 클라이언트에 CLOSE 를 보내고 연결을 닫는다 (로그아웃) */
+int serverConsumeReload(void);          /* 클라이언트가 설정을 다시 읽어 달라고 했다 (한 번만 1) */
+const char *serverActiveAppId(void);    /* 활성 창의 앱 이름 (단축키의 @앱), 없으면 "" */
 
 /* ---------------- menu.c: 메뉴 ---------------- */
 
@@ -308,15 +276,9 @@ int menuKey(int key);
 void helpOpen(void);
 const char *shortcutLabel(int action);
 
-/* 전역 동작 (main.c 의 단축키, 메뉴) */
-enum action {
-    ACT_NONE, ACT_MENU, ACT_RUN, ACT_TERMINAL, ACT_FILES, ACT_CLOSE, ACT_MAXIMIZE, ACT_MINIMIZE,
-    ACT_MOVE, ACT_NEXT, ACT_PREV, ACT_TASKBAR, ACT_THEME, ACT_HELP,
-    ACT_SWITCH_NEXT, ACT_SWITCH_PREV, ACT_TASKVIEW, ACT_SNAP_LEFT, ACT_SNAP_RIGHT, ACT_RESTORE_MIN,
-    ACT_FULLSCREEN, ACT_DESKTOP, ACT_MINIMIZE_ALL, ACT_RESTORE_ALL, ACT_WINMENU, ACT_RESIZE, ACT_LOCK,
-    ACT_TASKMGR, ACT_SCREENSHOT,
-    ACT_COUNT
-};
+/* main.c: 잠깐 보이는 알림 */
+void ntuiToast(const char *msg);
+void runAction(int action);             /* 컴포지터 동작 (ACT_*: 단축키, 메뉴) */
 
 /* ---------------- switcher.c: 창 전환기 (Alt+Tab) ---------------- */
 
@@ -332,24 +294,13 @@ int lockIsActive(void);
 void lockDraw(void);
 int lockKey(int key);
 
-/* ---------------- lineedit.c: 한 줄 입력 ---------------- */
+/* ---------------- lineedit.c: 한 줄 입력 (편집은 nwp.h 의 nwp_le_*, 그리기만 여기) ---------------- */
 
-struct lineedit {
-    char *buf;
-    int cap;                            /* buf 크기 (NUL 포함) */
-    int len;
-    int pos;
-};
-
-void leInit(struct lineedit *le, char *buf, int cap);
-void leSet(struct lineedit *le, const char *s);
-/* 편집 키면 처리하고 1: 글자, Backspace/Delete, <- -> Home End, Ctrl-A/E/U/K/W, Ctrl+Backspace, Ctrl+<- -> (낱말) */
-int leKey(struct lineedit *le, int key);
+#define lineedit nwp_lineedit
+#define leInit   nwp_le_init
+#define leSet    nwp_le_set
+#define leKey    nwp_le_key
 /* [x, x+width) 에 그린다 (커서가 보이도록 민다). secret 이면 '*' 로 */
 void leDraw(const struct lineedit *le, int x, int y, int width, int secret, int cursor);
-
-/* ---------------- clock.c: 시계 / 달력 창 ---------------- */
-
-struct window *clockOpen(void);
 
 #endif /* NTUI_H */

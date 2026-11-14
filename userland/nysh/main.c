@@ -801,7 +801,7 @@ static int b_source(int argc, char **argv)
     return run_file(argv[1]);
 }
 
-/* 커널이 아는 신원 (nx64_whoami): sudo 아래에서는 root. 환경 변수 USER/LOGNAME 은 보지 않는다 */
+/* 커널이 아는 신원 (nx64_whoami): elev 아래에서는 root. 환경 변수 USER/LOGNAME 은 보지 않는다 */
 static int b_whoami(int argc, char **argv)
 {
     struct nx64_identity me;

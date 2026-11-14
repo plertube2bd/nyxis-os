@@ -1484,7 +1484,8 @@ static Nstatus nyfs_lookup(vnode_t *dir, const char *name, vnode_t **out_vnode)
     childdata->vol = dirdata->vol;
     childdata->ino = child_ino;
 
-    status = vfs_init_vnode(child, child_ino, nyfs_node_kind(&child_inode),
+    status = vfs_init_vnode(child, child_ino,
+                             child_inode.type == NYFS_INO_TYPE_SYMLINK ? VFS_NODE_SYMLINK : nyfs_node_kind(&child_inode),
                              &g_nyfs_ops, nNULL, childdata);
     if (NSTATUS_IS_ERR(status)) {
         nyfs_free_vnode_data(childdata);
@@ -1494,6 +1495,40 @@ static Nstatus nyfs_lookup(vnode_t *dir, const char *name, vnode_t **out_vnode)
 
     *out_vnode = child;
     return Nok;
+}
+
+/*
+ * 심볼릭 링크의 대상 경로 = 링크 노드의 내용 (데이터 스트림). 링크 자체의 권한은 보지 않는다 (UNIX 관례:
+ * 대상에 닿을 때 대상의 권한을 검사한다). 형식은 vfs.c 의 follow_link 머리말.
+ */
+static Nstatus nyfs_readlink(vnode_t *vnode, char *buf, usize max, usize *out_len)
+{
+    nyfs_vnode_data_t *data;
+    nyfs_inode_t inode;
+    Nstatus status;
+
+    if (!vnode || !buf || !out_len) {
+        return NinvalidArg;
+    }
+
+    data = (nyfs_vnode_data_t *)vfs_get_vnode_private(vnode);
+    if (!data || !data->vol) {
+        return NinvalidArg;
+    }
+
+    status = nyfs_read_inode(data->vol, data->ino, &inode);
+    if (NSTATUS_IS_ERR(status)) {
+        return status;
+    }
+    if (inode.type != NYFS_INO_TYPE_SYMLINK) {
+        return NinvalidArg;
+    }
+    if (inode.size >= (u64)max) {
+        return NpathTooLong;
+    }
+
+    *out_len = 0;
+    return nyfs_extent_read_at(data->vol, inode.data_extent_root, 0, buf, (usize)inode.size, out_len);
 }
 
 static Nstatus nyfs_open(vnode_t *vnode, u32 flags, handle_t *out_handle)
@@ -2600,6 +2635,7 @@ Nstatus nyfs_register(void)
     g_nyfs_ops.chmod = nyfs_chmod;
     g_nyfs_ops.truncate = nyfs_truncate;
     g_nyfs_ops.release = nyfs_release;
+    g_nyfs_ops.readlink = nyfs_readlink;
 
     ops.mount = nyfs_mount;
     ops.unmount = nyfs_unmount;

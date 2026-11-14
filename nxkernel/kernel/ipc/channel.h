@@ -19,6 +19,7 @@
 #include "nyxis.h"
 #include "nyx_abi.h"
 #include "kernel/process/waitq.h"
+#include "kernel/syscall/handles.h"
 
 #define CHAN_NAME_MAX 64U
 
@@ -28,6 +29,8 @@ typedef struct chan_msg {
     u32 uid;
     u32 gid;
     u32 len;
+    bool has_handle;
+    nx_handle_t handle;         /* 붙어 온 핸들 (테이블 밖의 사본: 객체 참조를 가진다) */
     u8  data[NX_CHAN_MSG_MAX];
 } chan_msg_t;
 
@@ -59,11 +62,21 @@ void channel_retain(channel_t *c);
 /* 현재 프로세스 신원으로 메시지를 넣는다. 큐가 가득 차면 Nbusy, 수신자가 없으면 Ndisconnected */
 Nstatus channel_send(channel_t *c, const void *buf, usize len);
 
+/* 핸들 사본(attach, 객체 참조를 가진 것)을 붙여 보낸다. 성공하면 참조는 메시지 것이 되고, 실패하면 호출자에게 남는다 */
+Nstatus channel_send_handle(channel_t *c, const void *buf, usize len, const nx_handle_t *attach);
+
+/* 맨 앞 메시지에 핸들이 붙어 있는지 (인터럽트가 꺼진 상태에서) */
+bool channel_head_has_handle_locked(const channel_t *c);
+
 /*
  * 메시지 하나를 꺼낸다 (인터럽트가 꺼진 상태에서 호출, 잠들지 않는다).
  * 없으면 Ntimeout(=비었음). buf 가 작으면 NbufferOverflow 이고 메시지는 남긴다 (info->length 는 채움).
  */
 Nstatus channel_take_locked(channel_t *c, void *buf, usize len, struct nx_msginfo *info);
+
+/* take 와 같고, 붙은 핸들이 있으면 *out 으로 넘기고 *got = true (참조는 호출자 것: 테이블에 넣거나 nx_handle_release) */
+Nstatus channel_take_handle_locked(channel_t *c, void *buf, usize len, struct nx_msginfo *info,
+                                   nx_handle_t *out, bool *got);
 
 /* NxPoll 준비 상태 (NX_POLL_* 비트) */
 u32 channel_poll_bits(const channel_t *c, bool receiver);

@@ -1,5 +1,5 @@
 /*
- * vt_test.c - ntui 터미널 에뮬레이터(userland/ntui/vt.c) 호스트 검사
+ * vt_test.c - nterm 터미널 에뮬레이터(userland/nterm/vt.c) 호스트 검사
  *
  * vt.c 는 libc 만 쓰므로 호스트 컴파일러 + 새니타이저로 바로 돌린다 (make test-ntui).
  * 프로그램 출력 바이트를 넣고 격자(글자, 색, 커서)와 키 인코딩, 응답(커서 위치 보고)을 확인한다.
@@ -8,7 +8,7 @@
 #include <string.h>
 #include <stdlib.h>
 
-#include "ntui.h"
+#include "vt.h"
 
 static int g_fail;
 static int g_count;
@@ -235,6 +235,59 @@ static void testFuzz(void)
     vtFree(v);
 }
 
+/* 창 조작 (CSI t), XTVERSION, OSC 제목 */
+static int g_ops[8][4];
+static int g_nops;
+static char g_title[64];
+
+static void onWinop(void *ctx, const int *p, int n)
+{
+    int i;
+
+    (void)ctx;
+    if (g_nops >= 8)
+        return;
+    for (i = 0; i < 4; i++)
+        g_ops[g_nops][i] = i < n ? p[i] : -1;
+    g_nops++;
+}
+
+static void onTitle(void *ctx, const char *t)
+{
+    (void)ctx;
+    snprintf(g_title, sizeof(g_title), "%s", t);
+}
+
+static void testWindowOps(void)
+{
+    struct vt *v = vtNew(20, 5, onReply, NULL);
+
+    vtSetWindowOps(v, onWinop, onTitle);
+    g_nops = 0;
+    feed(v, "\033[8;30;100t\033[3;5;2tA\033[10;1t\033[18t");
+    check(g_nops == 4, "four window ops");
+    check(g_ops[0][0] == 8 && g_ops[0][1] == 30 && g_ops[0][2] == 100, "resize params (rows;cols)");
+    check(g_ops[1][0] == 3 && g_ops[1][1] == 5 && g_ops[1][2] == 2, "move params");
+    check(g_ops[2][0] == 10 && g_ops[2][1] == 1 && g_ops[2][3] == -1, "fullscreen params");
+    check(g_ops[3][0] == 18 && g_ops[3][1] == -1, "size query");
+    check(strncmp(text(v, 0, 0), "A", 1) == 0, "text between window ops is printed");
+    g_nops = 0;
+    feed(v, "\033[2 t\033[ q");      /* DECSWBV / DECSCUSR: 중간 바이트가 있으면 창 조작이 아니다 */
+    check(g_nops == 0, "intermediate bytes are not window ops");
+    g_reply[0] = '\0';
+    feed(v, "\033[>0q");
+    check(strcmp(g_reply, "\033P>|nterm(1)\033\\") == 0, "XTVERSION reply");
+    feed(v, "\033]2;hello\x01world\007");
+    check(strcmp(g_title, "hello?world") == 0, "OSC 2 title (BEL)");
+    feed(v, "\033]0;two\033\\B");
+    check(strcmp(g_title, "two") == 0, "OSC 0 title (ST)");
+    check(strncmp(text(v, 0, 0), "AB", 2) == 0, "printing continues after OSC");
+    g_title[0] = '\0';
+    feed(v, "\033]52;c;Zm9v\007\033Pfoo;2;bar\033\\");
+    check(g_title[0] == '\0', "other OSC / DCS strings are not titles");
+    vtFree(v);
+}
+
 int main(void)
 {
     testBasic();
@@ -244,6 +297,7 @@ int main(void)
     testUtf8AndLineDrawing();
     testResize();
     testKeys();
+    testWindowOps();
     testFuzz();
     printf("vt: %d/%d checks passed\n", g_count - g_fail, g_count);
     return g_fail ? 1 : 0;

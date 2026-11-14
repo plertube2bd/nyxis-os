@@ -13,6 +13,8 @@
 #include "kernel/ipc/pipe.h"
 #include "kernel/info/info.h"
 #include "console/inputs/tty.h"
+#include "kernel/mm/shm.h"
+#include "kernel/process/umem.h"
 
 /* 핸들 값 = (세대 << 32) | 슬롯 번호 */
 static u64 make_handle(u32 generation, u32 index)
@@ -95,6 +97,12 @@ Nstatus nx_handle_lookup(nx_handle_table_t *table, u64 handle, u32 required_righ
     return NSTATUS_OK;
 }
 
+/* 테이블의 주인 프로세스 (테이블은 process_t 안에 있다) */
+static process_t *table_owner(nx_handle_table_t *table)
+{
+    return (process_t *)(void *)((char *)table - __builtin_offsetof(process_t, handles));
+}
+
 Nstatus nx_handle_close(nx_handle_table_t *table, u64 handle)
 {
     nx_handle_t *slot;
@@ -103,7 +111,23 @@ Nstatus nx_handle_close(nx_handle_table_t *table, u64 handle)
     if (NSTATUS_IS_ERR(status))
         return status;
 
-    if (slot->type == NX_HANDLE_FILE && slot->of) {
+    nx_handle_release(slot, table_owner(table));
+    {
+        u32 gen = slot->generation + 1U;      /* 이 슬롯의 오래된 핸들 값을 무효화 */
+
+        memset(slot, 0, sizeof(*slot));
+        slot->generation = gen;
+    }
+    return NSTATUS_OK;
+}
+
+void nx_handle_release(nx_handle_t *slot, struct process *owner)
+{
+    if (slot->type == NX_HANDLE_SHM && slot->shm) {
+        if (slot->shm_va)
+            shm_unmap(slot->shm, owner, slot->shm_va);
+        shm_release(slot->shm);
+    } else if (slot->type == NX_HANDLE_FILE && slot->of) {
         if (--slot->of->refs == 0) {          /* 마지막 공유자: VFS 핸들을 닫는다 */
             (void)vfs_close(&slot->of->file);
             kfree(slot->of);
@@ -125,14 +149,6 @@ Nstatus nx_handle_close(nx_handle_table_t *table, u64 handle)
         device_close(slot->dev, slot->dev->owner, slot->dev_write);   /* 장치 핸들은 복제 불가: 소유자 = 이 핸들의 프로세스 */
     else if (slot->type == NX_HANDLE_INFO && slot->info_buf)
         kfree(slot->info_buf);
-
-    {
-        u32 gen = slot->generation + 1U;      /* 이 슬롯의 오래된 핸들 값을 무효화 */
-
-        memset(slot, 0, sizeof(*slot));
-        slot->generation = gen;
-    }
-    return NSTATUS_OK;
 }
 
 void nx_handle_discard(nx_handle_t *slot)
@@ -200,6 +216,11 @@ Nstatus nx_handle_share(const nx_handle_t *src, nx_handle_t *dst, bool share)
         dst->console_fd = src->console_fd;
         dst->tty = src->tty;
         tty_retain(dst->tty);
+        return NSTATUS_OK;
+    case NX_HANDLE_SHM:
+        dst->shm = src->shm;                /* 같은 객체, 매핑은 없다 (새 핸들이 따로 매핑한다) */
+        dst->shm_va = 0;
+        shm_retain(dst->shm);
         return NSTATUS_OK;
     case NX_HANDLE_PTY:
         dst->pty = src->pty;
