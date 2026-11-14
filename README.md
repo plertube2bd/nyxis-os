@@ -13,14 +13,217 @@
 > - 이름은 **"Nyxis OS"** 로, *Nyxis* 와 *OS* 사이에 띄어쓰기가 있습니다.
 > - 이 문제는 이미 서로 합의를 마쳤습니다. **이에 관한 추가 연락은 받지 않습니다.**
 
-**English summary.** Nyxis OS is an experimental, hobby x86-64 operating system written from scratch in C: a UEFI
-bootloader, its own kernel (preemptive multitasking, handles and namespaces, signals, pipes, pseudo-terminals,
-shared memory, AHCI/SATA and its own file system *nyfs*), a C library (*nlibc*), a shell, core utilities, a C compiler
-that runs inside the OS, an init system with services and a journal, and a keyboard-driven text-mode desktop (*ntui*).
-It runs in QEMU. Build instructions below are in Korean; the commands themselves are the same in any language:
-`make users`, then `make run` inside `nxkernel/`. Licensed under GPL-3.0.
+**Languages:** [English](#english) · [한국어](#한국어)
+
+> **Most documentation in this repository is written in Korean.** That includes the files in `docs/`, the other
+> READMEs, configuration file headers and source code comments. This English section covers the essentials; for
+> details, follow the links to the Korean documents. Commands, file names and code are the same in either language.
 
 ---
+
+# English
+
+## About
+
+Nyxis OS is an experimental, hobby x86-64 operating system written from scratch, with user experience and
+consistency at its center. The name comes from *Nyx*, the Greek goddess of the night, plus the suffix *-is*, giving the
+feel of "a tendency toward something." It prefers a simple, consistent design over legacy compatibility: everything is
+a handle, paths are written `namespace:/path`, and system features go through one central API (nx64api, NWP).
+
+What is in it today:
+
+| Part | Contents |
+|---|---|
+| Bootloader | UEFI bootloader NYTB (`bootloader/nytb`); GRUB (Multiboot2) boot also works |
+| Kernel | `nxkernel/`: preemptive multitasking, user mode, handles and rights, namespaces, signals, process groups, pipes, channels (IPC), pseudo-terminals, shared memory, authentication (PBKDF2) |
+| Drivers | `drivers/`: AHCI (SATA), ATA, RAM disk, PIC, its own file system *nyfs*, VFS |
+| C library | nlibc (C89 standard library + basic POSIX layer) and the Nyxis-specific nx64api |
+| System | init (with a service manager), login, elev (privilege elevation), journald (system journal) |
+| Commands | nysh (shell), coreutils, kilo (editor), nlcc (a C compiler that runs inside Nyxis, based on TinyCC), nex, journalman, ntop, sysmon, ... |
+| Desktop | ntui (a compositor) with window programs nterm (terminal), nfiles (files), nclock (clock), nkeys (shortcut settings) |
+
+> ⚠️ Nyxis OS is an experimental hobby project. Do not use it where production use, security or automation matter.
+> Running it in QEMU is recommended over real hardware.
+
+## Quick start
+
+```bash
+git clone https://github.com/plertube2bd/nyxis-os.git
+cd nyxis-os/nxkernel
+make users     # create login accounts (once)
+make run       # build everything and boot it in QEMU
+```
+
+After boot you get a login screen. Log in with an account made by `make users` and the desktop (ntui) starts.
+
+## Building
+
+The full guide, including troubleshooting, is [docs/INSTALL.md](docs/INSTALL.md) (Korean).
+
+**1. Requirements.** Build on an x86_64 Linux host. External sources (TinyCC, kilo) are already in `third_party/`.
+
+| Purpose | Tools |
+|---|---|
+| Compiling | `gcc`, `binutils` (`as`, `ld`, `objcopy`), `make`, `patch` |
+| UEFI bootloader | `gnu-efi` (3.x and 4.x both work) |
+| Disk images | `dosfstools` (`mkfs.vfat`), `mtools` (`mmd`, `mcopy`) |
+| Build scripts | `python3` |
+| Running | `qemu-system-x86_64`, OVMF (UEFI firmware for QEMU) |
+
+```bash
+# Arch Linux
+sudo pacman -S --needed base-devel gnu-efi dosfstools mtools python qemu-system-x86 edk2-ovmf
+# Ubuntu / Debian
+sudo apt install build-essential gnu-efi dosfstools mtools python3 qemu-system-x86 ovmf
+```
+
+If your distribution puts files elsewhere, pass them as variables: `OVMF`, `OVMF_VARS` (firmware), `EFIINC`, `EFILIB`,
+`CRT0` (gnu-efi). Example: `make OVMF=/path/OVMF_CODE.fd OVMF_VARS=/path/OVMF_VARS.fd run`
+
+**2. Accounts.** Run `make users` in `nxkernel/`. It asks for a name, uid and password. Create the administrator `root`
+(uid 0) and an everyday account (uid 1000 and up). The result goes to `config/users.db`, which stores only salted
+hashes and is not tracked by git. Rebuild the image after changing accounts.
+
+**3. Build and run.** Run every command in `nxkernel/` (or `make -C nxkernel ...` from the repository root).
+
+| Command | What it does |
+|---|---|
+| `make run` | Build everything and run in QEMU (GTK window; serial output in your terminal) |
+| `make run-nographic` | Serial only, no display (e.g. over SSH). Quit with `Ctrl-A` then `X` |
+| `make os` | Build the boot image only (`out/esp.img`) |
+| `make run-sata` | Boot over SATA (port 0 = ESP, port 1 = `disk.img`) |
+| `make iso` / `make run-grub-uefi` / `make run-grub-bios` | GRUB boot ISO (needs `grub-mkrescue`, `xorriso`) |
+| `make clean` | Remove build output (`out/`). `disk.img` and `config/` are kept |
+| `make nlibc-sdk` | SDK for building Nyxis programs on the host (`out/nlibc/bin/nlcc`) |
+
+The first build compiles the bootloader, kernel, nlibc, commands, shell and nlcc, so it takes a few minutes. Output goes
+to `out/` (`out/esp.img` is the boot disk, `out/usr/*.run` are the programs). `build.sh` in the repository root runs
+`make -B os` and copies the image to `out/nyxis-os`.
+
+Build options: `RES=WxH` (screen resolution, default `1600x900`), `SELFTEST=1` (kernel self-test + test accounts with
+random passwords), `DEBUG=1` (bootloader framebuffer test pattern), `DEBUG_SYSCALLS=1` (debug system calls 768–1023),
+`DISK_SIZE=256M` (size of the `disk.img` made by `make disk-reset`, default 64M).
+
+**4. Storage.** The root file system (including the home directory `face:/` and the settings in `roi:/`) is loaded fresh
+from the image at every boot. Keep files you want to survive a reboot in `disk:/`. `make run` creates `disk.img` in the
+repository root if it is missing and attaches it as a second disk; `make disk-reset` empties it and creates it again.
+
+**5. Tests.**
+
+```bash
+make check                         # strict C89 compile (-O0/-O2)
+make test-host                     # FAT16/VFS/RAM disk host tests (+ ASan/UBSan fuzzing)
+make test-nlibc                    # C library (including floating-point differential tests against glibc)
+make test-coreutils                # commands and shell, on Linux
+make test-ntui                     # terminal emulator, shortcut parser
+make clean && make SELFTEST=1 os   # image for end-to-end tests
+make test-e2e                      # boot in QEMU -> log in -> shell -> commands -> power off (serial and PS/2)
+make test-disk                     # disk:/ survives a reboot
+```
+
+Always run `make clean` when switching between `SELFTEST=1` and normal images. The Makefile does not track compiler
+option changes, so mixing them produces an image without the self-test. Use `BUILD=<dir>` to keep them apart.
+
+**6. Real hardware (experimental).** Writing `out/esp.img` to a USB stick may boot on a UEFI PC (turn off Secure Boot,
+use AHCI mode; NVMe is not supported). This is untested on real hardware; see section 6 of
+[docs/INSTALL.md](docs/INSTALL.md).
+
+## Using the desktop (ntui)
+
+After login, the default login shell **ntui** takes over the screen and keyboard and becomes the desktop: a taskbar at
+the bottom and, at first, a help window. Everything is done with the keyboard.
+
+> **Super (Windows) key in QEMU:** your host desktop may take the Super key first. Press `Ctrl+Alt+G` in the QEMU window
+> to grab the keyboard so that Super reaches Nyxis. There are also shortcuts without Super (`Alt+F1`, `Ctrl+Alt+T`, ...).
+
+| Keys | Action |
+|---|---|
+| `Super` (press and release), `Super+Q`, `Alt+F1` | Menu (apps, theme, help, log out, power off) |
+| `Super+Enter`, `Super+T`, `Ctrl+Alt+T` | New terminal window |
+| `Super+E` | File manager |
+| `Super+R`, `Alt+F2` | Run box (run a command) |
+| `F1`, `Super+/` | Help (the current shortcut list) |
+| `Super+I` | Shortcut settings window (record new keys) |
+| `Super+L`, `Ctrl+Alt+L` | Lock the screen |
+| `Ctrl+Shift+Esc`, `Ctrl+Alt+Delete` | Process manager (ntop) |
+| `Print` | Screenshot |
+| `Super+G` | Change theme |
+| `Alt+F4`, `Super+W` | Close window |
+| `Alt+Tab` / `Alt+Shift+Tab`, `Super+Tab` | Switch windows / task view |
+| `Super+↑` / `Super+↓` / `Super+←` / `Super+→` | Maximize / restore or minimize / left or right half |
+| `F11` | Fullscreen |
+| `Alt+Space` | Window menu (move, size, ...). `Alt+F7` move, `Alt+F8` resize (arrow keys, Enter to finish) |
+| `Super+D`, `Super+M` | Show desktop, minimize all |
+| `Super+1` … `Super+9` | Go to window n |
+| In a terminal: `Ctrl+Shift+T`, `Ctrl+Shift+W`, `Shift+PgUp/PgDn` | New terminal, close, scroll back |
+
+All shortcuts live in one file (`app:/ntui.run/keys`; your own copy is `roi:/<uid>/app/ntui/keys`). Change them in the
+`Super+I` window or any editor, then reload with `Super+Shift+R`. The format is described at the top of
+[rootfs/app/ntui/keys](rootfs/app/ntui/keys).
+
+- **Terminal (nterm)** runs the shell `nysh`; full-screen programs such as `ntop`, `sysmon` and `kilo` run inside it.
+  Typing `nfiles` in a terminal opens a new window.
+- **Files (nfiles)**, **Clock (nclock)** and **Shortcuts (nkeys)** open from the menu or with shortcuts.
+- Programs in a terminal can control their own window: `nwin size 100x30`, `nwin center`, `nwin full`
+  (from C, the `nx64_win_*` functions in nx64api, [docs/NX64API.md](docs/NX64API.md)).
+- Settings such as the startup window and theme are listed in [rootfs/app/README.md](rootfs/app/README.md).
+- **Log out** in the menu returns to the login screen; **Power off** turns the machine off (both ask once more). In a
+  terminal, `poweroff` also works.
+- **Without a display** (serial, `make run-nographic`), ntui draws as text on the current terminal and uses `Ctrl`
+  shortcuts instead of Super: `Ctrl+Q` menu, `Ctrl+T` terminal, `Ctrl+E` files, `Ctrl+R` run, `Ctrl+W` close,
+  `Ctrl+F` maximize, `Ctrl+N`/`Ctrl+P` switch windows. To use only the shell, as root run
+  `echo app:/nysh.run > roi:/<uid>/shell` (that user's login shell).
+
+## Getting around
+
+Paths are written `namespace:/path`.
+
+| Namespace | Contents |
+|---|---|
+| `face:/` | Your home directory |
+| `app:/` | Installed programs (`app:/ls.run`, ...; the shell runs them by name) |
+| `tmp:/` | Temporary space in RAM (gone after a reboot) |
+| `disk:/` | Persistent space on disk |
+| `roi:/` | Settings registry (one value per file; yours is `roi:/<uid>/`) |
+| `info:/` | System information from the kernel (read-only) |
+| `dev:/`, `svc:/` | Devices, service channels |
+
+```
+nyfetch                     system information
+ls app:/                    installed programs
+kilo face:/memo.txt         text editor
+nlcc -o hello.run app:/src/examples/hello.c && ./hello.run     compile C inside Nyxis
+elev cat roi:/hostname      run as root (allowed users, password check)
+ntop                        processes
+nex                         services (nex status journald, elev nex restart <unit>)
+journalman -b               log of this boot (journalman -f to follow)
+poweroff                    power off
+```
+
+## Documentation (Korean)
+
+These documents are written in Korean. The full list with descriptions is in the Korean section below
+([문서와 README 위치](#문서와-readme-위치)).
+
+| Document | Topic |
+|---|---|
+| [docs/INSTALL.md](docs/INSTALL.md) | Building and running on Linux |
+| [docs/NX64API.md](docs/NX64API.md) | nx64api: TUI, system, settings, services, journal, window control, display |
+| [docs/NWP.md](docs/NWP.md) | NWP (Nyxis Window Protocol) between the compositor and window programs |
+| [userland/README.md](userland/README.md) | User programs and how to add one |
+| [nxkernel/kernel/README.md](nxkernel/kernel/README.md) | Kernel components (this one also has an English part) |
+| [rootfs/app/README.md](rootfs/app/README.md) | Default app settings |
+
+## License
+
+GPL-3.0 ([LICENSE](LICENSE)). Code in `third_party/` keeps its own license (TinyCC: LGPL-2.1 or later, kilo:
+BSD-2-Clause). Rules for importing external code: [docs/LICENSING.md](docs/LICENSING.md) (Korean).
+
+---
+
+# 한국어
+
+> 이 저장소의 문서(`docs/`, 각 README, 설정 파일 머리말, 소스 주석)는 대부분 한국어로 쓰여 있습니다.
 
 ## 소개
 
