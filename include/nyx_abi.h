@@ -33,6 +33,25 @@
  *   토큰은 일회용이다: NxProcessCreate 의 token 인자로 쓰는 순간 소모되고 핸들도 닫힌다.
  */
 #define NX_SYS_AUTHENTICATE     10U
+/*
+ * NxSpeakerTone(hz, ms) - PC 스피커로 사각파 비프음 (누구나. 기다리지 않고 바로 돌아온다)
+ *   hz: NX_SPEAKER_MIN_HZ..NX_SPEAKER_MAX_HZ, 0 = 끄기. 그 밖은 NinvalidArg
+ *   ms: 길이 (커널 타이머가 끈다), 0 = 다음 호출까지 계속. NX_SPEAKER_MAX_MS 초과는 NinvalidArg
+ *   소리는 하나뿐이라 나중에 부른 쪽이 이긴다. 그 소리를 낸 프로세스가 끝나면 커널이 끈다.
+ *   반환: 0
+ */
+#define NX_SYS_SPEAKER_TONE     11U
+#define NX_SPEAKER_MIN_HZ       20U
+#define NX_SPEAKER_MAX_HZ       20000U
+#define NX_SPEAKER_MAX_MS       60000U
+/*
+ * NxSpeakerChord(const uint32_t *hz, n, ms) - 화음 (누구나. 기다리지 않는다)
+ *   hz[0..n) 의 음을 아르페지오로 낸다: 커널 타이머 tick(10ms)마다 다음 음. 스피커는 1비트라 음이 섞이지 않고
+ *   번갈아 나온다 (칩튠의 화음). n 은 0..NX_SPEAKER_MAX_VOICES, 0 Hz 항목은 건너뛴다 (모두 0 = 끄기).
+ *   같은 화음을 다시 주면 순서를 처음으로 돌리지 않는다. ms 와 주인 규칙은 NxSpeakerTone 과 같다.
+ */
+#define NX_SYS_SPEAKER_CHORD    12U
+#define NX_SPEAKER_MAX_VOICES   4U
 
 #define NX_SYS_OPEN             32U
 #define NX_SYS_CLOSE            33U

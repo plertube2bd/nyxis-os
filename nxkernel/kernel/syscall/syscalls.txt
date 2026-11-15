@@ -21,6 +21,9 @@
 ;                                      토큰 핸들(NX_RIGHT_STAT)이면 그 토큰의 신원 (소모하지 않음)
 ;   9  NxPowerOff()                       uid 0 만 (보통 init 이 svc:/sys/init 요청을 받아 호출)
 ;   10 NxAuthenticate(name, password)     -> 일회용 토큰 핸들. 실패 시 1초 지연 후 Nauthentication
+;   11 NxSpeakerTone(hz, ms)              PC 스피커 사각파. hz 0 = 끄기, ms 0 = 계속. 누구나, 기다리지 않음.
+;                                      낸 프로세스가 끝나면 커널이 끈다 (kernel/timer/pit/pcspk.h)
+;   12 NxSpeakerChord(u32 *hz, n, ms)     화음 (n <= 4): tick(10ms)마다 다음 음으로 바꾸는 아르페지오. 규칙은 11 과 같다
 ;
 ;   32 NxOpen(const char *path, flags)    flags: NX_O_READ|NX_O_WRITE|NX_O_APPEND -> 핸들
 ;                                      NX_O_APPEND: 파일은 쓰기마다 끝으로 (열린 파일의 속성: dup/fork/exec 에 이어짐)
@@ -130,6 +133,8 @@
 8   | NxGetIdentity  ; [구현됨]
 9   | NxPowerOff  ; [구현됨]
 10  | NxAuthenticate  ; [구현됨]
+11  | NxSpeakerTone  ; [구현됨]
+12  | NxSpeakerChord  ; [구현됨]
 
 ; =========================================================
 ; 0x0020 ~ 0x003F : Object / Handle API

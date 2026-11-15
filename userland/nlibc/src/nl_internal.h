@@ -108,6 +108,10 @@ unsigned int __nl_umask(unsigned int mask);        /* 이전 값 */
 /* index 번째 항목. 반환 1 = 있음, 0 = 끝, -1 = 오류 */
 int __nl_readdir(const char *path, unsigned long index, char *name, size_t cap, int *type);
 int __nl_sleep_ms(unsigned long ms);
+/* PC 스피커 (NxSpeakerTone): hz 0 = 끄기, ms 0 = 계속. 없는 플랫폼은 -1 + ENOSYS */
+int __nl_speaker(unsigned long hz, unsigned long ms);
+/* 화음 (NxSpeakerChord): hz[0..n), n <= 4 */
+int __nl_speaker_chord(const unsigned int *hz, unsigned long n, unsigned long ms);
 /* 신원. name 은 모르면 빈 문자열 */
 int __nl_identity(unsigned int *uid, unsigned int *gid, char *name, size_t cap);
 

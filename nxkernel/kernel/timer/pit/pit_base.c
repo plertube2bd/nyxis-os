@@ -18,6 +18,7 @@
 #include "interrupt.h"
 #include "drivers/pic/pic.h"
 #include "kernel/timer/pit/pit_base.h"
+#include "kernel/timer/pit/pcspk.h"
 #include "kernel/process/schedule.h"
 
 #define PIT_CMD   0x43
@@ -42,6 +43,7 @@ static void timer_interrupt_handler(struct trap_frame *frame)
 {
     (void)frame;
     timer_tick++;
+    pcspk_timer_tick(timer_tick);   /* 길이를 정한 비프음이 끝났으면 끈다 */
     sched_timer_tick();     /* 타임슬라이스 소모. 실제 전환은 interrupt_dispatch 의 선점 지점에서 */
 }
 

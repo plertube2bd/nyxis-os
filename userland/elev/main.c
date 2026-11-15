@@ -83,6 +83,56 @@ static int fail(const char *what, long status)
     return 1;
 }
 
+/* ---------------- 비밀번호를 묻는 동안의 안전장치 ----------------
+ * 에코를 끈 채 Ctrl-C(SIGINT), Ctrl-\\(SIGQUIT), SIGTERM, SIGHUP 으로 끝나면 터미널이 에코 없이 남는다. 그동안 이 신호들에
+ * 처리기를 두어 에코를 되돌린 뒤, 기본 동작으로 같은 신호를 다시 받아 끝난다 (셸은 평소처럼 130 등을 본다).
+ * SIGKILL 은 잡을 수 없다: 셸(nysh)이 포그라운드 작업이 끝날 때마다 터미널을 되돌린다 */
+static const unsigned long g_guard_sigs[] = { NX_SIGINT, NX_SIGQUIT, NX_SIGTERM, NX_SIGHUP };
+#define GUARD_COUNT (sizeof(g_guard_sigs) / sizeof(g_guard_sigs[0]))
+
+static void set_action(unsigned long sig, unsigned long handler);
+
+/* 처리기에서 돌아가지 않는다 (restorer 는 쓰이지 않지만 커널이 요구한다) */
+static void guard_restorer(void)
+{
+    nx_exit(1);
+}
+
+static void guard_handler(int sig, void *info, void *ctx)
+{
+    (void)info;
+    (void)ctx;
+    (void)nx_set_echo(1);
+    nx_puts("\n");
+    set_action((unsigned long)sig, NX_SIG_DFL);
+    (void)nx_syscall(NX_SYS_SIGNAL_MASK, NX_SIG_UNBLOCK, 1UL << ((unsigned long)sig - 1UL), 0, 0, 0);
+    (void)nx_syscall(NX_SYS_SIGNAL_SEND, NX_PID_SELF, (unsigned long)sig, 0, 0, 0);
+    nx_exit(128 + sig);                  /* 여기까지 오지 않는다 */
+}
+
+static void set_action(unsigned long sig, unsigned long handler)
+{
+    struct nx_sigaction act;
+    unsigned long i;
+
+    nx_memset(&act, 0, sizeof(act));
+    act.handler = handler;
+    if (handler != NX_SIG_DFL && handler != NX_SIG_IGN) {
+        act.restorer = (unsigned long)guard_restorer;
+        for (i = 0; i < GUARD_COUNT; i++)
+            act.mask |= 1U << (g_guard_sigs[i] - 1U);   /* 처리하는 동안 다른 것은 막는다 */
+    }
+    (void)nx_syscall(NX_SYS_SIGNAL_ACTION, sig, (unsigned long)&act, 0, 0, 0);
+}
+
+static void guard_echo(int on)
+{
+    unsigned long i;
+
+    for (i = 0; i < GUARD_COUNT; i++)
+        set_action(g_guard_sigs[i], on ? (unsigned long)guard_handler : NX_SIG_DFL);
+}
+
 int main(int argc, char **argv, char **envp)
 {
     struct nx_identity id;
@@ -145,9 +195,11 @@ int main(int argc, char **argv, char **envp)
         nx_puts("[elev] password for ");
         nx_puts(id.name);
         nx_puts(": ");
+        guard_echo(1);                   /* 에코를 끈 동안 끝나도 되돌린다 */
         (void)nx_set_echo(0);
         r = nx_readline(password, sizeof(password));
         (void)nx_set_echo(1);
+        guard_echo(0);
         if (r < 0) {
             nx_wipe(password, sizeof(password));
             return fail("no password", 0);

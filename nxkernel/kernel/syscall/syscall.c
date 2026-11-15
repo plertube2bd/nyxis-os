@@ -38,6 +38,7 @@
 #include "kernel/info/info.h"
 #include "kernel/crypto/sha256.h"
 #include "kernel/timer/pit/pit_base.h"
+#include "kernel/timer/pit/pcspk.h"
 #include "kernel/timer/rtc/rtc.h"
 #include "console/outputs/printk.h"
 #include "drivers/filesystem/vfs.h"
@@ -1126,6 +1127,34 @@ static i64 sys_power_off(const u64 *a)
     return (i64)acpi_power_off();
 }
 
+/* NxSpeakerTone(hz, ms): PC 스피커 (kernel/timer/pit/pcspk.h). 주인은 부른 프로세스 */
+static i64 sys_speaker_tone(const u64 *a)
+{
+    if (!current_process)
+        return (i64)NprocessFailed;
+    if (a[0] > NX_SPEAKER_MAX_HZ || a[1] > NX_SPEAKER_MAX_MS)
+        return (i64)NinvalidArg;
+    return (i64)pcspk_tone((u32)a[0], (u32)a[1], current_process->pid);
+}
+
+/* NxSpeakerChord(const u32 *hz, n, ms): 아르페지오 화음 (kernel/timer/pit/pcspk.h) */
+static i64 sys_speaker_chord(const u64 *a)
+{
+    u32 hz[NX_SPEAKER_MAX_VOICES];
+    Nstatus status;
+
+    if (!current_process)
+        return (i64)NprocessFailed;
+    if (a[1] > NX_SPEAKER_MAX_VOICES || a[2] > NX_SPEAKER_MAX_MS)
+        return (i64)NinvalidArg;
+    if (a[1] > 0) {
+        status = copy_from_user(hz, a[0], (usize)a[1] * sizeof(u32));
+        if (NSTATUS_IS_ERR(status))
+            return (i64)status;
+    }
+    return (i64)pcspk_chord(hz, (u32)a[1], (u32)a[2], current_process->pid);
+}
+
 /* NxAuthenticate(const char *name, const char *password) -> 토큰 핸들 */
 static i64 sys_authenticate(const u64 *a)
 {
@@ -1859,6 +1888,8 @@ static const struct syscall_entry g_syscalls[] = {
     { NX_SYS_GET_IDENTITY,     sys_get_identity },
     { NX_SYS_POWER_OFF,        sys_power_off },
     { NX_SYS_AUTHENTICATE,     sys_authenticate },
+    { NX_SYS_SPEAKER_TONE,     sys_speaker_tone },
+    { NX_SYS_SPEAKER_CHORD,    sys_speaker_chord },
 
     { NX_SYS_OPEN,             sys_open },
     { NX_SYS_CLOSE,            sys_close },

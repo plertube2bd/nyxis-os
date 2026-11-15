@@ -4,7 +4,7 @@
 #   make            부트로더 + 커널 빌드            (out/BOOTX64.EFI, out/kernel.elf)
 #   make os         부팅 가능한 ESP 디스크 이미지    (out/esp.img)
 #   make run        QEMU(OVMF, q35+AHCI) 로 실행     (GTK 창 + 시리얼 stdio)
-#   make run-nographic  화면 없이 시리얼만으로 실행
+#   make run-nographic  화면 없이 시리얼만으로 실행 (로그인 셸이 ntui 대신 nysh 인 이미지 out/esp-nographic.img)
 #   make run-sata   SATA 로 부팅: q35 내장 AHCI 의 포트 0 = ESP(부팅), 포트 1 = disk.img (disk:/). 연결을 명시한다
 #                   (QEMU_DISPLAY / QEMU_SERIAL / QEMU_EXTRA 로 화면, 시리얼, 추가 옵션을 바꿀 수 있다)
 #   make iso        GRUB(Multiboot2) 부팅 ISO (BIOS/UEFI 겸용)   (out/nyxis.iso)
@@ -18,12 +18,16 @@
 #   make test-disk  disk:/ 영구 저장 검사 (SELFTEST 이미지 필요: 쓰고 -> 재부팅 -> 그대로인지)
 #   make disk       disk:/ 용 영구 디스크 이미지 (disk.img, 없을 때만 만든다. run 이 SATA 디스크로 붙인다)
 #   make disk-reset disk.img 를 지우고 새로 만든다 (안의 파일이 모두 사라진다)
+#   make badapple-midi   Bad Apple!! 악보(media/badapple.mid, 퍼블릭 도메인 부저용 편곡)를 받는다
+#   make badapple-movie BADAPPLE_SRC=<영상>   Bad Apple!! 동영상(media/badapple.mp4)을 만든다 (docs/BADAPPLE.md).
+#                   있으면 이미지의 app:/badapple.run/badapple.mp4 로 들어간다. 소리는 QEMU_AUDIO (auto/pipewire/pa/alsa/wav/none)
 #   make users      로그인 계정 만들기 (config/users.db, 비밀번호는 터미널에서 묻는다). 일반 이미지 빌드에 필요
 #   make clean
 #
 #   옵션:  DEBUG=1     부트로더 프레임버퍼 테스트 패턴 활성화 (-DNYTB_DEBUG)
-#          RES=WxH     화면 해상도 (기본 1600x900). 부트로더가 정확히 그 모드를, 없으면 그 안에 드는 가장 큰
-#                      모드를 고른다. 바꾸면 부트로더/ISO 만 다시 만든다 (예: make RES=1280x800 run)
+#          RES=WxH     화면 해상도. 기본 auto = UEFI 가 주는 가장 큰 프레임버퍼 모드. WxH 를 주면 부트로더가 정확히
+#                      그 모드를, 없으면 그 안에 드는 가장 큰 모드를 고른다. 바꾸면 부트로더/ISO 만 다시 만든다
+#                      (예: make RES=1280x800 run)
 #          SELFTEST=1  커널 부팅 후 자체 점검(kernel/selftest.c) 실행 (-DNYX_SELFTEST). DEBUG_SYSCALLS 도 켠다
 #          DEBUG_SYSCALLS=1  디버그 시스템 콜(0x0300 구역, 768~1023: NxKernelPrint, NxDebugNop)을 커널에 넣는다
 #                      (-DNYX_DEBUG_SYSCALLS). 기본은 빠진다: 그 번호는 NsyscallFailed
@@ -97,11 +101,20 @@ CFLAGS += -DNYTB_DEBUG
 endif
 
 # 화면 해상도 (부트로더의 GOP 모드 선택, GRUB 의 gfxmode)
-RES   ?= 1600x900
+#   RES=auto (기본)  UEFI GOP 가 주는 가장 큰 프레임버퍼 모드. GRUB 은 gfxmode=auto
+#   RES=WxH          그 모드 (없으면 그 안에 드는 가장 큰 모드)
+RES   ?= auto
+ifeq ($(RES),auto)
+RES_W := 0
+RES_H := 0
+GRUB_GFXMODE := auto
+else
 RES_W := $(word 1,$(subst x, ,$(RES)))
 RES_H := $(word 2,$(subst x, ,$(RES)))
 ifeq ($(RES_H),)
-$(error RES must look like 1600x900)
+$(error RES must be auto or look like 1600x900)
+endif
+GRUB_GFXMODE := $(RES)x32,1024x768x32,auto
 endif
 CFLAGS += -DNYTB_PREF_W=$(RES_W) -DNYTB_PREF_H=$(RES_H)
 # RES 가 바뀌면 부트로더를 다시 컴파일하도록 (Makefile 은 CFLAGS 변경을 추적하지 않는다)
@@ -223,6 +236,7 @@ KERNEL_C_SRCS = \
 	kernel/syscall/handles.c \
 	kernel/timer/pit/pit_base.c \
 	kernel/timer/rtc/rtc.c \
+	kernel/timer/pit/pcspk.c \
 	kernel/exec/exec.c \
 	kernel/ipc/pipe.c \
 	kernel/security/perm.c \
@@ -394,7 +408,7 @@ $(BUILD)/obj/ulib/crt0.o: $(ULIB_DIR)/crt0.s
 #   - main.c 가 "nyx.h" 를 포함하면 시스템 프로그램 (userland/lib 의 작은 런타임): USER_PROGS
 #   - 그 밖에 *.c 가 있는 디렉터리는 nlibc 앱 (디렉터리의 *.c 를 모두 묶는다): NLIBC_APPS
 #   - 자기 규칙이 따로 있는 디렉터리는 뺀다: USERLAND_SPECIAL
-USERLAND_SPECIAL = lib nlibc initrd elftest coreutils kilo nlcc
+USERLAND_SPECIAL = lib nlibc initrd elftest coreutils kilo nlcc badapple
 USERLAND_DIRS    = $(filter-out $(USERLAND_SPECIAL),$(sort $(notdir $(patsubst %/,%,$(dir $(wildcard $(ROOT)/userland/*/*.c))))))
 
 # 시스템 프로그램: userland/<이름>/*.c -> fs:/usr/<이름>.run (= app:/<이름>.run). 디렉터리의 *.c 를 모두 묶는다
@@ -511,7 +525,16 @@ NLIBC_APPS      = $(filter-out $(USER_PROGS),$(USERLAND_DIRS))
 NLIBC_APP_ELFS  = $(addprefix $(USR_DIR)/,$(addsuffix .run,$(NLIBC_APPS)))
 
 # 앱이 다른 디렉터리의 소스를 함께 쓸 때: NLIBC_APP_EXTRA_<앱> (소스), NLIBC_APP_INC_<앱> (-I)
+# uzlib (third_party/uzlib, Zlib 라이선스): Nyxis 용 오브젝트는 아래 $(BUILD)/obj/uzlib/%.o 규칙 (badapple 참고)
+UZLIB_DIR        = $(ROOT)/third_party/uzlib/src
+UZLIB_INFL_SRCS  = $(UZLIB_DIR)/tinflate.c $(UZLIB_DIR)/tinfzlib.c $(UZLIB_DIR)/adler32.c $(UZLIB_DIR)/crc32.c
+UZLIB_NX_OBJS    = $(patsubst $(UZLIB_DIR)/%.c,$(BUILD)/obj/uzlib/%.o,$(UZLIB_INFL_SRCS))
+UZLIB_DEFL_OBJS  = $(BUILD)/obj/uzlib/defl_static.o $(BUILD)/obj/uzlib/genlz77.o $(BUILD)/obj/uzlib/crc32.o
+
 NLIBC_APP_EXTRA_nkeys = $(ROOT)/userland/ntui/keymap.c
+# ntui 의 스크린샷 = .ppm.gz (uzlib 의 deflate)
+NLIBC_APP_EXTRA_ntui  = $(UZLIB_DEFL_OBJS)
+NLIBC_APP_INC_ntui    = -I$(UZLIB_DIR)
 NLIBC_APP_INC_nkeys   = -I$(ROOT)/userland/ntui
 
 define NLIBC_APP_RULE
@@ -541,6 +564,65 @@ $(KILO_SRC): $(KILO_DIR)/kilo.c $(ROOT)/userland/kilo/kilo-nyxis.patch
 $(KILO_ELF): $(KILO_SRC) $(NLIBC_STAMP)
 	@mkdir -p $(USR_DIR)
 	$(NLCC) -std=gnu99 $(OPT) -Wall -o $@ $(KILO_SRC)
+
+# ------------------------------------------------------------------
+# badapple (흑백 아스키 아트 + 사각파 동영상 플레이어, docs/BADAPPLE.md) -> fs:/usr/badapple.run
+#   userland/badapple/*.c (프로젝트 규칙 그대로) + third_party/uzlib (upstream 그대로, inflate 만).
+#   uzlib 는 C99 이고 upstream 의 경고를 고치지 않으므로 kilo 처럼 -Werror 없이 따로 컴파일한다.
+BADAPPLE_SRCS    = $(wildcard $(ROOT)/userland/badapple/*.c)
+BADAPPLE_ELF     = $(USR_DIR)/badapple.run
+
+$(BUILD)/obj/uzlib/%.o: $(UZLIB_DIR)/%.c $(wildcard $(UZLIB_DIR)/*.h) $(NLIBC_STAMP)
+	@mkdir -p $(dir $@)
+	$(NLCC) -std=gnu99 $(OPT) -Wall -c $< -o $@
+
+$(BADAPPLE_ELF): $(BADAPPLE_SRCS) $(wildcard $(ROOT)/userland/badapple/*.h) $(UZLIB_NX_OBJS) $(NLIBC_STAMP)
+	@mkdir -p $(USR_DIR)
+	$(NLCC) $(NLIBC_APP_CFLAGS) -I$(UZLIB_DIR) -D_POSIX_C_SOURCE=200809L -o $@ $(BADAPPLE_SRCS) $(UZLIB_NX_OBJS)
+
+# 동영상 app:/badapple.run/badapple.mp4 (호스트에서 만든다: 원본 영상 -> ffmpeg -> tools/badapple/nxbwenc).
+#   make badapple-movie BADAPPLE_SRC=<영상 파일>   만들어서 $(BADAPPLE_MP4) 에 둔다 (make clean 에도 남는다)
+#   그 파일이 있으면 이미지에 넣고, 없으면 플레이어만 들어간다 (실행하면 만드는 법을 알려 준다)
+BADAPPLE_MP4    ?= $(ROOT)/media/badapple.mp4
+BADAPPLE_SRC    ?=
+# 음악: MIDI 악보가 있으면 그것으로 (사람이 만든 부저용 편곡), 없으면 원본 오디오에서 자동으로 뽑는다.
+#   make badapple-midi   악보를 받는다: xqe2011/bad-apple-midi 의 input.mid (퍼블릭 도메인, 단일 부저용 편곡.
+#                        원본은 cnlohr/badderapple). 커밋을 고정해 받는다
+#   BADAPPLE_MIDI_OFFSET 악보 0초 = 영상 몇 ms (PV 와 맞춰 본 값: 0)
+BADAPPLE_MIDI   ?= $(ROOT)/media/badapple.mid
+BADAPPLE_MIDI_URL = https://raw.githubusercontent.com/xqe2011/bad-apple-midi/c325dbc6d0209abc986e16df7fcef63a5b4d140c/input.mid
+BADAPPLE_MIDI_OFFSET ?= 0
+NXBWENC         = $(BUILD)/host/nxbwenc
+UZLIB_ALL_SRCS  = $(UZLIB_INFL_SRCS) $(UZLIB_DIR)/defl_static.c $(UZLIB_DIR)/genlz77.c
+
+$(NXBWENC): $(ROOT)/tools/badapple/nxbwenc.c $(ROOT)/userland/badapple/nxbw.h $(UZLIB_ALL_SRCS)
+	@mkdir -p $(dir $@)
+	$(CC) -std=gnu99 -O2 -Wall -I$(UZLIB_DIR) -I$(ROOT)/userland/badapple -o $@ $(ROOT)/tools/badapple/nxbwenc.c $(UZLIB_ALL_SRCS) -lm
+
+badapple-enc: $(NXBWENC)
+
+badapple-movie: $(NXBWENC)
+	@if [ -z "$(BADAPPLE_SRC)" ]; then echo "usage: make badapple-movie BADAPPLE_SRC=<video file> (docs/BADAPPLE.md)" >&2; exit 1; fi
+	@mkdir -p $(BUILD)/badapple $(dir $(BADAPPLE_MP4))
+	ffmpeg -v error -y -i "$(BADAPPLE_SRC)" -an -vf "fps=30,scale=80:60:flags=area,format=gray" -f rawvideo $(BUILD)/badapple/frames.gray
+	ffmpeg -v error -y -i "$(BADAPPLE_SRC)" -vn -ac 1 -ar 11025 -f s16le $(BUILD)/badapple/audio.s16
+	$(NXBWENC) -v $(BUILD)/badapple/frames.gray -a $(BUILD)/badapple/audio.s16 -r 11025 -f 30 \
+		$(if $(wildcard $(BADAPPLE_MIDI)),-M $(BADAPPLE_MIDI) -t $(BADAPPLE_MIDI_OFFSET)) \
+		-o $(BADAPPLE_MP4) -n $(BUILD)/badapple/notes.txt -w $(BUILD)/badapple/preview.wav -W $(BUILD)/badapple/preview-chord.wav
+	rm -f $(BUILD)/badapple/frames.gray $(BUILD)/badapple/audio.s16
+
+badapple-midi:
+	@mkdir -p $(dir $(BADAPPLE_MIDI))
+	curl -fsSL -o $(BADAPPLE_MIDI) $(BADAPPLE_MIDI_URL)
+	@head -c 4 $(BADAPPLE_MIDI) | grep -q MThd || { echo "badapple-midi: not a MIDI file" >&2; rm -f $(BADAPPLE_MIDI); exit 1; }
+
+ifneq ($(wildcard $(BADAPPLE_MP4)),)
+BADAPPLE_ROOTFS = --file /usr/badapple.run/badapple.mp4=$(abspath $(BADAPPLE_MP4))
+BADAPPLE_DEPS   = $(BADAPPLE_MP4)
+else
+BADAPPLE_ROOTFS =
+BADAPPLE_DEPS   =
+endif
 
 # ------------------------------------------------------------------
 # nlcc (Nyxis 안의 C 컴파일러) = TinyCC + userland/nlcc/ (설정과 패치). 자세한 것은 userland/nlcc/README.md
@@ -605,6 +687,10 @@ nlcc: $(NLCC_ELF) $(NLCC_STAMP)
 INITRD_RUN = $(ROOT)/userland/initrd/_ns_/app/hellowld.run
 INITRD_IMG = $(BUILD)/initrd.img
 OS_IMG     = $(BUILD)/esp.img
+# run-nographic 용: 로그인 셸 틀(roi:/default/shell)만 nysh 로 바꾼 이미지 (프로그램은 같은 out/usr 를 쓴다)
+INITRD_NG_IMG = $(BUILD)/initrd-nographic.img
+OS_NG_IMG     = $(BUILD)/esp-nographic.img
+NG_SHELL      = $(BUILD)/nographic-shell
 NYFS_PACK  = $(ROOT)/tools/nyfs-utils/build/nyfs-pack
 ROOTFS_MANIFEST = $(BUILD)/rootfs.manifest
 ROOTFS_SIZE = 32M
@@ -692,11 +778,26 @@ APP_FILES = $(shell find $(APP_SRC) 2>/dev/null)
 #   app:/sudo.run -> app:/elev.run (권한 상승 명령의 예전 이름)
 ROOTFS_LINKS = --link /usr/sudo.run=elev.run
 
-$(INITRD_IMG): $(ROOTFS_EXTRA_DEPS) $(USER_PROG_ELFS) $(ELFTEST_ELF) $(NLIBC_TEST_ELF) $(FPUTEST_ELF) $(HELLO_ELF) $(COREUTILS_ELFS) $(NLIBC_APP_ELFS) $(KILO_ELF) $(NLCC_ELF) $(NLCC_STAMP) $(INITRD_RUN) $(ROOT_USERS_DB) $(NYFS_PACK) $(ROOT)/tools/mkrootfs.py $(ROI_FILES) $(APP_FILES)
+ROOTFS_DEPS = $(ROOTFS_EXTRA_DEPS) $(BADAPPLE_ELF) $(BADAPPLE_DEPS) $(USER_PROG_ELFS) $(ELFTEST_ELF) $(NLIBC_TEST_ELF) $(FPUTEST_ELF) $(HELLO_ELF) $(COREUTILS_ELFS) $(NLIBC_APP_ELFS) $(KILO_ELF) $(NLCC_ELF) $(NLCC_STAMP) $(INITRD_RUN) $(ROOT_USERS_DB) $(NYFS_PACK) $(ROOT)/tools/mkrootfs.py $(ROI_FILES) $(APP_FILES)
+
+# 루트 파일시스템 이미지: $(call MAKE_ROOTFS,<매니페스트>,<더할 mkrootfs 옵션>) (같은 --template-file 이 두 번이면 뒤의 것)
+define MAKE_ROOTFS
 	python3 $(ROOT)/tools/mkrootfs.py --users $(ROOT_USERS_DB) --bin $(USR_DIR) --roi $(ROI_SRC) --app $(APP_SRC) \
 		--file /usr/hellowld.run=$(INITRD_RUN):0644 --tree /usr/lib=$(NLCC_ROOT)/lib --tree /usr/src=$(NLCC_ROOT)/src \
-		$(ROOTFS_LINKS) $(ROOTFS_EXTRA) > $(ROOTFS_MANIFEST)
-	$(NYFS_PACK) -s $(ROOTFS_SIZE) -o $@ $(ROOTFS_MANIFEST)
+		$(ROOTFS_LINKS) $(ROOTFS_EXTRA) $(BADAPPLE_ROOTFS) $(2) > $(1)
+	$(NYFS_PACK) -s $(ROOTFS_SIZE) -o $@ $(1)
+endef
+
+$(INITRD_IMG): $(ROOTFS_DEPS)
+	$(call MAKE_ROOTFS,$(ROOTFS_MANIFEST),)
+
+# run-nographic: 화면이 없으므로 로그인 셸을 nysh 로 (기본 이미지의 ntui 는 아무도 볼 수 없는 화면을 가져간다)
+$(NG_SHELL):
+	@mkdir -p $(BUILD)
+	echo "app:/nysh.run" > $@
+
+$(INITRD_NG_IMG): $(ROOTFS_DEPS) $(NG_SHELL)
+	$(call MAKE_ROOTFS,$(BUILD)/rootfs-nographic.manifest,--template-file shell=$(NG_SHELL))
 
 # FAT16 은 운영체제에서 쓰지 않는다: 호스트 테스트(make test-host)용 이미지만 만든다
 FAT16_TEST_IMG = $(BUILD)/fat16-test.img
@@ -712,7 +813,8 @@ $(FAT16_TEST_IMG): $(INITRD_RUN)
 
 os: $(OS_IMG)
 
-$(OS_IMG): $(BOOTLOADER) $(KERNEL) $(INITRD_IMG)
+# 부팅 디스크(ESP): $(call MAKE_ESP,<initrd 이미지>)
+define MAKE_ESP
 	rm -f $@
 	dd if=/dev/zero of=$@ bs=1M count=64 status=none
 	mkfs.vfat $@
@@ -720,18 +822,47 @@ $(OS_IMG): $(BOOTLOADER) $(KERNEL) $(INITRD_IMG)
 	mmd -i $@ ::EFI/BOOT
 	mcopy -i $@ $(BOOTLOADER) ::EFI/BOOT/BOOTX64.EFI
 	mcopy -i $@ $(KERNEL) ::kernel.elf
-	mcopy -i $@ $(INITRD_IMG) ::initrd.img
+	mcopy -i $@ $(1) ::initrd.img
+endef
+
+$(OS_IMG): $(BOOTLOADER) $(KERNEL) $(INITRD_IMG)
+	$(call MAKE_ESP,$(INITRD_IMG))
+
+$(OS_NG_IMG): $(BOOTLOADER) $(KERNEL) $(INITRD_NG_IMG)
+	$(call MAKE_ESP,$(INITRD_NG_IMG))
 
 # =========================
 # Run (UEFI x86_64, QEMU + OVMF)
 # =========================
+# PC 스피커 소리 (NxSpeakerTone, beep, badapple): QEMU 의 pcspk 를 호스트 오디오에 잇는다.
+#   QEMU_AUDIO=auto (기본)  이 QEMU 에 있는 백엔드를 고른다: pipewire > pa > alsa > sdl. 없으면 소리 없이
+#   QEMU_AUDIO=pipewire|pa|alsa|sdl|coreaudio   그 백엔드
+#   QEMU_AUDIO=wav          out/pcspk.wav 로 녹음 (호스트에서 들어 보거나 검사할 때)
+#   QEMU_AUDIO=none         끈다
+#   Arch 는 백엔드가 따로 있다: sudo pacman -S qemu-audio-pipewire (또는 qemu-audio-pa / qemu-audio-alsa)
+QEMU_AUDIO ?= auto
+QEMU_AUDIO_DRV := $(strip $(if $(filter auto,$(QEMU_AUDIO)),\
+	$(firstword $(filter pipewire pa alsa sdl coreaudio,$(shell qemu-system-x86_64 -audiodev help 2>/dev/null))),\
+	$(filter-out none,$(QEMU_AUDIO))))
+ifeq ($(QEMU_AUDIO_DRV),wav)
+QEMU_SOUND = -audiodev wav,id=snd0,path=$(BUILD)/pcspk.wav -machine pcspk-audiodev=snd0
+else ifneq ($(QEMU_AUDIO_DRV),)
+QEMU_SOUND = -audiodev $(QEMU_AUDIO_DRV),id=snd0 -machine pcspk-audiodev=snd0
+else
+QEMU_SOUND =
+endif
+
 # OVMF_VARS 는 실행마다 새 복사본을 사용한다 (원본 펌웨어 변수 파일을 수정하지 않음)
 QEMU_COMMON = \
 	-m 1024 \
+	$(QEMU_SOUND) \
 	-drive if=pflash,format=raw,readonly=on,file=$(OVMF) \
 	-drive if=pflash,format=raw,file=$(BUILD)/OVMF_VARS.fd
 
 prepare-run: os
+	cp $(OVMF_VARS) $(BUILD)/OVMF_VARS.fd
+
+prepare-run-nographic: $(OS_NG_IMG)
 	cp $(OVMF_VARS) $(BUILD)/OVMF_VARS.fd
 
 run: prepare-run $(DISK_IMG)
@@ -751,11 +882,12 @@ run: prepare-run $(DISK_IMG)
 			-serial stdio \
 			-display gtk
 
-run-nographic: prepare-run $(DISK_IMG)
+# 로그인 셸이 nysh 인 이미지로 (계정마다의 roi:/<uid>/shell 을 nysh 로 만든다. make run 의 이미지는 그대로 ntui)
+run-nographic: prepare-run-nographic $(DISK_IMG)
 	qemu-system-x86_64 \
 		-machine q35 \
 		$(QEMU_COMMON) \
-		-drive file=$(OS_IMG),format=raw \
+		-drive file=$(OS_NG_IMG),format=raw \
 		$(QEMU_DISK) \
 		-vga std \
 		-display none \
@@ -819,7 +951,7 @@ $(ISO_IMG): $(KERNEL) $(INITRD_IMG)
 	mkdir -p $(ISO_DIR)/boot/grub
 	cp $(KERNEL) $(ISO_DIR)/boot/kernel.elf
 	cp $(INITRD_IMG) $(ISO_DIR)/boot/initrd.img
-	printf 'insmod all_video\nset timeout=0\nset default=0\nset gfxmode=$(RES)x32,1024x768x32,auto\nset gfxpayload=keep\nmenuentry "Nyxis OS" {\n\tmultiboot2 /boot/kernel.elf\n\tmodule2 /boot/initrd.img initrd\n\tboot\n}\n' > $(ISO_DIR)/boot/grub/grub.cfg
+	printf 'insmod all_video\nset timeout=0\nset default=0\nset gfxmode=$(GRUB_GFXMODE)\nset gfxpayload=keep\nmenuentry "Nyxis OS" {\n\tmultiboot2 /boot/kernel.elf\n\tmodule2 /boot/initrd.img initrd\n\tboot\n}\n' > $(ISO_DIR)/boot/grub/grub.cfg
 	grub-mkrescue -o $@ $(ISO_DIR) >/dev/null 2>&1
 
 # BIOS(SeaBIOS) + GRUB
@@ -956,4 +1088,4 @@ check:
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: test-disk disk disk-reset all kernel os iso run run-nographic run-sata run-usb run-grub-bios run-grub-uefi prepare-run check test-host test-nlibc test-coreutils test-ntui nlibc-host-lib nlibc-sdk nlcc clean users test-e2e
+.PHONY: badapple-enc badapple-movie badapple-midi test-disk disk disk-reset all kernel os iso run run-nographic run-sata run-usb run-grub-bios run-grub-uefi prepare-run prepare-run-nographic check test-host test-nlibc test-coreutils test-ntui nlibc-host-lib nlibc-sdk nlcc clean users test-e2e

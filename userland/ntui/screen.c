@@ -20,6 +20,7 @@
 #include <sys/ioctl.h>
 #include <nx64.h>
 
+#include "uzlib.h"
 #include "ntui.h"
 
 #define OUT_MAX 4096
@@ -581,61 +582,108 @@ void screenFlush(void)
 
 /* ---------------- 스크린샷 (PrintScreen) ---------------- */
 
+/* p[0..3] = v (little endian) */
+static void putLe32(unsigned char *p, unsigned long v)
+{
+    p[0] = (unsigned char)(v & 0xFFU);
+    p[1] = (unsigned char)((v >> 8) & 0xFFU);
+    p[2] = (unsigned char)((v >> 16) & 0xFFU);
+    p[3] = (unsigned char)((v >> 24) & 0xFFU);
+}
+
 /*
- * 화면 모드에서 지금 화면을 PPM(P6) 으로 저장한다: face:/screenshot-YYYYMMDD-HHMMSS.ppm (홈에 못 쓰면 tmp:/).
- * 저장한 경로를 path 에 넣는다. 성공 0, 실패 -1 (터미널 모드도 -1)
+ * 화면 모드에서 지금 화면을 gzip 으로 압축한 PPM(P6) 으로 저장한다: face:/screenshot-YYYYMMDD-HHMMSS.ppm.gz
+ * (홈에 못 쓰면 tmp:/). 압축은 uzlib (third_party/uzlib) 의 deflate. 호스트에서는 gunzip 또는 그대로 이미지
+ * 프로그램으로 연다. 저장한 경로를 path 에 넣는다. 성공 0, 실패 -1 (터미널 모드도 -1)
  */
 int screenShot(char *path, size_t cap)
 {
     static const char *const dirs[] = { "face:/", "tmp:/" };
-    unsigned char *row;
+    char header[48];
+    unsigned char gz_head[10] = { 0x1F, 0x8B, 8, 0, 0, 0, 0, 0, 0, 3 };   /* deflate, 플래그 없음, OS = Unix */
+    unsigned char gz_tail[8];
+    unsigned char *ppm;
+    struct uzlib_comp comp;
     char name[64];
     time_t now = time(NULL);
     struct tm *tm = gmtime(&now);
+    size_t hlen;
+    size_t len;
     size_t d;
     int x;
     int y;
+    int ret = -1;
 
     if (!g_dispOpen)
         return -1;
     if (tm != NULL)
-        strftime(name, sizeof(name), "screenshot-%Y%m%d-%H%M%S.ppm", tm);
+        strftime(name, sizeof(name), "screenshot-%Y%m%d-%H%M%S.ppm.gz", tm);
     else
-        strcpy(name, "screenshot.ppm");
-    row = (unsigned char *)malloc((size_t)g_disp.width * 3U);
-    if (row == NULL)
+        strcpy(name, "screenshot.ppm.gz");
+
+    /* PPM 전체를 메모리에 만든다 (LZ77 은 한 덩어리 안에서만 찾는다) */
+    hlen = (size_t)snprintf(header, sizeof(header), "P6\n%d %d\n255\n", g_disp.width, g_disp.height);
+    len = hlen + (size_t)g_disp.width * (size_t)g_disp.height * 3U;
+    ppm = (unsigned char *)malloc(len);
+    if (ppm == NULL)
         return -1;
+    memcpy(ppm, header, hlen);
+    for (y = 0; y < g_disp.height; y++) {
+        const unsigned *line = g_disp.fb + (size_t)y * (size_t)g_disp.stride;
+        unsigned char *row = ppm + hlen + (size_t)y * (size_t)g_disp.width * 3U;
+
+        for (x = 0; x < g_disp.width; x++) {
+            unsigned px = line[x];
+            unsigned r = g_disp.bgr ? (px & 0xFFU) : ((px >> 16) & 0xFFU);
+            unsigned b = g_disp.bgr ? ((px >> 16) & 0xFFU) : (px & 0xFFU);
+
+            row[x * 3] = (unsigned char)r;
+            row[x * 3 + 1] = (unsigned char)((px >> 8) & 0xFFU);
+            row[x * 3 + 2] = (unsigned char)b;
+        }
+    }
+
+    /* deflate (uzlib: LZ77 + 고정 허프만). 출력 버퍼는 uzlib 가 realloc 으로 늘린다 */
+    memset(&comp, 0, sizeof(comp));
+    comp.dict_size = 32768;
+    comp.hash_bits = 12;
+    comp.hash_table = (uzlib_hash_entry_t *)calloc((size_t)1 << comp.hash_bits, sizeof(uzlib_hash_entry_t));
+    if (comp.hash_table == NULL) {
+        free(ppm);
+        return -1;
+    }
+    zlib_start_block(&comp);
+    uzlib_compress(&comp, ppm, (unsigned)len);
+    zlib_finish_block(&comp);
+    free(comp.hash_table);
+    if (comp.outbuf == NULL) {
+        free(ppm);
+        return -1;
+    }
+    putLe32(gz_head + 4, (unsigned long)now);
+    putLe32(gz_tail, (unsigned long)~uzlib_crc32(ppm, (unsigned)len, ~0U));
+    putLe32(gz_tail + 4, (unsigned long)len);
+    free(ppm);
+
     for (d = 0; d < sizeof(dirs) / sizeof(dirs[0]); d++) {
         FILE *f;
-        int ok = 1;
+        int ok;
 
         snprintf(path, cap, "%s%s", dirs[d], name);
         f = fopen(path, "wb");
         if (f == NULL)
             continue;
-        fprintf(f, "P6\n%d %d\n255\n", g_disp.width, g_disp.height);
-        for (y = 0; y < g_disp.height && ok; y++) {
-            const unsigned *line = g_disp.fb + (size_t)y * (size_t)g_disp.stride;
-
-            for (x = 0; x < g_disp.width; x++) {
-                unsigned px = line[x];
-                unsigned r = g_disp.bgr ? (px & 0xFFU) : ((px >> 16) & 0xFFU);
-                unsigned b = g_disp.bgr ? ((px >> 16) & 0xFFU) : (px & 0xFFU);
-
-                row[x * 3] = (unsigned char)r;
-                row[x * 3 + 1] = (unsigned char)((px >> 8) & 0xFFU);
-                row[x * 3 + 2] = (unsigned char)b;
-            }
-            ok = fwrite(row, 3, (size_t)g_disp.width, f) == (size_t)g_disp.width;
-        }
+        ok = fwrite(gz_head, 1, sizeof(gz_head), f) == sizeof(gz_head) &&
+             fwrite(comp.outbuf, 1, (size_t)comp.outlen, f) == (size_t)comp.outlen &&
+             fwrite(gz_tail, 1, sizeof(gz_tail), f) == sizeof(gz_tail);
         if (fclose(f) != 0)
             ok = 0;
         if (ok) {
-            free(row);
-            return 0;
+            ret = 0;
+            break;
         }
         (void)remove(path);
     }
-    free(row);
-    return -1;
+    free(comp.outbuf);
+    return ret;
 }

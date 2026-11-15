@@ -13,6 +13,7 @@
 #include <errno.h>
 #include <time.h>
 #include <sys/ioctl.h>
+#include <poll.h>
 
 #define NX64_OUT_MAX 4096
 
@@ -401,6 +402,23 @@ int nx64_tui_key(int timeout_ms)
 
     if (g_tty < 0)
         return -1;
+    /* 밀리초 단위로 기다린다: 입력이 올 때까지 poll 하고, 그동안 아무것도 없으면 바로 NONE.
+     * (raw 모드의 read 는 VTIME=1 이라 한 번에 100ms 씩만 기다릴 수 있다. poll 이 안 되면 그 방식으로) */
+    if (g_pend_len == 0 && timeout_ms >= 0) {
+        struct pollfd p;
+        int r;
+
+        if (check_resize())
+            return NX64_KEY_RESIZE;
+        p.fd = g_tty;
+        p.events = POLLIN;
+        p.revents = 0;
+        r = poll(&p, 1, timeout_ms);
+        if (r == 0 || (r < 0 && errno == EINTR))
+            return check_resize() ? NX64_KEY_RESIZE : NX64_KEY_NONE;
+        if (r > 0)
+            tries = 1;              /* 읽을 것이 있다: 아래 read 는 기다리지 않는다 */
+    }
     for (;;) {
         if (check_resize())
             return NX64_KEY_RESIZE;

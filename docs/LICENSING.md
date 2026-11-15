@@ -20,3 +20,4 @@ BSD 계열(FreeBSD, OpenBSD, NetBSD)은 대부분 BSD-2/3 이므로 코드를 �
 ## 현재 상태
 - 2026-09 감사에서 작성/수정한 코드는 모두 새로 작성했고 외부 소스를 복사하지 않았다.
 - 빌드 의존성 `gnu-efi`(BSD 계열)는 소스에 포함하지 않고 시스템 패키지로 링크만 한다.
+- 가져온 코드 목록은 [THIRD_PARTY.md](../THIRD_PARTY.md) (TinyCC, kilo, uzlib).

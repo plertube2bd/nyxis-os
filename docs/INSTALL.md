@@ -76,6 +76,8 @@ make run
 터미널에 나옵니다. 로그인한 뒤에는 화면 창과 터미널 어느 쪽에서도 입력할 수 있습니다.
 
 화면이 없는 환경(SSH 등)에서는 시리얼만으로 실행합니다. QEMU 를 끝내려면 `Ctrl-A` 다음 `X` 를 누릅니다.
+이때는 로그인 셸이 데스크톱(ntui) 대신 셸 `nysh` 인 이미지(`out/esp-nographic.img`)로 부팅합니다. 같은 프로그램에
+로그인 셸 설정만 다르고, `make run` 의 이미지(`out/esp.img`)는 그대로입니다.
 
 ```bash
 make run-nographic

@@ -387,25 +387,29 @@ static EFI_STATUS load_elf_kernel(
  * GOP (프레임버퍼)
  * ========================================================= */
 
-/* 원하는 해상도 (빌드 옵션 RES=WxH, nxkernel/Makefile) */
+/* 원하는 해상도 (빌드 옵션 RES=WxH, nxkernel/Makefile). 0 x 0 (기본, RES=auto) = 펌웨어가 주는 가장 큰 모드 */
 #ifndef NYTB_PREF_W
-#define NYTB_PREF_W 1600
+#define NYTB_PREF_W 0
 #endif
 #ifndef NYTB_PREF_H
-#define NYTB_PREF_H 900
+#define NYTB_PREF_H 0
 #endif
 
 /*
  * 사용할 GOP 모드 선택: 직접 프레임버퍼 접근이 가능한 모드(BltOnly 제외) 중
- *   1. 정확히 NYTB_PREF_W x NYTB_PREF_H
- *   2. 없으면 그 안에 드는(가로, 세로 모두 이하) 모드 중 가장 넓은 것 (실제 PC 마다 모드 목록이 다르다)
- *   3. 그것도 없으면 GOP 의 현재 모드
+ *   RES=auto (NYTB_PREF_W/H 가 0): 면적이 가장 큰 모드 (같으면 가로가 넓은 것)
+ *   RES=WxH:
+ *     1. 정확히 NYTB_PREF_W x NYTB_PREF_H
+ *     2. 없으면 그 안에 드는(가로, 세로 모두 이하) 모드 중 가장 넓은 것 (실제 PC 마다 모드 목록이 다르다)
+ *   어느 쪽이든 고를 것이 없으면 GOP 의 현재 모드
  */
 static UINT32 get_preferred_gop_mode(EFI_GRAPHICS_OUTPUT_PROTOCOL *Gop)
 {
     UINT32 selected = Gop->Mode->Mode;
     UINT64 best_area = 0;
+    UINT32 best_w = 0;
     UINT32 mode;
+    BOOLEAN largest = (NYTB_PREF_W == 0 || NYTB_PREF_H == 0);
 
     for (mode = 0; mode < Gop->Mode->MaxMode; mode++) {
         EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *Info = NULL;
@@ -426,6 +430,15 @@ static UINT32 get_preferred_gop_mode(EFI_GRAPHICS_OUTPUT_PROTOCOL *Gop)
 
         if (fmt == PixelBltOnly)
             continue;
+
+        if (largest) {
+            if ((UINT64)w * h > best_area || ((UINT64)w * h == best_area && w > best_w)) {
+                selected = mode;
+                best_area = (UINT64)w * h;
+                best_w = w;
+            }
+            continue;
+        }
 
         if (w == NYTB_PREF_W && h == NYTB_PREF_H)
             return mode;

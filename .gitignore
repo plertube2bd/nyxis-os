@@ -69,3 +69,6 @@ userland/initrd/initrd.img
 
 # disk:/ 영구 디스크 이미지 (make disk)
 /disk.img
+
+# Bad Apple!! 동영상과 악보 (make badapple-movie / badapple-midi 가 만든다: 저장소에 올리지 않는다)
+/media/

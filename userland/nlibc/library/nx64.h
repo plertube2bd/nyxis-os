@@ -99,7 +99,7 @@ void nx64_tui_flush(void);
 /* 다음 flush 가 모든 칸을 다시 보내게 (다른 출력이 화면을 덮었을 때) */
 void nx64_tui_invalidate(void);
 
-/* 키 하나를 최대 timeout_ms 기다린다 (100ms 단위, < 0 이면 끝없이). 없으면 NX64_KEY_NONE, 입력이 끝나면 -1 */
+/* 키 하나를 최대 timeout_ms 기다린다 (밀리초, 0 = 기다리지 않음, < 0 이면 끝없이). 없으면 NX64_KEY_NONE, 입력이 끝나면 -1 */
 int nx64_tui_key(int timeout_ms);
 
 /* 이벤트 루프 */
@@ -225,6 +225,28 @@ void *nx64_shm_map(int fd);
 
 /* init 에게 전원을 꺼 달라고 요청한다 (svc:/sys/init). 성공 0: 곧 꺼진다 */
 int nx64_request_poweroff(void);
+
+/*
+ * 소리: PC 스피커의 사각파 비프음 (커널 NxSpeakerTone. 커널 안에서는 kernel/timer/pit/pcspk.h 의 pcspk_*).
+ *   nx64_tone(hz, ms)   hz 의 사각파를 ms 동안 낸다. 기다리지 않는다 (커널 타이머가 끈다).
+ *                       ms 0 = 다음 호출까지 계속, hz 0 = 끄기. hz 는 NX64_TONE_MIN_HZ..NX64_TONE_MAX_HZ
+ *   nx64_beep(hz, ms)   소리를 내고 끝날 때까지 기다린다 (beep 명령)
+ *   nx64_tone_off()     끄기 (= nx64_tone(0, 0))
+ *   nx64_chord(hz, n, ms)  화음: hz[0..n) (n <= NX64_CHORD_MAX) 를 아르페지오로 ms 동안 (기다리지 않는다).
+ *                       스피커는 한 번에 한 음뿐이라 커널이 10ms 마다 다음 음으로 바꾼다 (칩튠 화음, 음은 겹치지 않는다).
+ *                       0 Hz 항목은 건너뛴다. 같은 화음을 다시 주면 끊기지 않고 이어진다
+ * 스피커는 하나뿐이라 나중에 부른 프로그램이 이긴다. 프로그램이 끝나면(Ctrl-C 포함) 그 프로그램이 낸 소리는
+ * 커널이 끈다. 누구나 쓸 수 있다. 실패하면 -1 + errno (EINVAL: 범위 밖, ENOSYS: 스피커가 없는 플랫폼)
+ * QEMU 에서 들으려면 make run 의 QEMU_AUDIO (docs/NX64API.md 의 "소리")
+ */
+#define NX64_TONE_MIN_HZ 20U
+#define NX64_TONE_MAX_HZ 20000U
+#define NX64_TONE_MAX_MS 60000U
+int nx64_tone(unsigned int hz, unsigned int ms);
+int nx64_beep(unsigned int hz, unsigned int ms);
+int nx64_tone_off(void);
+#define NX64_CHORD_MAX 4
+int nx64_chord(const unsigned int *hz, int n, unsigned int ms);
 
 /*
  * 저널 (journald, svc:/sys/journal). 로그를 남기는 가장 쉬운 길:

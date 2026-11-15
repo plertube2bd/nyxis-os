@@ -35,6 +35,12 @@
  *   mark   프롬프트 기호 (기본 "*", 출력 가능한 ASCII 1~8 자)
  *   rc     대화형 셸이 시작할 때 실행하는 명령들. 기본(app:/nysh.run/rc)을 먼저, 그다음 사용자 것
  *          (roi:/<uid>/app/nysh/rc) 을 실행한다 (둘 다 있으면 둘 다: 시스템 설정 위에 사용자 설정)
+ *   welcome  대화형 셸이 처음 뜰 때(SHLVL 이 1: 로그인 셸, 터미널 창의 셸. 셸 안에서 다시 띄운 nysh 는 아니다) rc 보다
+ *          먼저 보이는 글. 비어 있으면 보이지 않는다. 기본 "{clearscreen}Welcome to Nyxis OS. [kernel-version]".
+ *          {동작}: clearscreen newline bold dim reset red green yellow blue magenta cyan white (색은 NO_COLOR 면 생략)
+ *          [값]:   kernel-version abi hostname user date time uptime
+ *          모르는 {..} [..] 는 글자 그대로. 여러 줄로 써도 된다 (끝의 개행 하나는 떼고, 끝에 개행을 하나 붙인다)
+ * SHLVL: 셸이 겹친 깊이 (bash 와 같다). nysh 는 시작할 때 1 올려 물려준다.
  *
  * 실행: nysh            대화형 (표준 입력이 콘솔이면 프롬프트를 보인다)
  *       nysh -c 명령    한 줄 실행
@@ -48,6 +54,8 @@
 #include <unistd.h>
 #include <dirent.h>
 #include <signal.h>
+#include <time.h>
+#include <termios.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <nx64.h>
@@ -1002,6 +1010,18 @@ static void reap_bg(void)
     }
 }
 
+/* 터미널을 셸이 쓰는 상태(줄 단위 + 에코)로 되돌린다. 포그라운드 작업이 끝날 때마다 (어떻게 끝났든):
+ * 비밀번호를 묻던 elev 가 Ctrl-C 나 SIGKILL 로 죽어 에코가 꺼진 채이거나, raw 모드의 프로그램(kilo, ntop)이
+ * 정리하지 못하고 죽어도 프롬프트는 정상으로 돌아온다 (bash/zsh 와 같은 안전장치) */
+static struct termios g_sane;
+static int g_have_sane;
+
+static void restore_tty(void)
+{
+    if (g_have_sane)
+        (void)tcsetattr(0, TCSANOW, &g_sane);
+}
+
 static int run_pipeline(struct cmd *cmds, int n, int background)
 {
     pid_t pids[MAX_CMDS];
@@ -1094,6 +1114,8 @@ static int run_pipeline(struct cmd *cmds, int n, int background)
     }
     if (jobctl && pgid != 0)
         (void)tcsetpgrp(0, 0);              /* 프롬프트로: Ctrl-C 는 쓰던 줄만 버린다 */
+    if (jobctl)
+        restore_tty();
     return rc;
 }
 
@@ -1235,6 +1257,111 @@ static void show_prompt(void)
         fprintf(stderr, "%s%s ", name, g_mark);
 }
 
+/* 환영 글의 [값] 하나. 모르는 이름이면 0 */
+static int welcome_value(const char *name, char *out, size_t cap)
+{
+    time_t now = time(NULL);
+    struct tm *tm = gmtime(&now);
+    unsigned long ms;
+
+    out[0] = '\0';
+    if (strcmp(name, "kernel-version") == 0) {
+        if (nx64_info("version", out, cap) < 0)
+            snprintf(out, cap, "?");
+    } else if (strcmp(name, "abi") == 0) {
+        if (nx64_info("abi", out, cap) < 0)
+            snprintf(out, cap, "?");
+    } else if (strcmp(name, "hostname") == 0) {
+        if (nx64_info("hostname", out, cap) < 0)
+            snprintf(out, cap, "nyxis");
+    } else if (strcmp(name, "user") == 0) {
+        const char *u = getenv("USER");
+
+        snprintf(out, cap, "%s", u ? u : "?");
+    } else if (strcmp(name, "date") == 0) {
+        if (tm == NULL || strftime(out, cap, "%Y-%m-%d", tm) == 0)
+            snprintf(out, cap, "?");
+    } else if (strcmp(name, "time") == 0) {
+        if (tm == NULL || strftime(out, cap, "%H:%M UTC", tm) == 0)
+            snprintf(out, cap, "?");
+    } else if (strcmp(name, "uptime") == 0) {
+        ms = nx64_uptime_ms();
+        if (ms >= 3600000UL)
+            snprintf(out, cap, "%luh %lum", ms / 3600000UL, ms / 60000UL % 60UL);
+        else
+            snprintf(out, cap, "%lum %lus", ms / 60000UL, ms / 1000UL % 60UL);
+    } else {
+        return 0;
+    }
+    return 1;
+}
+
+/* 환영 글의 {동작} 하나 (보낼 바이트). 모르는 이름이면 NULL */
+static const char *welcome_action(const char *name)
+{
+    static const struct { const char *name; const char *seq; int color; } acts[] = {
+        { "clearscreen", "\033[2J\033[H", 0 }, { "newline", "\n", 0 },
+        { "bold", "\033[1m", 1 }, { "dim", "\033[2m", 1 }, { "reset", "\033[0m", 1 },
+        { "red", "\033[31m", 1 }, { "green", "\033[32m", 1 }, { "yellow", "\033[33m", 1 },
+        { "blue", "\033[34m", 1 }, { "magenta", "\033[35m", 1 }, { "cyan", "\033[36m", 1 },
+        { "white", "\033[37m", 1 },
+    };
+    size_t i;
+
+    for (i = 0; i < sizeof(acts) / sizeof(acts[0]); i++) {
+        if (strcmp(name, acts[i].name) == 0)
+            return acts[i].color && !g_color ? "" : acts[i].seq;
+    }
+    return NULL;
+}
+
+/* 환영 글 (설정 welcome). 비어 있거나 없으면 아무것도 */
+static void show_welcome(void)
+{
+    char text[2048];
+    long n = nx64_setting_get("nysh", "welcome", text, sizeof(text));
+    const char *p;
+    int colored = 0;
+    int last_nl = 0;
+
+    if (n <= 0)
+        return;
+    for (p = text; *p != '\0'; p++) {
+        char close = *p == '{' ? '}' : *p == '[' ? ']' : 0;
+        const char *end = close ? strchr(p + 1, close) : NULL;
+
+        if (end != NULL && end - p - 1 > 0 && end - p - 1 < 32) {
+            char name[32];
+            char val[128];
+            const char *seq;
+
+            memcpy(name, p + 1, (size_t)(end - p - 1));
+            name[end - p - 1] = '\0';
+            if (close == '}' && (seq = welcome_action(name)) != NULL) {
+                fputs(seq, stdout);
+                if (seq[0] == '\033' && strcmp(name, "clearscreen") != 0)
+                    colored = strcmp(name, "reset") != 0;
+                last_nl = seq[0] == '\n';
+                p = end;
+                continue;
+            }
+            if (close == ']' && welcome_value(name, val, sizeof(val))) {
+                fputs(val, stdout);
+                last_nl = 0;
+                p = end;
+                continue;
+            }
+        }
+        fputc(*p, stdout);
+        last_nl = *p == '\n';
+    }
+    if (colored)
+        fputs("\033[0m", stdout);
+    if (!last_nl)
+        fputc('\n', stdout);
+    fflush(stdout);
+}
+
 /* 시작 스크립트 (설정 rc): 기본, 그다음 사용자 것. 없는 것은 조용히 건너뛴다 */
 static void run_rc(void)
 {
@@ -1274,6 +1401,15 @@ int main(int argc, char **argv)
     }
     if (!getenv("SHELL"))
         setenv("SHELL", "app:/nysh.run", 1);
+    {
+        /* 셸이 겹친 깊이 (bash 의 SHLVL): 1 이면 이 터미널의 첫 셸 */
+        const char *lv = getenv("SHLVL");
+        char buf[16];
+        long level = lv ? strtol(lv, NULL, 10) : 0;
+
+        snprintf(buf, sizeof(buf), "%ld", level >= 0 && level < 1000 ? level + 1 : 1);
+        setenv("SHLVL", buf, 1);
+    }
     if (getcwd(line, sizeof(line)))
         setenv("PWD", line, 1);
     g_color = want_color();
@@ -1288,7 +1424,14 @@ int main(int argc, char **argv)
     g_interactive = isatty(0);
     if (g_interactive) {
         (void)tcsetpgrp(0, 0);              /* 이 셸을 띄운 셸의 작업 그룹에서 벗어난다: 프롬프트의 Ctrl-C 로 죽지 않게 */
+        if (tcgetattr(0, &g_sane) == 0) {   /* 셸이 쓰는 터미널 상태: 줄 단위, 에코, 신호 */
+            g_sane.c_lflag |= (tcflag_t)(ICANON | ECHO | ISIG);
+            g_have_sane = 1;
+            restore_tty();                  /* 이 셸을 띄운 프로그램이 에코를 끈 채였어도 */
+        }
         load_mark();
+        if (strcmp(getenv("SHLVL"), "1") == 0)
+            show_welcome();
         run_rc();
         g_last = 0;                         /* rc 의 마지막 결과가 첫 프롬프트 색을 정하지 않게 */
     }

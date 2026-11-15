@@ -94,7 +94,7 @@ static const struct {
     { "restore-all", ACT_RESTORE_ALL, "restore all" },
     { "lock", ACT_LOCK, "lock screen" },
     { "task-manager", ACT_TASKMGR, "processes (ntop)" },
-    { "screenshot", ACT_SCREENSHOT, "screenshot to face:/" },
+    { "screenshot", ACT_SCREENSHOT, "screenshot to face:/ (.ppm.gz)" },
     { "taskbar", ACT_TASKBAR, "taskbar" },
     { "theme", ACT_THEME, "change theme" },
     { "help", ACT_HELP, "help" },

@@ -89,7 +89,7 @@ hashes and is not tracked by git. Rebuild the image after changing accounts.
 | Command | What it does |
 |---|---|
 | `make run` | Build everything and run in QEMU (GTK window; serial output in your terminal) |
-| `make run-nographic` | Serial only, no display (e.g. over SSH). Quit with `Ctrl-A` then `X` |
+| `make run-nographic` | Serial only, no display (e.g. over SSH); the login shell is nysh instead of the desktop. Quit with `Ctrl-A` then `X` |
 | `make os` | Build the boot image only (`out/esp.img`) |
 | `make run-sata` | Boot over SATA (port 0 = ESP, port 1 = `disk.img`) |
 | `make iso` / `make run-grub-uefi` / `make run-grub-bios` | GRUB boot ISO (needs `grub-mkrescue`, `xorriso`) |
@@ -100,7 +100,7 @@ The first build compiles the bootloader, kernel, nlibc, commands, shell and nlcc
 to `out/` (`out/esp.img` is the boot disk, `out/usr/*.run` are the programs). `build.sh` in the repository root runs
 `make -B os` and copies the image to `out/nyxis-os`.
 
-Build options: `RES=WxH` (screen resolution, default `1600x900`), `SELFTEST=1` (kernel self-test + test accounts with
+Build options: `RES=WxH` (screen resolution; default `auto` = the largest framebuffer mode UEFI offers), `SELFTEST=1` (kernel self-test + test accounts with
 random passwords), `DEBUG=1` (bootloader framebuffer test pattern), `DEBUG_SYSCALLS=1` (debug system calls 768–1023),
 `DISK_SIZE=256M` (size of the `disk.img` made by `make disk-reset`, default 64M).
 
@@ -146,7 +146,7 @@ the bottom and, at first, a help window. Everything is done with the keyboard.
 | `Super+I` | Shortcut settings window (record new keys) |
 | `Super+L`, `Ctrl+Alt+L` | Lock the screen |
 | `Ctrl+Shift+Esc`, `Ctrl+Alt+Delete` | Process manager (ntop) |
-| `Print` | Screenshot |
+| `Print` | Screenshot (`face:/screenshot-<time>.ppm.gz`, gzip-compressed PPM) |
 | `Super+G` | Change theme |
 | `Alt+F4`, `Super+W` | Close window |
 | `Alt+Tab` / `Alt+Shift+Tab`, `Super+Tab` | Switch windows / task view |
@@ -169,7 +169,9 @@ All shortcuts live in one file (`app:/ntui.run/keys`; your own copy is `roi:/<ui
 - Settings such as the startup window and theme are listed in [rootfs/app/README.md](rootfs/app/README.md).
 - **Log out** in the menu returns to the login screen; **Power off** turns the machine off (both ask once more). In a
   terminal, `poweroff` also works.
-- **Without a display** (serial, `make run-nographic`), ntui draws as text on the current terminal and uses `Ctrl`
+- **`make run-nographic`** boots a separate image (`out/esp-nographic.img`) whose login shell is `nysh`, so you get a
+  shell prompt on the serial console instead of the desktop. You can still start the desktop from there with `ntui`.
+- **ntui without a display** (started from a serial shell) draws as text on the current terminal and uses `Ctrl`
   shortcuts instead of Super: `Ctrl+Q` menu, `Ctrl+T` terminal, `Ctrl+E` files, `Ctrl+R` run, `Ctrl+W` close,
   `Ctrl+F` maximize, `Ctrl+N`/`Ctrl+P` switch windows. To use only the shell, as root run
   `echo app:/nysh.run > roi:/<uid>/shell` (that user's login shell).
@@ -208,7 +210,8 @@ These documents are written in Korean. The full list with descriptions is in the
 | Document | Topic |
 |---|---|
 | [docs/INSTALL.md](docs/INSTALL.md) | Building and running on Linux |
-| [docs/NX64API.md](docs/NX64API.md) | nx64api: TUI, system, settings, services, journal, window control, display |
+| [docs/NX64API.md](docs/NX64API.md) | nx64api: TUI, system, settings, services, journal, window control, display, sound |
+| [docs/BADAPPLE.md](docs/BADAPPLE.md) | `badapple`: ASCII-art video player with PC-speaker square-wave sound (one note, or arpeggio chords); the MP4/nxbw format |
 | [docs/NWP.md](docs/NWP.md) | NWP (Nyxis Window Protocol) between the compositor and window programs |
 | [userland/README.md](userland/README.md) | User programs and how to add one |
 | [nxkernel/kernel/README.md](nxkernel/kernel/README.md) | Kernel components (this one also has an English part) |
@@ -217,7 +220,7 @@ These documents are written in Korean. The full list with descriptions is in the
 ## License
 
 GPL-3.0 ([LICENSE](LICENSE)). Code in `third_party/` keeps its own license (TinyCC: LGPL-2.1 or later, kilo:
-BSD-2-Clause). Rules for importing external code: [docs/LICENSING.md](docs/LICENSING.md) (Korean).
+BSD-2-Clause, uzlib: Zlib; list in [THIRD_PARTY.md](THIRD_PARTY.md)). Rules for importing external code: [docs/LICENSING.md](docs/LICENSING.md) (Korean).
 
 ---
 
@@ -304,7 +307,7 @@ make users
 | 명령 | 내용 |
 |---|---|
 | `make run` | 모두 빌드하고 QEMU 로 실행 (GTK 창 + 시리얼은 지금 터미널) |
-| `make run-nographic` | 화면 없이 시리얼만으로 (SSH 등). 끝내기: `Ctrl-A` 다음 `X` |
+| `make run-nographic` | 화면 없이 시리얼만으로 (SSH 등). 로그인 셸이 데스크톱 대신 nysh. 끝내기: `Ctrl-A` 다음 `X` |
 | `make os` | 실행하지 않고 부팅 이미지만 (`out/esp.img`) |
 | `make run-sata` | SATA 로 부팅 (포트 0 = ESP, 포트 1 = `disk.img`) |
 | `make iso` / `make run-grub-uefi` / `make run-grub-bios` | GRUB 부팅 ISO (`grub-mkrescue`, `xorriso` 필요) |
@@ -319,7 +322,7 @@ make users
 
 | 옵션 | 내용 |
 |---|---|
-| `RES=WxH` | 화면 해상도 (기본 `1600x900`). 예: `make RES=1280x800 run` |
+| `RES=WxH` | 화면 해상도 (기본 `auto` = UEFI 가 주는 가장 큰 프레임버퍼 모드). 예: `make RES=1280x800 run` |
 | `SELFTEST=1` | 부팅 뒤 커널 자체 점검 + 테스트 계정(root/test, 무작위 비밀번호)의 테스트 이미지 |
 | `DEBUG=1` | 부트로더 프레임버퍼 테스트 패턴 |
 | `DEBUG_SYSCALLS=1` | 디버그 시스템 콜(768~1023)을 넣는다 |
@@ -377,7 +380,7 @@ NVMe 미지원). 실제 하드웨어에서는 검증되지 않았습니다. 방�
 | `Super+I` | 단축키 설정 창 (키를 녹음해 바꾼다) |
 | `Super+L`, `Ctrl+Alt+L` | 화면 잠금 |
 | `Ctrl+Shift+Esc`, `Ctrl+Alt+Delete` | 프로세스 관리 (ntop) |
-| `Print` | 스크린샷 |
+| `Print` | 스크린샷 (`face:/screenshot-<시각>.ppm.gz`, gzip 으로 압축한 PPM) |
 | `Super+G` | 테마 바꾸기 |
 | `Alt+F4`, `Super+W` | 창 닫기 |
 | `Alt+Tab` / `Alt+Shift+Tab`, `Super+Tab` | 창 전환 / 작업 보기 |
@@ -406,7 +409,10 @@ NVMe 미지원). 실제 하드웨어에서는 검증되지 않았습니다. 방�
 
 ### 화면 없이 (시리얼, `make run-nographic`)
 
-화면을 가져올 수 없으면 ntui 는 지금 터미널 위에서 글자로 그립니다. Super 키가 없으므로 `Ctrl` 단축키를 씁니다:
+`make run-nographic` 은 로그인 셸이 `nysh` 인 이미지(`out/esp-nographic.img`)로 부팅합니다: 시리얼 콘솔에서 데스크톱 대신
+셸 프롬프트가 뜹니다. 거기서 `ntui` 를 치면 데스크톱을 띄울 수 있습니다.
+
+셸에서 띄운 ntui 처럼 화면을 가져올 수 없으면 ntui 는 지금 터미널 위에서 글자로 그립니다. Super 키가 없으므로 `Ctrl` 단축키를 씁니다:
 `Ctrl+Q` 메뉴, `Ctrl+T` 터미널, `Ctrl+E` 파일, `Ctrl+R` 실행, `Ctrl+W` 닫기, `Ctrl+F` 최대화, `Ctrl+N`/`Ctrl+P` 창 전환.
 데스크톱 없이 셸만 쓰려면 root 로 `echo app:/nysh.run > roi:/<uid>/shell` (그 사용자의 로그인 셸).
 
@@ -447,7 +453,8 @@ poweroff                    전원 끄기
 | 문서 | 내용 |
 |---|---|
 | [docs/INSTALL.md](docs/INSTALL.md) | 리눅스에서 빌드하고 실행하기 (패키지, 계정, 실행, 저장 공간, 실제 PC, 문제 해결) |
-| [docs/NX64API.md](docs/NX64API.md) | nx64api: TUI, 시스템 정보, 설정, 서비스 채널, 저널, ntui 창 다루기, 화면 |
+| [docs/NX64API.md](docs/NX64API.md) | nx64api: TUI, 시스템 정보, 설정, 서비스 채널, 저널, ntui 창 다루기, 화면, 소리 |
+| [docs/BADAPPLE.md](docs/BADAPPLE.md) | `badapple`: 흑백 아스키 아트 + PC 스피커 사각파 동영상 플레이어 (단음, 아르페지오 화음), MP4/nxbw 형식 |
 | [docs/NWP.md](docs/NWP.md) | NWP (Nyxis Window Protocol): 컴포지터와 창 프로그램 사이의 규약 |
 | [docs/AUDIT.md](docs/AUDIT.md) | 커널 소스 감사와 개선 기록 |
 | [docs/LICENSING.md](docs/LICENSING.md) | 외부 코드를 가져올 때의 라이선스 규칙 |
@@ -483,5 +490,5 @@ docs/           문서
 
 ## 라이선스
 
-GPL-3.0 ([LICENSE](LICENSE)). `third_party/` 의 코드는 각자의 라이선스를 따릅니다 (TinyCC: LGPL-2.1 이상, kilo: BSD-2-Clause).
+GPL-3.0 ([LICENSE](LICENSE)). `third_party/` 의 코드는 각자의 라이선스를 따릅니다 (TinyCC: LGPL-2.1 이상, kilo: BSD-2-Clause, uzlib: Zlib. 목록은 [THIRD_PARTY.md](THIRD_PARTY.md)).
 외부 코드를 가져오는 규칙은 [docs/LICENSING.md](docs/LICENSING.md).

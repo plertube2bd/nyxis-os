@@ -14,6 +14,7 @@
 #include "string.h"
 #include "phys.h"
 #include "kernel/timer/pit/pit_base.h"
+#include "kernel/timer/pit/pcspk.h"
 #include "kernel/process/waitq.h"
 
 /* Process list */
@@ -424,6 +425,9 @@ static Nstatus terminate_locked(process_t *proc, i32 code)
 
     /* 콘솔을 raw 모드로 두고 끝났으면 되돌린다 (셸이 먹통이 되지 않도록) */
     tty_process_terminated(proc->pid);
+
+    /* 이 프로세스가 낸 비프음이 남아 있으면 끈다 (NxSpeakerTone) */
+    pcspk_process_terminated(proc->pid);
 
     /* 제어 터미널 참조를 놓는다 (pty 의 마지막 사용자였으면 주 끝이 EOF 를 본다) */
     process_set_ctty(proc, nNULL);

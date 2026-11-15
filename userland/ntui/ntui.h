@@ -129,7 +129,7 @@ void screenStyle(enum role r, int *fg, int *bg, unsigned *attr);           /* �
 void screenInvalidate(void);
 void screenFlush(void);
 int screenDisplayMode(void);            /* 1 이면 프레임버퍼에 직접 그린다 */
-int screenShot(char *path, size_t cap); /* 화면 모드: 화면을 PPM 으로 저장 (path 에 이름). 성공 0 */
+int screenShot(char *path, size_t cap); /* 화면 모드: 화면을 PPM.gz (gzip) 로 저장 (path 에 이름). 성공 0 */
 struct nx64_display;
 struct nx64_display *screenDisplay(void);   /* 화면 모드의 화면 (아니면 NULL) */
 

@@ -726,6 +726,16 @@ long __nl_clock_ns(int which)
     return ret(nx_sc(NX_SYS_GET_TIME, which == NL_CLOCK_REALTIME ? NX_CLOCK_REALTIME : NX_CLOCK_MONOTONIC, 0, 0));
 }
 
+int __nl_speaker(unsigned long hz, unsigned long ms)
+{
+    return (int)ret(nx_sc(NX_SYS_SPEAKER_TONE, hz, ms, 0));
+}
+
+int __nl_speaker_chord(const unsigned int *hz, unsigned long n, unsigned long ms)
+{
+    return (int)ret(nx_sc(NX_SYS_SPEAKER_CHORD, (unsigned long)hz, n, ms));
+}
+
 int __nl_sleep_ms(unsigned long ms)
 {
     while (ms > 0) {

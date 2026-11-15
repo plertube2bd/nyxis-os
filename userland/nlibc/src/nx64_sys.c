@@ -284,6 +284,53 @@ int nx64_request_poweroff(void)
     return nx64_service_send("svc:/sys/init", "poweroff", 8);
 }
 
+/* ---------------- 소리 (PC 스피커) ---------------- */
+
+int nx64_tone(unsigned int hz, unsigned int ms)
+{
+    if ((hz != 0 && (hz < NX64_TONE_MIN_HZ || hz > NX64_TONE_MAX_HZ)) || ms > NX64_TONE_MAX_MS) {
+        errno = EINVAL;
+        return -1;
+    }
+    return __nl_speaker(hz, ms);
+}
+
+int nx64_chord(const unsigned int *hz, int n, unsigned int ms)
+{
+    int i;
+
+    if (n < 0 || n > NX64_CHORD_MAX || (n > 0 && hz == NULL) || ms > NX64_TONE_MAX_MS) {
+        errno = EINVAL;
+        return -1;
+    }
+    for (i = 0; i < n; i++) {
+        if (hz[i] != 0 && (hz[i] < NX64_TONE_MIN_HZ || hz[i] > NX64_TONE_MAX_HZ)) {
+            errno = EINVAL;
+            return -1;
+        }
+    }
+    return __nl_speaker_chord(hz, (unsigned long)n, ms);
+}
+
+int nx64_tone_off(void)
+{
+    return __nl_speaker(0, 0);
+}
+
+int nx64_beep(unsigned int hz, unsigned int ms)
+{
+    int r;
+
+    if (hz == 0 || ms == 0)
+        return __nl_sleep_ms(ms);
+    /* 길이는 커널에도 알린다: 기다리는 중에 신호로 끝나도 소리가 남지 않게 */
+    if (nx64_tone(hz, ms) < 0)
+        return -1;
+    r = __nl_sleep_ms(ms);
+    (void)__nl_speaker(0, 0);
+    return r;
+}
+
 /* ---------------- 프로세스 ---------------- */
 
 int nx64_processes(struct nx64_proc *out, int max)

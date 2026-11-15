@@ -291,6 +291,8 @@ long __nl_shm_create(size_t size, int cloexec) { (void)size; (void)cloexec; errn
 void *__nl_shm_map(long h) { (void)h; errno = ENOSYS; return 0; }
 int __nl_openpty(long out[2], int cloexec) { (void)out; (void)cloexec; errno = ENOSYS; return -1; }
 long __nl_devcmd(long h, unsigned long cmd, unsigned long arg) { (void)h; (void)cmd; (void)arg; errno = ENOSYS; return -1; }
+int __nl_speaker(unsigned long hz, unsigned long ms) { (void)hz; (void)ms; errno = ENOSYS; return -1; }
+int __nl_speaker_chord(const unsigned int *hz, unsigned long n, unsigned long ms) { (void)hz; (void)n; (void)ms; errno = ENOSYS; return -1; }
 void *__nl_map_mmio(long h) { (void)h; errno = ENOSYS; return 0; }
 
 int __nl_tty_winsize(long h, unsigned short ws[4])

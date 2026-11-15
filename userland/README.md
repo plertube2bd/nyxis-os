@@ -34,6 +34,10 @@ nlibc 의 검사/예제는 C89 그대로다. nlibc 에는 아직 `<stdbool.h>` �
 - `nwin/`: 지금 터미널 창 다루기 (nx64api `nx64_win_*` 예제): `nwin` (정보), `nwin size 100x30`, `nwin move 4 2`,
   `nwin center`, `nwin max|full|normal|min`, `nwin title 제목`, `nwin demo`. ntui 의 터미널 창 밖에서는 실패한다
 - `nkeys/`: 단축키 설정 창 (NWP 클라이언트, Super+I. 키 녹음 중에는 컴포지터의 단축키를 막는다). `nkeys -h` 는 단축키 보기 (F1)
+- `badapple/`: 흑백 아스키 아트(80x60, 16단계) + PC 스피커 사각파 동영상 플레이어 (기본 단음, `-c` 화음) `badapple [-m] [-c] [-f] [파일.mp4]`.
+  MP4 컨테이너 안의 자체 코덱 nxbw (4비트 픽셀, XOR 델타 + deflate) 를 uzlib(`third_party/uzlib`)로 푼다.
+  uzlib 때문에 자기 규칙이 따로 있다 (`nxkernel/Makefile` 의 `BADAPPLE_ELF`). 동영상 만들기: [docs/BADAPPLE.md](../docs/BADAPPLE.md)
+- `beep/`: PC 스피커 비프음 `beep -f 880 -l 200`, 화음 `beep -c 523,659,784 -l 600` (nx64api `nx64_beep`/`nx64_chord` 예제)
 - `nysh/`: 셸 (nlibc). 파이프, 리디렉션, 변수, 따옴표, 글롭, `&&`/`||`, cd. 문법은 `nysh/main.c` 머리말
 - `coreutils/`: cat, ls, cp, mv, rm, touch, mkdir, echo 등 기본 명령어 (nlibc, [README](coreutils/README.md))
 - `nlibc/`: C 라이브러리와 호스트 SDK (`nlcc` = gcc/ld 래퍼). Nyxis 전용 API `<nx64.h>` (nx64api) 도 여기 있다

@@ -17,10 +17,14 @@ nyfs 의 노드는 파일이든 디렉터리든 하나의 오브젝트다 (내�
 | login | `prompt` | `nyxis os login: ` | 로그인 프롬프트 |
 | nysh | `mark` | `*` | 프롬프트 기호 (출력 가능한 ASCII 1~8 자) |
 | nysh | `rc` | (주석뿐) | 대화형 셸 시작 스크립트. 기본 rc 다음에 사용자 rc 도 실행 |
+| nysh | `welcome` | `{clearscreen}Welcome to Nyxis OS. [kernel-version]` | 대화형 셸이 처음 뜰 때(로그인 셸, 터미널 창. `SHLVL` 1) 보이는 글. 비우면 안 보인다. `{clearscreen}` `{newline}` `{bold}` `{red}`… 동작, `[kernel-version]` `[hostname]` `[user]` `[date]` `[time]` `[uptime]` `[abi]` 값 (`userland/nysh/main.c` 머리말) |
 | ntui | `theme` | `nyx` | 테마 (Super+G 로 바꾸면 사용자 값으로 저장) |
 | ntui | `startup` | `help` | 시작할 때 열 창: `help` / `terminal` / `files` / `none` |
 | ntui | `display` | (없음) | `terminal` 이면 화면(dev:/console)을 가져오지 않고 지금 터미널 위에서 돈다 |
 | ntui | `keys` | (여러 줄) | 모든 단축키: `[super+r] { exec nrunner; }` 형식. 키마다 ntui 동작/명령/프로그램(`pass`, `send`)/신호(`signal`)로 보낸다. 설명은 파일 머리말, 고치는 창은 Super+I |
+| badapple | `movie` | `app:/badapple.run/badapple.mp4` | 인자 없이 실행할 때 재생할 파일 ([docs/BADAPPLE.md](../../docs/BADAPPLE.md)) |
+| badapple | `sound` | `mono` | 소리: `mono` (가장 두드러진 음 하나) / `chord` (아르페지오 화음. 스피커는 음량이 없어 모든 음이 같은 크기) |
+| badapple | `ramp` | ` .,:;-=+*ox%#&@M` | 밝기 16단계(검정 -> 흰색)를 그릴 글자 16개 (출력 가능한 ASCII) |
 | sysmon | `refresh_ms` | `1000` | 다시 그리는 간격 (100~10000) |
 | ntop | `refresh_ms` | `1000` | 다시 읽는 간격 (200~10000) |
 | ntop | `sort` | `pid` | 처음 정렬: `pid` / `cpu` / `mem` |

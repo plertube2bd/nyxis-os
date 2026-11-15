@@ -53,7 +53,7 @@ nlcc -o tmp:/demo.run app:/src/examples/nx64demo.c && tmp:/demo.run
 | `nx64_tui_box(x, y, w, h, title, style)` | `+ - |` 테두리와 제목 |
 | `nx64_tui_bar(x, y, w, value, max, on, off)` | 막대 그래프 |
 | `nx64_tui_flush` | 바뀐 칸만 화면에 낸다 (깜빡임 없음) |
-| `nx64_tui_key(timeout_ms)` | 키 하나. 없으면 `NX64_KEY_NONE`. 방향키·Home/End·PgUp/PgDn·Del은 `NX64_KEY_*`, Ctrl 조합은 `NX64_KEY_CTRL('x')` |
+| `nx64_tui_key(timeout_ms)` | 키 하나를 최대 `timeout_ms` 밀리초 기다린다 (0 = 기다리지 않음, 음수 = 끝없이). 없으면 `NX64_KEY_NONE`. 방향키·Home/End·PgUp/PgDn·Del은 `NX64_KEY_*`, Ctrl 조합은 `NX64_KEY_CTRL('x')` |
 
 - **스타일:** `nx64_style`은 256색 `fg`/`bg`와 `NX64_BOLD`·`NX64_UNDERLINE`·`NX64_REVERSE`로 이루어진다. `nx64_style_make(fg, bg, attr)`로 만든다.
 - **기본 스타일:** `NX64_DEFAULT`, `NX64_FRAME`, `NX64_ACCENT`, `NX64_SELECTED`, `NX64_DIM`은 데스크톱의 nyx 테마와 같은 색이다.
@@ -126,6 +126,8 @@ int main(void)
 | [journald](../userland/journald/main.c) | `nx64_service_create`/`_receive_fd`/`_fd` (로그, 서비스 출력 파이프, 읽기 요청), `nx64_processes`, 설정 `storage` `max_kib` |
 | [journalman](../userland/journalman/main.c) | `nx64_journal_open`/`_parse`/`_format`/`_send`, `nx64_info` |
 | [nex](../userland/nex/main.c) | `nx64_service_create`/`_connect`/`_send_fd` (init 에게 답장 채널을 넘긴다), 저널 읽기 |
+| [badapple](../userland/badapple/main.c) | TUI (밀리초 `nx64_tui_key`), `nx64_chord`/`nx64_tone_off`, `nx64_win_*`, 설정 `movie` `ramp` ([BADAPPLE.md](BADAPPLE.md)) |
+| [beep](../userland/beep/main.c) | `nx64_beep`, `nx64_chord`, `nx64_tone_off` |
 | [ntui](../userland/ntui/sys.c) | 사용자/호스트/시간대(`nx64_whoami`, `nx64_info`), 테마·startup 설정, 시계 창의 업타임 |
 
 ntui의 화면 그리기는 창 관리자용 자체 계층(`screen.c`, 역할 색)을 쓰고, 화면 모드에서는 아래 `nx64_display_*`로 프레임버퍼에 직접 그린다. init·login·elev는 nlibc 없이 도는 작은 시스템 런타임(`userland/lib/nyx.h`)에 남겨 두었다.
@@ -153,6 +155,49 @@ ntui의 화면 그리기는 창 관리자용 자체 계층(`screen.c`, 역할 �
 | `nx64_display_rgb(&d, 0xRRGGBB)` | 이 화면의 픽셀 값 (RGB/BGR 배치를 맞춘다) |
 | `nx64_display_keys(&d, ev, max, timeout_ms)` | 키 이벤트를 읽는다: `code`(PS/2 세트 1, E0 확장은 +0x100, `NX64_KC_*`: PrintScreen 과 메뉴 키 포함), `mods`(`NX64_KMOD_SHIFT/CTRL/ALT/SUPER/ALTGR/CAPS`), `pressed`(누름/뗌), `ch`(Shift 반영 ASCII). `d.fd` 를 poll 해도 된다 |
 | `nx64_display_close(&d)` | 돌려준다 |
+
+## 소리 (PC 스피커)
+
+사각파 비프음과 화음. 커널의 `NxSpeakerTone`(11), `NxSpeakerChord`(12)를 부른다. 커널 안의 코드는 같은 장치를
+`kernel/timer/pit/pcspk.h` 의 `pcspk_tone` / `pcspk_chord` / `pcspk_beep` / `pcspk_off` 로 쓴다.
+
+| 함수 | 하는 일 |
+|---|---|
+| `nx64_tone(hz, ms)` | `hz` 의 사각파를 `ms` 동안. **기다리지 않는다** (커널 타이머가 끈다). `ms` 0 = 다음 호출까지 계속, `hz` 0 = 끄기 |
+| `nx64_beep(hz, ms)` | 소리를 내고 끝날 때까지 기다린다. `hz` 0 이면 `ms` 동안 쉼 |
+| `nx64_chord(hz, n, ms)` | 화음: `hz[0..n)` (`n` <= `NX64_CHORD_MAX` = 4) 를 `ms` 동안. 기다리지 않는다. 0 Hz 항목은 건너뛴다 |
+| `nx64_tone_off()` | 끄기 |
+
+- `hz` 는 `NX64_TONE_MIN_HZ`(20) .. `NX64_TONE_MAX_HZ`(20000), `ms` 는 `NX64_TONE_MAX_MS`(60000) 까지. 밖이면 `-1` + `EINVAL`.
+- 누구나 쓸 수 있다. 스피커는 하나라서 나중에 부른 프로그램이 이긴다.
+- **화음은 아르페지오다**: 스피커는 한 번에 한 음만 낼 수 있어서 커널이 타이머 tick(10ms)마다 다음 음으로 바꾼다.
+  음은 겹치지 않고 번갈아 나오며 귀에는 화음으로 들린다 (칩튠의 화음). 같은 화음을 다시 주면 순서를 처음으로 돌리지 않는다.
+- **음량은 없다**: 스피커는 켜짐/꺼짐뿐이라 모든 음이 같은 크기다. 화음의 어느 음을 작게 낼 수 없으므로, 원곡처럼
+  주선율이 두드러져야 하는 음악은 단음이 더 낫다 (badapple 의 기본).
+- 소리를 낸 프로그램이 끝나면 (Ctrl-C, kill 포함) 커널이 그 소리를 끈다. 계속 나는 소리(`ms` 0)도 남지 않는다.
+- 계속 바꾸는 소리(음악)는 프레임마다 `nx64_tone(hz, 250)` 처럼 짧은 길이로 늘려 가면, 프로그램이 멈췄을 때도 곧 꺼진다.
+  같은 주파수를 다시 주면 커널은 분주기를 다시 쓰지 않는다 (소리가 끊기지 않는다).
+- 셸에서는 [`beep`](../userland/beep/main.c): `beep -f 880 -l 200`, `beep -c 523,659,784 -l 600`, `beep -f 523 -l 120 -r 3 -d 80`, `beep -s`.
+- QEMU 에서 들으려면 오디오 백엔드가 있어야 한다 (`make run QEMU_AUDIO=...`, [BADAPPLE.md](BADAPPLE.md) 의 "소리").
+- 호스트 검사용 nlibc(Linux)에서는 `-1` + `ENOSYS`.
+
+```c
+#include <nx64.h>
+
+int main(void)
+{
+    static const unsigned melody[] = { 523, 659, 784, 1047 };
+
+    static const unsigned c_major[] = { 523, 659, 784 };
+    int i;
+
+    for (i = 0; i < 4; i++)
+        nx64_beep(melody[i], 150);
+    nx64_chord(c_major, 3, 800);        /* 화음 (아르페지오), 기다리지 않는다 */
+    nx64_beep(0, 800);                  /* 쉼 = 기다리기 */
+    return 0;
+}
+```
 
 ## 공유 메모리와 fd 보내기
 
